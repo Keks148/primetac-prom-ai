@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v4.1</title>
+<title>PrimeTac Prom AI v5</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -38,7 +38,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 <button onclick="showTop()">ТОП для продаж</button>
 <button onclick="showPrices()">Цены</button>
 <button onclick="loadSales()">Продажи</button>
-<button onclick="loadOrders()">Заказы</button>
+<button onclick="loadOrders()">Заказы</button><button onclick="openEditor()">AI-редактор</button>
 </div>
 
 <div id="status" class="card">Проверяем...</div>
@@ -70,7 +70,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v4.1: рекомендации цены основаны на закупке и марже. Это не анализ цен конкурентов.
+v5: AI-редактор цен и описаний основаны на закупке и марже. Это не анализ цен конкурентов.
 </div>
 </div>
 
@@ -203,6 +203,101 @@ async function loadOrders(){
   $("#content").innerHTML=a.length?a.slice(0,100).map(o=>`<div class="card"><b>Заказ #${esc(o.id)}</b><div class="muted">${esc(o.status||"")} · ${esc(o.full_price||o.price||"")}</div></div>`).join(""):'<div class="card">Заказов нет.</div>';
  }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
 }
+
+function editorProductOptions(){
+ return REPORT.slice(0,500).map(x=>`<option value="${esc(x.product.id)}">${esc(x.product.name)} — ${money(x.promPrice)}</option>`).join("");
+}
+
+function openEditor(){
+ if(!REPORT.length){
+   $("#content").innerHTML='<div class="card warn">Сначала нажми «Анализ всего каталога».</div>';
+   return;
+ }
+ $("#content").innerHTML=`<div class="card">
+   <h3 style="margin-top:0">AI-редактор товара</h3>
+   <div class="muted small">Сначала AI только готовит изменения. Запись в Prom происходит отдельной кнопкой и требует WRITE_PIN.</div>
+   <div style="margin-top:10px">
+     <label>Товар</label><br>
+     <select id="editProduct" style="width:100%">${editorProductOptions()}</select>
+   </div>
+   <div class="row" style="margin-top:10px">
+     <label><input id="editPrice" type="checkbox" checked> Цена</label>
+     <label><input id="editDesc" type="checkbox" checked> Описание</label>
+     <label>Целевая маржа <input id="editMargin" type="number" value="20" min="5" max="50" style="width:80px">%</label>
+   </div>
+   <button style="margin-top:10px" onclick="proposeEdit()">Подготовить изменения AI</button>
+ </div><div id="editorResult"></div>`;
+}
+
+async function proposeEdit(){
+ const productId=$("#editProduct").value;
+ $("#editorResult").innerHTML='<div class="card">AI готовит предложение…</div>';
+ try{
+  const d=await j("/api/editor/propose",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({
+      productId,
+      targetMargin:Number($("#editMargin").value||20),
+      changePrice:$("#editPrice").checked,
+      changeDescription:$("#editDesc").checked
+    })
+  });
+  window._editProposal=d;
+  $("#editorResult").innerHTML=`<div class="card">
+   <b>${esc(d.name)}</b>
+   <div class="row" style="margin-top:8px">
+    <span class="tag">Текущая цена: ${money(d.currentPrice)}</span>
+    <span class="tag">Закупка: ${money(d.buyPrice)}</span>
+    <span class="tag">Новая цена: ${money(d.proposedPrice)}</span>
+   </div>
+   <div style="margin-top:12px"><b>Новое описание</b></div>
+   <textarea id="proposalDescription" style="width:100%;min-height:260px;background:#0f0f0f;color:#fff;border:1px solid #444;border-radius:8px;padding:10px">${esc(d.proposedDescription||"")}</textarea>
+   <div class="muted small">Можно вручную поправить текст перед записью.</div>
+   <div style="margin-top:10px">
+    <label>WRITE_PIN <input id="writePin" type="password" autocomplete="off"></label>
+   </div>
+   <button style="margin-top:10px" onclick="applyEdit()">ПРИМЕНИТЬ В PROM</button>
+   <div class="muted small" style="margin-top:6px">Изменение будет реальным. Для первого теста выбери один недорогой товар.</div>
+  </div>`;
+ }catch(e){
+  $("#editorResult").innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
+ }
+}
+
+async function applyEdit(){
+ const d=window._editProposal;
+ if(!d) return;
+ const pin=$("#writePin").value;
+ if(!pin){
+   alert("Введи WRITE_PIN");
+   return;
+ }
+ if(!confirm(`Реально изменить товар "${d.name}" в Prom?`)) return;
+
+ const payload={
+   productId:d.productId,
+   confirm:"APPLY"
+ };
+ if(d.proposedPrice!=null) payload.price=d.proposedPrice;
+ const desc=$("#proposalDescription").value;
+ if(desc.trim()) payload.description=desc;
+
+ $("#editorResult").insertAdjacentHTML("beforeend",'<div id="applyStatus" class="card">Отправляю изменение в Prom…</div>');
+ try{
+   const r=await fetch("/api/editor/apply",{
+     method:"POST",
+     headers:{"Content-Type":"application/json","X-Write-Pin":pin},
+     body:JSON.stringify(payload)
+   });
+   const out=await r.json();
+   if(!r.ok) throw new Error(out.error + (out.details?` — ${JSON.stringify(out.details)}`:""));
+   $("#applyStatus").innerHTML='<b class="good">Готово: Prom принял изменение.</b><br><span class="muted small">Теперь обнови каталог и проверь карточку на Prom.</span>';
+ }catch(e){
+   $("#applyStatus").innerHTML=`<b class="bad">Prom не принял изменение:</b><br>${esc(e.message)}<br><span class="muted small">Это безопасно: если API вернул ошибку, массовых изменений не делаем.</span>`;
+ }
+}
+
 health();
 </script>
 </body>
