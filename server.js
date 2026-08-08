@@ -19,6 +19,12 @@ let militarisCache = {
   error: null
 };
 
+let catalogCache = {
+  loadedAt: null,
+  report: [],
+  summary: null
+};
+
 function requirePromToken(req, res, next) {
   if (!process.env.PROM_TOKEN) return res.status(500).json({ error: "PROM_TOKEN не задан" });
   next();
@@ -124,7 +130,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/4.0"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/4.1"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -145,6 +151,7 @@ async function refreshMilitaris(){
     }
   }
   militarisCache={loadedAt:new Date().toISOString(),items,bySku,rawCount:raw.length,error:null};
+  catalogCache={loadedAt:null,report:[],summary:null};
   return {loadedAt:militarisCache.loadedAt,count:items.length,rawCount:raw.length};
 }
 function promProducts(d){ return Array.isArray(d)?d:(Array.isArray(d?.products)?d.products:[]); }
@@ -328,6 +335,128 @@ function summarize(report){
   };
 }
 
+async function getCatalogReport(force=false){
+  if(!force && catalogCache.report.length) return catalogCache;
+  if(!militarisCache.items.length) await refreshMilitaris();
+
+  const products=await fetchAllPromProducts();
+  const report=enrichReport(products.map(p=>{
+    const match=findMilitarisMatch(p);
+    return {
+      product:{
+        id:p.id,
+        name:p.name,
+        price:p.price,
+        currency:p.currency||"UAH",
+        external_id:p.external_id||null,
+        sku:p.sku||p.article||p.code||null
+      },
+      ...metrics(p,match)
+    };
+  }));
+
+  catalogCache={
+    loadedAt:new Date().toISOString(),
+    report,
+    summary:summarize(report)
+  };
+  return catalogCache;
+}
+
+function orderArray(data){
+  return Array.isArray(data)?data:(Array.isArray(data?.orders)?data.orders:[]);
+}
+
+function getOrderItems(order){
+  if(!order || typeof order!=="object") return [];
+  for(const key of ["products","items","order_products","products_data"]){
+    if(Array.isArray(order[key])) return order[key];
+  }
+  return [];
+}
+
+function itemName(item){
+  return scalar(first(item,["name","product_name","title"])) ||
+    scalar(first(item?.product||{},["name","title"]));
+}
+
+function itemQty(item){
+  return cleanNumber(first(item,["quantity","qty","count"])) || 1;
+}
+
+function itemPrice(item){
+  return cleanNumber(first(item,["price","unit_price","price_with_discount","final_price","sale_price"]));
+}
+
+function buildCatalogLookups(report){
+  const byId=new Map();
+  const byExternal=new Map();
+  const bySku=new Map();
+  const byName=new Map();
+
+  for(const x of report){
+    if(x?.product?.id!=null) byId.set(String(x.product.id),x);
+    if(x?.product?.external_id) byExternal.set(norm(x.product.external_id),x);
+    if(x?.product?.sku) bySku.set(norm(x.product.sku),x);
+    if(x?.product?.name) byName.set(norm(x.product.name),x);
+  }
+  return {byId,byExternal,bySku,byName};
+}
+
+function resolveOrderItem(item,lookups){
+  const ids=[
+    first(item,["product_id","id"]),
+    first(item?.product||{},["id","product_id"])
+  ].filter(v=>v!=null).map(String);
+
+  for(const id of ids){
+    if(lookups.byId.has(id)) return lookups.byId.get(id);
+  }
+
+  const external=[
+    first(item,["external_id","product_external_id"]),
+    first(item?.product||{},["external_id"])
+  ].map(scalar).map(norm).filter(Boolean);
+
+  for(const v of external){
+    if(lookups.byExternal.has(v)) return lookups.byExternal.get(v);
+  }
+
+  const skus=[
+    first(item,["sku","article","code"]),
+    first(item?.product||{},["sku","article","code"])
+  ].map(scalar).map(norm).filter(Boolean);
+
+  for(const v of skus){
+    if(lookups.bySku.has(v)) return lookups.bySku.get(v);
+  }
+
+  const name=norm(itemName(item));
+  if(name && lookups.byName.has(name)) return lookups.byName.get(name);
+
+  return null;
+}
+
+async function hydrateOrders(orders){
+  const result=[];
+  const batchSize=5;
+
+  for(let i=0;i<orders.length;i+=batchSize){
+    const slice=orders.slice(i,i+batchSize);
+    const hydrated=await Promise.all(slice.map(async o=>{
+      if(getOrderItems(o).length || !o?.id) return o;
+      try{
+        const detail=await promRequest(`/orders/${encodeURIComponent(o.id)}`);
+        return detail?.order || detail || o;
+      }catch{
+        return o;
+      }
+    }));
+    result.push(...hydrated);
+  }
+  return result;
+}
+
 app.get("/api/health",(req,res)=>{
   res.json({
     ok:true,
@@ -344,16 +473,12 @@ app.post("/api/militaris/refresh",async(req,res)=>{
 
 app.get("/api/catalog/report-all",requirePromToken,async(req,res)=>{
   try{
-    if(!militarisCache.items.length) await refreshMilitaris();
-    const products=await fetchAllPromProducts();
-    const report=enrichReport(products.map(p=>{
-      const match=findMilitarisMatch(p);
-      return {
-        product:{id:p.id,name:p.name,price:p.price,currency:p.currency||"UAH",external_id:p.external_id||null,sku:p.sku||p.article||p.code||null},
-        ...metrics(p,match)
-      };
-    }));
-    res.json({loadedAt:militarisCache.loadedAt,summary:summarize(report),report});
+    const data=await getCatalogReport(true);
+    res.json({
+      loadedAt:data.loadedAt,
+      summary:data.summary,
+      report:data.report
+    });
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
   }
@@ -361,26 +486,96 @@ app.get("/api/catalog/report-all",requirePromToken,async(req,res)=>{
 
 app.get("/api/orders/analytics",requirePromToken,async(req,res)=>{
   try{
-    if(!militarisCache.items.length) await refreshMilitaris();
-    const products=enrichReport((await fetchAllPromProducts()).map(p=>({product:{id:p.id,name:p.name,price:p.price,currency:p.currency||"UAH",external_id:p.external_id||null,sku:p.sku||p.article||p.code||null},...metrics(p,findMilitarisMatch(p))})));
-    const byId=new Map(products.map(x=>[String(x.product.id),x]));
-    const od=await promRequest("/orders/list?limit=100");
-    const orders=Array.isArray(od)?od:(Array.isArray(od?.orders)?od.orders:[]);
-    let revenue=0, estimatedGross=0, units=0, matchedUnits=0;
+    // Главное исправление v4.1: используем готовый кэш каталога,
+    // а не пересчитываем все 1144 × 7993 сопоставления при каждом клике «Продажи».
+    const catalog=await getCatalogReport(false);
+    const lookups=buildCatalogLookups(catalog.report);
+
+    const raw=await promRequest("/orders/list?limit=100");
+    const baseOrders=orderArray(raw);
+    const orders=await hydrateOrders(baseOrders);
+
+    let revenue=0;
+    let estimatedGross=0;
+    let units=0;
+    let matchedUnits=0;
+    let ordersWithItems=0;
+
     const productSales=new Map();
+
     for(const o of orders){
-      const ps=Array.isArray(o.products)?o.products:[];
-      for(const op of ps){
-        const qty=Number(op.quantity||1); const sale=Number(op.price||0)*qty; units+=qty; revenue+=sale;
-        const x=byId.get(String(op.id||op.product_id||""));
-        if(x?.matched){ matchedUnits+=qty; estimatedGross+=(Number(op.price||x.promPrice)-Number(x.buyPrice||0))*qty; }
-        const key=String(op.id||op.product_id||op.name||"unknown");
-        const cur=productSales.get(key)||{name:op.name||x?.product?.name||key,qty:0,revenue:0,estimatedGross:0,matched:Boolean(x?.matched)};
-        cur.qty+=qty;cur.revenue+=sale;if(x?.matched)cur.estimatedGross+=(Number(op.price||x.promPrice)-Number(x.buyPrice||0))*qty;productSales.set(key,cur);
+      const items=getOrderItems(o);
+      if(items.length) ordersWithItems++;
+
+      let orderLinesRevenue=0;
+
+      for(const op of items){
+        const qty=itemQty(op);
+        const x=resolveOrderItem(op,lookups);
+        let unitPrice=itemPrice(op);
+
+        if(!unitPrice && x?.promPrice) unitPrice=Number(x.promPrice);
+        const sale=unitPrice*qty;
+
+        units+=qty;
+        revenue+=sale;
+        orderLinesRevenue+=sale;
+
+        let lineGross=0;
+        if(x?.matched){
+          matchedUnits+=qty;
+          lineGross=(unitPrice-Number(x.buyPrice||0))*qty;
+          estimatedGross+=lineGross;
+        }
+
+        const key=String(
+          first(op,["product_id","id"]) ||
+          first(op?.product||{},["id"]) ||
+          itemName(op) ||
+          "unknown"
+        );
+
+        const cur=productSales.get(key)||{
+          name:itemName(op)||x?.product?.name||key,
+          qty:0,
+          revenue:0,
+          estimatedGross:0,
+          matched:Boolean(x?.matched)
+        };
+
+        cur.qty+=qty;
+        cur.revenue+=sale;
+        cur.estimatedGross+=lineGross;
+        cur.matched=cur.matched||Boolean(x?.matched);
+        productSales.set(key,cur);
+      }
+
+      // Если API списка/деталей заказа не отдал товарные строки,
+      // всё равно учитываем сумму заказа в обороте, но не выдумываем прибыль.
+      if(!items.length){
+        const total=cleanNumber(first(o,[
+          "full_price","total_price","price","amount","total","payment_amount"
+        ]));
+        revenue+=total;
       }
     }
-    res.json({orders:orders.length,units,revenue:round2(revenue),estimatedGross:round2(estimatedGross),matchedUnits,top:[...productSales.values()].sort((a,b)=>b.estimatedGross-a.estimatedGross||b.revenue-a.revenue).slice(0,30)});
-  }catch(e){res.status(e.status||500).json({error:e.message,details:e.data||null});}
+
+    res.json({
+      orders:orders.length,
+      ordersWithItems,
+      units,
+      revenue:round2(revenue),
+      estimatedGross:round2(estimatedGross),
+      matchedUnits,
+      catalogCachedAt:catalog.loadedAt,
+      note:"Расчёт по последним 100 заказам Prom. Прибыль считается только по товарным строкам, которые удалось сопоставить с каталогом.",
+      top:[...productSales.values()]
+        .sort((a,b)=>b.estimatedGross-a.estimatedGross||b.revenue-a.revenue)
+        .slice(0,30)
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
 });
 
 app.get("/api/orders",requirePromToken,async(req,res)=>{
@@ -426,4 +621,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v4 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v4.1 running on ${PORT}`));
