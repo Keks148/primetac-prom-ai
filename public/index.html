@@ -1,12 +1,153 @@
 <!doctype html>
-<html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PrimeTac Prom AI</title>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PrimeTac Prom AI v2</title>
 <style>
-body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}.wrap{max-width:1100px;margin:auto;padding:16px}h1{font-size:24px;margin:0 0 8px}.muted{color:#aaa}.bar{display:flex;gap:8px;flex-wrap:wrap;margin:16px 0}button{border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer}.card{background:#1c1c1c;border:1px solid #333;border-radius:14px;padding:14px;margin:10px 0}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px}.pill{display:inline-block;background:#2b2b2b;border-radius:999px;padding:5px 8px;margin:3px 4px 3px 0}pre{white-space:pre-wrap;background:#0b0b0b;padding:12px;border-radius:10px;overflow:auto}input{background:#0f0f0f;color:#fff;border:1px solid #444;border-radius:8px;padding:8px;width:110px}.ok{color:#8fd18f}.bad{color:#ff8b8b}
-</style></head><body><div class="wrap"><h1>PrimeTac Prom AI</h1><div class="muted">Безопасная панель чтения Prom.ua + AI-анализ карточек</div>
-<div class="bar"><button onclick="loadHealth()">Проверить подключение</button><button onclick="loadProducts()">Загрузить товары</button><button onclick="loadOrders()">Загрузить заказы</button></div>
-<div id="status" class="card">Нажми «Проверить подключение».</div>
-<div class="card"><b>Калькулятор Militaris</b><div class="grid" style="margin-top:10px"><label>Бренд<br><input id="brand" value="Salomon"></label><label>Цена сайта, грн<br><input id="retail" type="number" value="7600"></label><label>Твоя цена, грн<br><input id="sell" type="number" value="6990"></label><div><button onclick="calc()">Посчитать</button><div id="calcOut" style="margin-top:8px"></div></div></div></div>
-<div id="content"></div></div>
+body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
+.wrap{max-width:1100px;margin:auto;padding:16px}
+h1{font-size:24px;margin:0 0 5px}.muted{color:#aaa}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin:14px 0}
+button{border:0;border-radius:10px;padding:11px 14px;font-weight:700;cursor:pointer}
+.card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:14px;margin:10px 0}
+.pill{display:inline-block;background:#2a2a2a;border-radius:999px;padding:5px 8px;margin:3px}
+.good{color:#8fd18f}.warn{color:#ffd27f}.bad{color:#ff8b8b}
+pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;overflow:auto}
+select,input{background:#0f0f0f;color:#fff;border:1px solid #444;border-radius:8px;padding:9px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{border-bottom:1px solid #333;padding:8px;text-align:left;vertical-align:top}
+th{position:sticky;top:0;background:#181818}
+.tablewrap{overflow:auto;max-height:65vh;border:1px solid #333;border-radius:12px}
+</style>
+</head>
+<body>
+<div class="wrap">
+<h1>PrimeTac Prom AI <span class="muted">v2</span></h1>
+<div class="muted">Prom.ua + Militaris XML + реальная маржа + AI-анализ</div>
+
+<div class="bar">
+<button onclick="health()">Проверить подключение</button>
+<button onclick="refreshMilitaris()">Обновить Militaris</button>
+<button onclick="loadReport()">Отчёт по товарам</button>
+<button onclick="loadOrders()">Заказы</button>
+</div>
+
+<div id="status" class="card">Проверяем...</div>
+
+<div class="card">
+<div class="row">
+<b>Фильтр отчёта</b>
+<select id="filter" onchange="renderReport()">
+<option value="all">Все</option>
+<option value="matched">Только сопоставленные</option>
+<option value="profit">Прибыль > 0</option>
+<option value="best">Маржа ≥ 15%</option>
+<option value="bad">Убыток / нулевая маржа</option>
+<option value="unmatched">Не сопоставлены</option>
+</select>
+<select id="sort" onchange="renderReport()">
+<option value="margin">Сначала высокая маржа</option>
+<option value="profit">Сначала высокая прибыль</option>
+<option value="price">Сначала высокая цена</option>
+</select>
+</div>
+<div id="summary" class="muted" style="margin-top:8px"></div>
+</div>
+
+<div id="content"></div>
+</div>
+
 <script>
-const $=s=>document.querySelector(s);function esc(v){return String(v??"").replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}function discountForBrand(brand){const b=String(brand||"").toLowerCase();if(b.includes("salomon"))return .20;if(b.includes("helikon"))return .10;if(b.includes("lowa"))return .05;if(b.includes("belleville"))return .15;return .15}function calc(){const brand=$("#brand").value,retail=Number($("#retail").value||0),sell=Number($("#sell").value||0),d=discountForBrand(brand),buy=retail*(1-d),margin=sell-buy,marginPct=sell?margin/sell*100:0;$("#calcOut").innerHTML=`Скидка: <b>${Math.round(d*100)}%</b><br>Закупка: <b>${buy.toFixed(0)} грн</b><br>Валовая маржа: <b>${margin.toFixed(0)} грн (${marginPct.toFixed(1)}%)</b>`}async function jget(url,opts={}){const r=await fetch(url,opts),d=await r.json();if(!r.ok)throw new Error(d.error||"Ошибка запроса");return d}async function loadHealth(){try{const d=await jget("/api/health");$("#status").innerHTML=`Prom: <b class="${d.promConfigured?'ok':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'ok':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b>`}catch(e){$("#status").textContent=e.message}}function normalizeProducts(data){if(Array.isArray(data))return data;if(Array.isArray(data.products))return data.products;return []}async function loadProducts(){$("#content").innerHTML='<div class="card">Загрузка...</div>';try{const data=await jget("/api/products?limit=50"),products=normalizeProducts(data);if(!products.length){$("#content").innerHTML=`<div class="card">Товары не найдены.<pre>${esc(JSON.stringify(data,null,2))}</pre></div>`;return}window._products=products;$("#content").innerHTML=products.map((p,i)=>{const brand=p.brand||p.name||"",price=Number(p.price||0),d=discountForBrand(brand),buy=price*(1-d);return `<div class="card"><b>${esc(p.name||"Без названия")}</b><br><span class="pill">ID: ${esc(p.id)}</span><span class="pill">Цена: ${esc(p.price)} ${esc(p.currency||"UAH")}</span><span class="pill">Расчёт закупки*: ${buy.toFixed(0)} грн</span><div class="muted" style="margin:6px 0">*если цена в Prom совпадает с розничной ценой поставщика</div><button onclick="analyzeProduct(${i})">AI-анализ</button><pre id="a${i}" style="display:none"></pre></div>`}).join("")}catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}}async function analyzeProduct(i){const box=document.getElementById("a"+i);box.style.display="block";box.textContent="Анализ...";try{const d=await jget("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({product:window._products[i]})});box.textContent=d.text}catch(e){box.textContent=e.message}}async function loadOrders(){$("#content").innerHTML='<div class="card">Загрузка заказов...</div>';try{const data=await jget("/api/orders"),orders=Array.isArray(data.orders)?data.orders:[];if(!orders.length){$("#content").innerHTML=`<div class="card">Заказов пока нет.<pre>${esc(JSON.stringify(data,null,2))}</pre></div>`;return}$("#content").innerHTML=orders.slice(0,50).map(o=>`<div class="card"><b>Заказ #${esc(o.id)}</b><br><span class="pill">Статус: ${esc(o.status)}</span><span class="pill">Сумма: ${esc(o.full_price||o.price||"")}</span><div class="muted">${esc(o.date_created||"")}</div></div>`).join("")}catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}}calc();
-</script></body></html>
+const $=s=>document.querySelector(s);
+let REPORT=[];
+
+function esc(v){return String(v??"").replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
+async function j(url,opts={}){const r=await fetch(url,opts);const d=await r.json();if(!r.ok)throw new Error(d.error||"Ошибка");return d;}
+function money(v){return v==null?"—":Math.round(Number(v)).toLocaleString("uk-UA")+" грн";}
+
+async function health(){
+ try{
+  const d=await j("/api/health");
+  $("#status").innerHTML=
+   `Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · `+
+   `AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · `+
+   `Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'ещё не загружен'}</b>`;
+ }catch(e){$("#status").textContent=e.message}
+}
+
+async function refreshMilitaris(){
+ $("#status").textContent="Скачиваю XML Militaris. Файл большой — это может занять время…";
+ try{
+   const d=await j("/api/militaris/refresh",{method:"POST"});
+   $("#status").innerHTML=`Militaris загружен: <b class="good">${d.count}</b> товаров.`;
+ }catch(e){$("#status").innerHTML=`<span class="bad">${esc(e.message)}</span>`}
+}
+
+async function loadReport(){
+ $("#content").innerHTML='<div class="card">Получаю товары Prom и сопоставляю с Militaris…</div>';
+ try{
+   const d=await j("/api/catalog/report?limit=100");
+   REPORT=d.report||[];
+   $("#summary").textContent=`Загружено ${d.count}; сопоставлено ${d.matched}. Сейчас отчёт показывает первые 100 товаров Prom.`;
+   renderReport();
+ }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
+}
+
+function renderReport(){
+ let rows=[...REPORT];
+ const f=$("#filter").value;
+ if(f==="matched") rows=rows.filter(x=>x.matched);
+ if(f==="profit") rows=rows.filter(x=>(x.grossProfit??-1)>0);
+ if(f==="best") rows=rows.filter(x=>(x.marginPct??-999)>=15);
+ if(f==="bad") rows=rows.filter(x=>x.matched && (x.grossProfit??1)<=0);
+ if(f==="unmatched") rows=rows.filter(x=>!x.matched);
+
+ const s=$("#sort").value;
+ rows.sort((a,b)=>{
+   if(s==="profit") return (b.grossProfit??-999999)-(a.grossProfit??-999999);
+   if(s==="price") return Number(b.promPrice||0)-Number(a.promPrice||0);
+   return (b.marginPct??-999)-(a.marginPct??-999);
+ });
+
+ if(!rows.length){$("#content").innerHTML='<div class="card">По фильтру ничего нет.</div>';return;}
+ $("#content").innerHTML=`<div class="tablewrap"><table>
+ <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Прибыль</th><th>Маржа</th><th>Match</th><th>AI</th></tr></thead>
+ <tbody>${rows.map((x,i)=>{
+   const idx=REPORT.indexOf(x);
+   const cls=(x.marginPct??-999)>=15?'good':((x.grossProfit??0)>0?'warn':'bad');
+   return `<tr>
+   <td><b>${esc(x.product.name)}</b><br><span class="muted">ID ${esc(x.product.id)}</span></td>
+   <td>${money(x.promPrice)}</td>
+   <td>${x.matched?`${money(x.supplierPrice)}<br><span class="muted">${esc(x.supplierName||"")}</span>`:'—'}</td>
+   <td>${money(x.buyPrice)}${x.discountPct!=null?`<br><span class="muted">−${x.discountPct}%</span>`:''}</td>
+   <td class="${cls}">${money(x.grossProfit)}</td>
+   <td class="${cls}">${x.marginPct==null?'—':x.marginPct+'%'}</td>
+   <td>${x.matched?`${esc(x.matchMethod)} ${x.matchConfidence??''}`:'нет'}</td>
+   <td><button onclick="ai(${idx})">AI</button></td>
+   </tr><tr id="airow${idx}" style="display:none"><td colspan="8"><pre id="ai${idx}"></pre></td></tr>`;
+ }).join("")}</tbody></table></div>`;
+}
+
+async function ai(i){
+ const row=document.getElementById("airow"+i), box=document.getElementById("ai"+i);
+ row.style.display="table-row"; box.textContent="Анализ…";
+ try{
+  const d=await j("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(REPORT[i])});
+  box.textContent=d.text;
+ }catch(e){box.textContent=e.message}
+}
+
+async function loadOrders(){
+ $("#content").innerHTML='<div class="card">Загрузка заказов…</div>';
+ try{
+  const d=await j("/api/orders");
+  const a=Array.isArray(d.orders)?d.orders:[];
+  $("#content").innerHTML=a.length?a.slice(0,50).map(o=>`<div class="card"><b>Заказ #${esc(o.id)}</b><br><span class="pill">${esc(o.status)}</span><span class="pill">${esc(o.full_price||o.price||"")}</span><div class="muted">${esc(o.date_created||"")}</div></div>`).join(""):'<div class="card">Заказов пока нет.</div>';
+ }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
+}
+health();
+</script>
+</body>
+</html>
