@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v7</title>
+<title>PrimeTac Prom AI v7.1</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -32,6 +32,10 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 .adbadge.green{background:#173c20;color:#8fd18f}
 .adbadge.yellow{background:#463a17;color:#ffd27f}
 .adbadge.red{background:#431b1b;color:#ff8b8b}
+
+.ad-selected{outline:2px solid #8fd18f;box-shadow:0 0 0 3px rgba(143,209,143,.12)}
+.editor-nav{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}
+.editor-current{background:#151f17;border:1px solid #365c3c;border-radius:10px;padding:10px;margin:8px 0}
 </style>
 </head>
 <body>
@@ -78,7 +82,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v7: рейтинг рекламы + рынок Prom + безопасный AI основаны на закупке и марже. Это не анализ цен конкурентов.
+v7.1: удобный ТОП-30 + рынок Prom + безопасный AI основаны на закупке и марже. Это не анализ цен конкурентов.
 </div>
 </div>
 
@@ -212,21 +216,49 @@ async function loadOrders(){
  }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
 }
 
-function editorProductOptions(){
- return REPORT.slice(0,500).map(x=>`<option value="${esc(x.product.id)}">${esc(x.product.name)} — ${money(x.promPrice)}</option>`).join("");
+function editorProductOptions(selectedId=null){
+ const sid=selectedId==null?"":String(selectedId);
+ return REPORT.map(x=>{
+   const id=String(x.product.id);
+   const selected=id===sid?" selected":"";
+   return `<option value="${esc(id)}"${selected}>${esc(x.product.name)} — ${money(x.promPrice)}</option>`;
+ }).join("");
 }
 
-function openEditor(){
+function currentAdCandidateIndex(productId){
+ const list=window.AD_CANDIDATES||[];
+ return list.findIndex(x=>String(x?.product?.id)===String(productId));
+}
+
+function editorNavHtml(selectedProductId){
+ const list=window.AD_CANDIDATES||[];
+ const idx=currentAdCandidateIndex(selectedProductId);
+ if(idx<0) return "";
+ const x=list[idx];
+ return `<div class="editor-current">
+   <b>ТОП-30: #${idx+1} из ${list.length}</b><br>
+   <span class="muted small">${esc(x.product.name)}</span>
+   <div class="editor-nav">
+     <button onclick="openAdCandidateRelative(-1)" ${idx<=0?"disabled":""}>← Предыдущий</button>
+     <button onclick="backToAdCandidates()">← Вернуться к ТОП-30</button>
+     <button onclick="openAdCandidateRelative(1)" ${idx>=list.length-1?"disabled":""}>Следующий →</button>
+   </div>
+ </div>`;
+}
+
+function openEditor(selectedProductId=null){
  if(!REPORT.length){
    $("#content").innerHTML='<div class="card warn">Сначала нажми «Анализ всего каталога».</div>';
    return;
  }
- $("#content").innerHTML=`<div class="card">
+ const selected=selectedProductId==null?null:String(selectedProductId);
+ window._editorSelectedProductId=selected;
+ $("#content").innerHTML=`${selected?editorNavHtml(selected):""}<div class="card">
    <h3 style="margin-top:0">AI-редактор товара</h3>
    <div class="muted small">Сначала AI только готовит изменения. Запись в Prom происходит отдельной кнопкой и требует WRITE_PIN.</div>
    <div style="margin-top:10px">
      <label>Товар</label><br>
-     <select id="editProduct" style="width:100%">${editorProductOptions()}</select>
+     <select id="editProduct" style="width:100%">${editorProductOptions(selected)}</select>
    </div>
    <div class="row" style="margin-top:10px">
      <label><input id="editName" type="checkbox" checked> Название</label>
@@ -236,6 +268,18 @@ function openEditor(){
    </div>
    <button style="margin-top:10px" onclick="proposeEdit()">Подготовить изменения AI</button>
  </div><div id="editorResult"></div>`;
+
+ const sel=document.getElementById("editProduct");
+ if(sel){
+   sel.addEventListener("change",()=>{
+     window._editorSelectedProductId=sel.value;
+     const idx=currentAdCandidateIndex(sel.value);
+     if(idx>=0){
+       const nav=document.querySelector(".editor-current");
+       if(nav) nav.outerHTML=editorNavHtml(sel.value);
+     }
+   });
+ }
 }
 
 async function proposeEdit(){
@@ -380,12 +424,13 @@ async function applyEdit(){
  }
 }
 
-async function loadAdCandidates(){
- $("#content").innerHTML='<div class="card">Формирую предварительный ТОП-30 по марже, прибыли и надёжности match…</div>';
- try{
-   const d=await j("/api/ads/candidates?limit=30");
-   const rows=(d.items||[]).map((x,i)=>`
-     <div class="card">
+function renderAdCandidates(selectedId=null){
+ const list=window.AD_CANDIDATES||[];
+ const note=window.AD_CANDIDATES_NOTE||"";
+ const rows=list.map((x,i)=>{
+   const id=String(x.product.id);
+   const selected=selectedId!=null && id===String(selectedId);
+   return `<div id="ad-candidate-${esc(id)}" class="card ${selected?"ad-selected":""}">
        <b>${i+1}. ${esc(x.product.name)}</b>
        <div class="row" style="margin-top:6px">
          <span class="tag">Pre-score ${esc(x.preScore)}</span>
@@ -395,24 +440,62 @@ async function loadAdCandidates(){
          <span class="tag">Маржа ${x.marginPct==null?"—":x.marginPct+"%"}</span>
        </div>
        <div class="muted small" style="margin-top:6px">Это предварительный рейтинг. Для финального решения нажми «Проверить рынок Prom» в AI-редакторе.</div>
-       <button style="margin-top:8px" onclick="openEditorFor('${esc(x.product.id)}')">Открыть в AI-редакторе</button>
-     </div>
-   `).join("");
-   $("#content").innerHTML=`<div class="card"><b>ТОП-30 кандидатов на рекламу</b><div class="muted small">${esc(d.note||"")}</div></div>${rows}`;
+       <button style="margin-top:8px" onclick="openEditorFor('${esc(id)}')">Редактировать именно этот товар</button>
+     </div>`;
+ }).join("");
+
+ $("#content").innerHTML=`<div class="card">
+   <b>ТОП-30 кандидатов на рекламу</b>
+   <div class="muted small">${esc(note)}</div>
+   ${selectedId?`<div class="good small" style="margin-top:6px">Подсвечен товар, который ты только что редактировал.</div>`:""}
+ </div>${rows}`;
+
+ if(selectedId!=null){
+   setTimeout(()=>{
+     const el=document.getElementById(`ad-candidate-${String(selectedId)}`);
+     if(el) el.scrollIntoView({behavior:"smooth",block:"center"});
+   },60);
+ }
+}
+
+async function loadAdCandidates(){
+ $("#content").innerHTML='<div class="card">Формирую предварительный ТОП-30 по марже, прибыли и надёжности match…</div>';
+ try{
+   const d=await j("/api/ads/candidates?limit=30");
+   window.AD_CANDIDATES=d.items||[];
+   window.AD_CANDIDATES_NOTE=d.note||"";
+   renderAdCandidates();
  }catch(e){
    $("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
  }
 }
 
 function openEditorFor(productId){
- openEditor();
+ window._lastAdCandidateId=String(productId);
+ openEditor(String(productId));
  setTimeout(()=>{
    const sel=document.getElementById("editProduct");
    if(sel){
      sel.value=String(productId);
      sel.scrollIntoView({behavior:"smooth",block:"center"});
    }
- },50);
+ },40);
+}
+
+function backToAdCandidates(){
+ const id=window._editorSelectedProductId || window._lastAdCandidateId || null;
+ renderAdCandidates(id);
+}
+
+function openAdCandidateRelative(delta){
+ const list=window.AD_CANDIDATES||[];
+ const current=window._editorSelectedProductId || window._lastAdCandidateId;
+ const idx=currentAdCandidateIndex(current);
+ if(idx<0) return;
+ const next=Math.max(0,Math.min(list.length-1,idx+delta));
+ const id=String(list[next].product.id);
+ window._lastAdCandidateId=id;
+ openEditor(id);
 }
 
 health();
