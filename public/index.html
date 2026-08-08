@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v5</title>
+<title>PrimeTac Prom AI v6</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -70,7 +70,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v5: AI-редактор цен и описаний основаны на закупке и марже. Это не анализ цен конкурентов.
+v6: цена по рынку Prom + AI-редактор основаны на закупке и марже. Это не анализ цен конкурентов.
 </div>
 </div>
 
@@ -221,6 +221,7 @@ function openEditor(){
      <select id="editProduct" style="width:100%">${editorProductOptions()}</select>
    </div>
    <div class="row" style="margin-top:10px">
+     <label><input id="editName" type="checkbox" checked> Название</label>
      <label><input id="editPrice" type="checkbox" checked> Цена</label>
      <label><input id="editDesc" type="checkbox" checked> Описание</label>
      <label>Целевая маржа <input id="editMargin" type="number" value="20" min="5" max="50" style="width:80px">%</label>
@@ -240,17 +241,25 @@ async function proposeEdit(){
       productId,
       targetMargin:Number($("#editMargin").value||20),
       changePrice:$("#editPrice").checked,
-      changeDescription:$("#editDesc").checked
+      changeDescription:$("#editDesc").checked,
+      changeName:$("#editName").checked
     })
   });
   window._editProposal=d;
   $("#editorResult").innerHTML=`<div class="card">
    <b>${esc(d.name)}</b>
+   <div style="margin-top:10px"><b>Новое название</b></div>
+   <input id="proposalName" style="width:100%" value="${esc(d.proposedName||d.currentName||"")}">
    <div class="row" style="margin-top:8px">
     <span class="tag">Текущая цена: ${money(d.currentPrice)}</span>
     <span class="tag">Закупка: ${money(d.buyPrice)}</span>
-    <span class="tag">Новая цена: ${money(d.proposedPrice)}</span>
+    <span class="tag" id="newPriceTag">Цена по марже: ${money(d.proposedPrice)}</span>
    </div>
+   <div class="row" style="margin-top:10px">
+     <label>Минимальная маржа <input id="marketMinMargin" type="number" value="12" min="5" max="40" style="width:70px">%</label>
+     <button onclick="marketCheck()">Проверить рынок Prom</button>
+   </div>
+   <div id="marketResult"></div>
    <div style="margin-top:12px"><b>Новое описание</b></div>
    <textarea id="proposalDescription" style="width:100%;min-height:260px;background:#0f0f0f;color:#fff;border:1px solid #444;border-radius:8px;padding:10px">${esc(d.proposedDescription||"")}</textarea>
    <div class="muted small">Можно вручную поправить текст перед записью.</div>
@@ -262,6 +271,63 @@ async function proposeEdit(){
   </div>`;
  }catch(e){
   $("#editorResult").innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
+ }
+}
+
+async function marketCheck(){
+ const d=window._editProposal;
+ if(!d) return;
+ const box=$("#marketResult");
+ box.innerHTML='<div class="card">Ищу актуальные цены на Prom.ua…</div>';
+
+ try{
+   const r=await fetch("/api/market/check",{
+     method:"POST",
+     headers:{"Content-Type":"application/json"},
+     body:JSON.stringify({
+       productId:d.productId,
+       minMargin:Number($("#marketMinMargin").value||12)
+     })
+   });
+   const m=await r.json();
+   if(!r.ok) throw new Error(m.error||"Ошибка поиска рынка");
+
+   window._marketResult=m;
+   if(m.recommendedPrice!=null){
+     d.proposedPrice=m.recommendedPrice;
+     const tag=document.getElementById("newPriceTag");
+     if(tag) tag.textContent=`Цена по рынку: ${money(m.recommendedPrice)}`;
+   }
+
+   const comps=(m.competitors||[]).map(c=>
+     `<div style="padding:6px 0;border-bottom:1px solid #333">
+       <b>${money(c.price)}</b> · ${esc(c.match)}
+       <br><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title||c.url)}</a>
+     </div>`
+   ).join("");
+
+   const sources=(m.sources||[]).map(s=>
+     `<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title||s.url)}</a>`
+   ).join("<br>");
+
+   box.innerHTML=`<div class="card">
+     <b>Рынок Prom</b>
+     <div class="row" style="margin-top:8px">
+       <span class="tag">Минимум рынка: ${money(m.marketLow)}</span>
+       <span class="tag">Медиана: ${money(m.marketMedian)}</span>
+       <span class="tag">Нижняя четверть: ${money(m.marketQ1)}</span>
+       <span class="tag">Минимум по марже: ${money(m.floorPrice)}</span>
+       <span class="tag">Рекомендовано: ${money(m.recommendedPrice)}</span>
+       <span class="tag">Прибыль: ${money(m.expectedProfit)}</span>
+       <span class="tag">Маржа: ${m.expectedMargin==null?"—":m.expectedMargin+"%"}</span>
+     </div>
+     <p><strong>${esc(m.status||"")}</strong></p>
+     <div class="muted small">${esc(m.comment||"")}</div>
+     <div style="margin-top:10px"><b>Найденные предложения</b>${comps||'<div class="muted">Точных предложений не найдено.</div>'}</div>
+     ${sources?`<div style="margin-top:10px"><b>Источники поиска</b><br>${sources}</div>`:""}
+   </div>`;
+ }catch(e){
+   box.innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
  }
 }
 
@@ -280,6 +346,8 @@ async function applyEdit(){
    confirm:"APPLY"
  };
  if(d.proposedPrice!=null) payload.price=d.proposedPrice;
+ const newName=$("#proposalName")?.value?.trim();
+ if(newName) payload.name=newName;
  const desc=$("#proposalDescription").value;
  if(desc.trim()) payload.description=desc;
 
