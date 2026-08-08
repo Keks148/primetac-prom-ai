@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v3</title>
+<title>PrimeTac Prom AI v3.1</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -12,24 +12,24 @@ h1{font-size:24px;margin:0 0 5px}.muted{color:#aaa}.small{font-size:12px}
 button{border:0;border-radius:10px;padding:10px 13px;font-weight:700;cursor:pointer}
 .card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:13px;margin:10px 0}
 .good{color:#8fd18f}.warn{color:#ffd27f}.bad{color:#ff8b8b}
-pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;overflow:auto}
-select,input{background:#0f0f0f;color:#fff;border:1px solid #444;border-radius:8px;padding:9px;max-width:100%}
-.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:8px}
 .stat{background:#161616;border:1px solid #303030;border-radius:12px;padding:10px}
 .stat b{display:block;font-size:21px;margin-top:3px}
+.row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+select,input{background:#0f0f0f;color:#fff;border:1px solid #444;border-radius:8px;padding:9px}
+.search{min-width:220px;flex:1}
 table{width:100%;border-collapse:collapse;font-size:13px}
 th,td{border-bottom:1px solid #333;padding:7px;text-align:left;vertical-align:top}
 th{position:sticky;top:0;background:#181818;z-index:2}
 .tablewrap{overflow:auto;max-height:70vh;border:1px solid #333;border-radius:12px}
 .tag{display:inline-block;border-radius:999px;padding:3px 6px;background:#292929;margin:2px;font-size:11px}
-.search{min-width:220px;flex:1}
+pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;overflow:auto}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>PrimeTac Prom AI <span class="muted">v3</span></h1>
-<div class="muted">Весь каталог Prom + Militaris + маржа + техническая рекомендованная цена</div>
+<h1>PrimeTac Prom AI <span class="muted">v3.1</span></h1>
+<div class="muted">Безопасное сопоставление Prom ↔ Militaris</div>
 
 <div class="bar">
 <button onclick="health()">Проверить подключение</button>
@@ -39,47 +39,39 @@ th{position:sticky;top:0;background:#181818;z-index:2}
 </div>
 
 <div id="status" class="card">Проверяем...</div>
-
 <div id="stats" class="stats"></div>
 
 <div class="card">
 <div class="row">
 <input class="search" id="q" placeholder="Поиск товара..." oninput="render()">
-
 <select id="filter" onchange="render()">
-<option value="all">Все товары</option>
-<option value="profit">Прибыльные</option>
+<option value="all">Все</option>
+<option value="matched">Сопоставленные</option>
+<option value="unmatched">Без сопоставления</option>
+<option value="approx">Нужно проверить match</option>
 <option value="margin20">Маржа ≥20%</option>
-<option value="margin15">Маржа ≥15%</option>
 <option value="low">Маржа <10%</option>
 <option value="loss">Убыток</option>
-<option value="unmatched">Не сопоставлены</option>
-<option value="approx">Приблизительный match</option>
 <option value="salomon">Salomon</option>
 <option value="helikon">Helikon-Tex</option>
 <option value="lowa">LOWA</option>
 </select>
-
 <select id="sort" onchange="render()">
 <option value="margin">Маржа ↓</option>
 <option value="profit">Прибыль ↓</option>
-<option value="price">Цена Prom ↓</option>
-<option value="buy">Закупка ↓</option>
+<option value="price">Цена ↓</option>
 <option value="name">Название A→Я</option>
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-«Рекоменд. 20%» — техническая цена для валовой маржи 20%. Это не анализ рынка конкурентов.
+v3.1 специально предпочитает «не сопоставить», чем ошибочно связать разные товары.
 </div>
 </div>
 
 <div id="content"></div>
 </div>
-
 <script>
-const $=s=>document.querySelector(s);
-let REPORT=[];
-
+const $=s=>document.querySelector(s); let REPORT=[];
 function esc(v){return String(v??"").replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));}
 async function j(url,opts={}){const r=await fetch(url,opts);const d=await r.json();if(!r.ok)throw new Error(d.error||"Ошибка");return d;}
 function money(v){return v==null?"—":Math.round(Number(v)).toLocaleString("uk-UA")+" грн";}
@@ -87,68 +79,44 @@ function money(v){return v==null?"—":Math.round(Number(v)).toLocaleString("uk-
 async function health(){
  try{
   const d=await j("/api/health");
-  $("#status").innerHTML=
-   `Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · `+
-   `AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · `+
-   `Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'ещё не загружен'}</b>`;
+  $("#status").innerHTML=`Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'не загружен'}</b>`;
  }catch(e){$("#status").textContent=e.message}
 }
-
 async function refreshMilitaris(){
- $("#status").textContent="Скачиваю XML Militaris…";
- try{
-   const d=await j("/api/militaris/refresh",{method:"POST"});
-   $("#status").innerHTML=`Militaris загружен: <b class="good">${d.count}</b> товаров.`;
- }catch(e){$("#status").innerHTML=`<span class="bad">${esc(e.message)}</span>`}
+ $("#status").textContent="Обновляю Militaris…";
+ try{const d=await j("/api/militaris/refresh",{method:"POST"});$("#status").innerHTML=`Militaris: <b class="good">${d.count}</b> товаров.`}
+ catch(e){$("#status").innerHTML=`<span class="bad">${esc(e.message)}</span>`}
 }
-
-function renderStats(s){
- $("#stats").innerHTML = `
-  <div class="stat"><span class="muted">Товаров Prom</span><b>${s.total}</b></div>
-  <div class="stat"><span class="muted">Сопоставлено</span><b class="good">${s.matched}</b></div>
-  <div class="stat"><span class="muted">Без match</span><b class="${s.unmatched?'warn':''}">${s.unmatched}</b></div>
-  <div class="stat"><span class="muted">Маржа ≥20%</span><b class="good">${s.highMargin}</b></div>
-  <div class="stat"><span class="muted">Маржа <10%</span><b class="${s.lowMargin?'warn':''}">${s.lowMargin}</b></div>
-  <div class="stat"><span class="muted">Убыток</span><b class="${s.loss?'bad':''}">${s.loss}</b></div>
-  <div class="stat"><span class="muted">Match по названию</span><b class="${s.approximateMatches?'warn':''}">${s.approximateMatches}</b></div>
-  <div class="stat"><span class="muted">Сумма валовой прибыли*</span><b>${money(s.oneUnitGross)}</b></div>
- `;
- $("#stats").insertAdjacentHTML("afterend",
-   `<div id="discountStats" class="card small muted">*Сумма прибыли — если условно продать по 1 единице каждого сопоставленного товара. Это не прогноз продаж.</div>`
- );
- const extra = document.getElementById("discountStats");
- const parts = Object.entries(s.byDiscount||{}).map(([k,v])=>`<span class="tag">${esc(k)}: ${v}</span>`).join(" ");
- extra.innerHTML += `<div style="margin-top:7px">${parts}</div>`;
+function stats(s){
+ $("#stats").innerHTML=`
+ <div class="stat"><span class="muted">Товаров Prom</span><b>${s.total}</b></div>
+ <div class="stat"><span class="muted">Надёжно сопоставлено</span><b class="good">${s.matched}</b></div>
+ <div class="stat"><span class="muted">Без match</span><b class="warn">${s.unmatched}</b></div>
+ <div class="stat"><span class="muted">Маржа ≥20%</span><b class="good">${s.highMargin}</b></div>
+ <div class="stat"><span class="muted">Маржа <10%</span><b class="warn">${s.lowMargin}</b></div>
+ <div class="stat"><span class="muted">Убыток</span><b class="bad">${s.loss}</b></div>
+ <div class="stat"><span class="muted">Проверить match</span><b class="warn">${s.approximateMatches}</b></div>
+ <div class="stat"><span class="muted">Условная прибыль*</span><b>${money(s.oneUnitGross)}</b></div>`;
 }
-
 async function loadAll(){
- $("#content").innerHTML='<div class="card">Загружаю весь каталог Prom и сопоставляю с Militaris. На бесплатном Render это может занять немного времени…</div>';
- $("#stats").innerHTML="";
- const old=document.getElementById("discountStats"); if(old) old.remove();
-
+ $("#content").innerHTML='<div class="card">Загрузка и строгая проверка совпадений…</div>';
  try{
-   const d=await j("/api/catalog/report-all");
-   REPORT=d.report||[];
-   renderStats(d.summary);
-   render();
- }catch(e){
-   $("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
- }
+  const d=await j("/api/catalog/report-all");
+  REPORT=d.report||[]; stats(d.summary); render();
+ }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
 }
-
 function render(){
  let rows=[...REPORT];
  const q=$("#q").value.trim().toLowerCase();
- if(q) rows=rows.filter(x=>(x.product.name||"").toLowerCase().includes(q) || String(x.product.id||"").includes(q));
+ if(q) rows=rows.filter(x=>(x.product.name||"").toLowerCase().includes(q)||String(x.product.id||"").includes(q));
 
  const f=$("#filter").value;
- if(f==="profit") rows=rows.filter(x=>(x.grossProfit??-1)>0);
+ if(f==="matched") rows=rows.filter(x=>x.matched);
+ if(f==="unmatched") rows=rows.filter(x=>!x.matched);
+ if(f==="approx") rows=rows.filter(x=>x.matchMethod==="name_strong");
  if(f==="margin20") rows=rows.filter(x=>(x.marginPct??-999)>=20);
- if(f==="margin15") rows=rows.filter(x=>(x.marginPct??-999)>=15);
  if(f==="low") rows=rows.filter(x=>x.matched && (x.marginPct??999)<10);
  if(f==="loss") rows=rows.filter(x=>x.matched && (x.grossProfit??1)<=0);
- if(f==="unmatched") rows=rows.filter(x=>!x.matched);
- if(f==="approx") rows=rows.filter(x=>x.matchMethod==="name");
  if(f==="salomon") rows=rows.filter(x=>x.discountGroup==="Salomon");
  if(f==="helikon") rows=rows.filter(x=>x.discountGroup==="Helikon-Tex");
  if(f==="lowa") rows=rows.filter(x=>x.discountGroup==="LOWA");
@@ -157,56 +125,42 @@ function render(){
  rows.sort((a,b)=>{
    if(s==="profit") return (b.grossProfit??-999999)-(a.grossProfit??-999999);
    if(s==="price") return Number(b.promPrice||0)-Number(a.promPrice||0);
-   if(s==="buy") return (b.buyPrice??-999999)-(a.buyPrice??-999999);
    if(s==="name") return String(a.product.name||"").localeCompare(String(b.product.name||""),"uk");
    return (b.marginPct??-999)-(a.marginPct??-999);
  });
 
  if(!rows.length){$("#content").innerHTML='<div class="card">По фильтру ничего нет.</div>';return;}
-
  $("#content").innerHTML=`<div class="tablewrap"><table>
- <thead><tr>
- <th>Товар</th><th>Prom</th><th>Militaris</th><th>Скидка</th><th>Закупка</th>
- <th>Прибыль</th><th>Маржа</th><th>Рекоменд. 20%</th><th>Риск</th><th>AI</th>
- </tr></thead>
+ <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Прибыль</th><th>Маржа</th><th>Рекоменд.20%</th><th>Match</th><th>AI</th></tr></thead>
  <tbody>${rows.map(x=>{
    const idx=REPORT.indexOf(x);
    const cls=(x.marginPct??-999)>=20?'good':((x.grossProfit??0)>0?'warn':'bad');
-   const flags=(x.flags||[]).map(v=>`<span class="tag">${esc(v)}</span>`).join("");
    return `<tr>
    <td><b>${esc(x.product.name)}</b><br><span class="muted small">ID ${esc(x.product.id)}</span></td>
    <td>${money(x.promPrice)}</td>
    <td>${x.matched?`${money(x.supplierPrice)}<br><span class="muted small">${esc(x.supplierName||"")}</span>`:'—'}</td>
-   <td>${x.discountPct!=null?`−${x.discountPct}%<br><span class="muted small">${esc(x.discountGroup||"")}</span>`:'—'}</td>
-   <td>${money(x.buyPrice)}</td>
+   <td>${money(x.buyPrice)}${x.discountPct!=null?`<br><span class="muted small">−${x.discountPct}% ${esc(x.discountGroup||"")}</span>`:''}</td>
    <td class="${cls}">${money(x.grossProfit)}</td>
    <td class="${cls}">${x.marginPct==null?'—':x.marginPct+'%'}</td>
    <td>${money(x.recommended20)}</td>
-   <td>${flags||'—'}<br>${x.matched?`<span class="muted small">${esc(x.matchMethod)} ${x.matchConfidence??''}</span>`:''}</td>
+   <td>${x.matched?`<span class="tag">${esc(x.matchMethod)}</span> <span class="tag">${esc(x.matchConfidence)}</span>`:'<span class="tag">нет</span>'}${(x.flags||[]).map(v=>`<div class="small warn">${esc(v)}</div>`).join("")}</td>
    <td><button onclick="ai(${idx})">AI</button></td>
-   </tr>
-   <tr id="airow${idx}" style="display:none"><td colspan="10"><pre id="ai${idx}"></pre></td></tr>`;
+   </tr><tr id="airow${idx}" style="display:none"><td colspan="9"><pre id="ai${idx}"></pre></td></tr>`;
  }).join("")}</tbody></table></div>`;
 }
-
 async function ai(i){
- const row=document.getElementById("airow"+i), box=document.getElementById("ai"+i);
+ const row=document.getElementById("airow"+i),box=document.getElementById("ai"+i);
  row.style.display="table-row"; box.textContent="Анализ…";
- try{
-  const d=await j("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(REPORT[i])});
-  box.textContent=d.text;
- }catch(e){box.textContent=e.message}
+ try{const d=await j("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(REPORT[i])});box.textContent=d.text}
+ catch(e){box.textContent=e.message}
 }
-
 async function loadOrders(){
  $("#content").innerHTML='<div class="card">Загрузка заказов…</div>';
  try{
-  const d=await j("/api/orders");
-  const a=Array.isArray(d.orders)?d.orders:[];
-  $("#content").innerHTML=a.length?a.slice(0,100).map(o=>`<div class="card"><b>Заказ #${esc(o.id)}</b><br><span class="tag">${esc(o.status)}</span><span class="tag">${esc(o.full_price||o.price||"")}</span><div class="muted">${esc(o.date_created||"")}</div></div>`).join(""):'<div class="card">Заказов пока нет.</div>';
+  const d=await j("/api/orders"); const a=Array.isArray(d.orders)?d.orders:[];
+  $("#content").innerHTML=a.length?a.slice(0,100).map(o=>`<div class="card"><b>Заказ #${esc(o.id)}</b><div class="muted">${esc(o.status||"")} · ${esc(o.full_price||o.price||"")}</div></div>`).join(""):'<div class="card">Заказов нет.</div>';
  }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
 }
-
 health();
 </script>
 </body>
