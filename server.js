@@ -11,6 +11,9 @@ const MILITARIS_XML_URL =
   process.env.MILITARIS_XML_URL ||
   "https://militaris.com.ua/content/export/04658108dda3987543769e4a63b496ca.xml";
 
+const WRITE_ENABLED = String(process.env.WRITE_ENABLED || "false").toLowerCase() === "true";
+const WRITE_PIN = process.env.WRITE_PIN || "";
+
 let militarisCache = {
   loadedAt: null,
   items: [],
@@ -130,7 +133,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/4.1"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/5.0"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -473,12 +476,8 @@ app.post("/api/militaris/refresh",async(req,res)=>{
 
 app.get("/api/catalog/report-all",requirePromToken,async(req,res)=>{
   try{
-    const data=await getCatalogReport(true);
-    res.json({
-      loadedAt:data.loadedAt,
-      summary:data.summary,
-      report:data.report
-    });
+    const d=await getCatalogReport(true);
+    res.json({loadedAt:d.loadedAt,summary:d.summary,report:d.report});
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
   }
@@ -583,6 +582,193 @@ app.get("/api/orders",requirePromToken,async(req,res)=>{
   catch(e){ res.status(e.status||500).json({error:e.message,details:e.data||null}); }
 });
 
+function requireWritePin(req,res,next){
+  if(!WRITE_ENABLED){
+    return res.status(403).json({error:"WRITE_ENABLED=false. Запись в Prom отключена."});
+  }
+  if(!WRITE_PIN){
+    return res.status(500).json({error:"WRITE_PIN не задан в Render Environment."});
+  }
+  const pin=String(req.headers["x-write-pin"]||"");
+  if(pin!==WRITE_PIN){
+    return res.status(401).json({error:"Неверный WRITE_PIN"});
+  }
+  next();
+}
+
+async function currentCatalogItem(productId){
+  const data=await getCatalogReport(false);
+  return data.report.find(x=>String(x?.product?.id)===String(productId))||null;
+}
+
+async function promEditProduct(payload){
+  // Документация Prom подтверждает POST /products/edit.
+  // В этой версии отправляем массив изменяемых товаров.
+  const r=await fetch(`${PROM_BASE}/products/edit`,{
+    method:"POST",
+    headers:{
+      Authorization:`Bearer ${process.env.PROM_TOKEN}`,
+      Accept:"application/json",
+      "Content-Type":"application/json"
+    },
+    body:JSON.stringify([payload])
+  });
+  const text=await r.text();
+  let data;
+  try{data=JSON.parse(text)}catch{data={raw:text}}
+  if(!r.ok){
+    const e=new Error(`Prom edit API: ${r.status}`);
+    e.status=r.status;
+    e.data=data;
+    throw e;
+  }
+  return data;
+}
+
+function cleanHtmlText(s){
+  return String(s||"")
+    .replace(/<script[\s\S]*?<\/script>/gi,"")
+    .replace(/<style[\s\S]*?<\/style>/gi,"")
+    .trim();
+}
+
+app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
+  try{
+    const productId=req.body?.productId;
+    if(!productId) return res.status(400).json({error:"productId обязателен"});
+
+    const x=await currentCatalogItem(productId);
+    if(!x) return res.status(404).json({error:"Товар не найден в отчёте. Сначала нажми «Анализ всего каталога»."});
+
+    const targetMargin=Math.max(5,Math.min(Number(req.body?.targetMargin||20),50));
+    const changePrice=req.body?.changePrice!==false;
+    const changeDescription=req.body?.changeDescription!==false;
+
+    let proposedPrice=null;
+    if(changePrice && x.matched && x.buyPrice){
+      proposedPrice=priceForMargin(Number(x.buyPrice),targetMargin);
+    }
+
+    let proposedDescription=null;
+    if(changeDescription){
+      if(!process.env.OPENAI_API_KEY){
+        return res.status(400).json({error:"OPENAI_API_KEY не задан"});
+      }
+      const model=process.env.OPENAI_MODEL||"gpt-5-mini";
+      const prompt=`
+Ты редактор карточек украинского магазина PrimeTac Group на Prom.ua.
+
+Создай улучшенное ОПИСАНИЕ ТОВАРА НА УКРАИНСКОМ ЯЗЫКЕ.
+Используй только факты из входных данных.
+НЕ придумывай состав, размеры, производителя, страну, защитный класс, материал или характеристики, которых нет во входных данных.
+Если данных мало — сделай краткое честное описание без выдумок.
+Не добавляй цену.
+Формат: простой HTML, разрешены только <p>, <ul>, <li>, <strong>, <br>.
+Объём примерно 700–1600 символов.
+
+Товар:
+${JSON.stringify({
+  name:x.product.name,
+  currentDescription:x.product.description||"",
+  supplierName:x.supplierName||"",
+  supplierBrand:x.supplierBrand||"",
+  supplierPrice:x.supplierPrice||null,
+  category:x.product.category||"",
+  keywords:x.product.keywords||""
+},null,2)}
+`.trim();
+
+      const rr=await fetch("https://api.openai.com/v1/responses",{
+        method:"POST",
+        headers:{
+          Authorization:`Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type":"application/json"
+        },
+        body:JSON.stringify({model,input:prompt})
+      });
+      const data=await rr.json();
+      if(!rr.ok) return res.status(rr.status).json({error:"OpenAI API error",details:data});
+
+      proposedDescription=
+        data.output_text ||
+        (data.output||[]).flatMap(i=>i.content||[]).filter(c=>c.type==="output_text").map(c=>c.text).join("\n") ||
+        "";
+      proposedDescription=cleanHtmlText(proposedDescription);
+    }
+
+    res.json({
+      productId:x.product.id,
+      name:x.product.name,
+      currentPrice:Number(x.promPrice||0),
+      currentDescription:x.product.description||"",
+      buyPrice:x.buyPrice,
+      marginPct:x.marginPct,
+      targetMargin,
+      proposedPrice,
+      proposedDescription,
+      warning:"Это предложение. Ничего в Prom ещё не изменено."
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.post("/api/editor/apply",requirePromToken,requireWritePin,async(req,res)=>{
+  try{
+    const productId=req.body?.productId;
+    const confirm=String(req.body?.confirm||"");
+    if(confirm!=="APPLY"){
+      return res.status(400).json({error:"Для записи confirm должен быть APPLY"});
+    }
+
+    const x=await currentCatalogItem(productId);
+    if(!x) return res.status(404).json({error:"Товар не найден"});
+
+    const edit={id:Number(productId)};
+    const changes={};
+
+    if(req.body?.price!=null){
+      const price=Number(req.body.price);
+      if(!Number.isFinite(price)||price<=0) return res.status(400).json({error:"Некорректная цена"});
+      // Защита от случайной экстремальной цены
+      const old=Number(x.promPrice||0);
+      if(old>0 && (price<old*0.5 || price>old*1.8)){
+        return res.status(400).json({error:"Цена отличается от текущей более чем на допустимый безопасный диапазон 50%–180%."});
+      }
+      edit.price=price;
+      changes.price={from:old,to:price};
+    }
+
+    if(req.body?.description!=null){
+      const description=cleanHtmlText(req.body.description);
+      if(description.length<40) return res.status(400).json({error:"Описание слишком короткое"});
+      if(description.length>20000) return res.status(400).json({error:"Описание слишком длинное"});
+      edit.description=description;
+      changes.description=true;
+    }
+
+    if(Object.keys(changes).length===0){
+      return res.status(400).json({error:"Нет изменений для записи"});
+    }
+
+    const result=await promEditProduct(edit);
+
+    // Сбрасываем кэш, чтобы следующий анализ прочитал свежие данные Prom.
+    if(typeof catalogCache!=="undefined"){
+      catalogCache={loadedAt:null,report:[],summary:null};
+    }
+
+    res.json({
+      ok:true,
+      productId,
+      changes,
+      promResponse:result
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
 app.post("/api/analyze",async(req,res)=>{
   try{
     if(!process.env.OPENAI_API_KEY) return res.status(400).json({error:"OPENAI_API_KEY не задан"});
@@ -621,4 +807,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v4.1 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v5 running on ${PORT}`));
