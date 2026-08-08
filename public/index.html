@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v6.2</title>
+<title>PrimeTac Prom AI v7</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -24,6 +24,14 @@ th{position:sticky;top:0;background:#181818;z-index:2}
 .tablewrap{overflow:auto;max-height:70vh;border:1px solid #333;border-radius:12px}
 .tag{display:inline-block;border-radius:999px;padding:3px 6px;background:#292929;margin:2px;font-size:11px}
 pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;overflow:auto}
+
+.ad-green{border-left:5px solid #55c26a}
+.ad-yellow{border-left:5px solid #e4b84f}
+.ad-red{border-left:5px solid #e35d5d}
+.adbadge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:700;font-size:12px}
+.adbadge.green{background:#173c20;color:#8fd18f}
+.adbadge.yellow{background:#463a17;color:#ffd27f}
+.adbadge.red{background:#431b1b;color:#ff8b8b}
 </style>
 </head>
 <body>
@@ -38,7 +46,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 <button onclick="showTop()">ТОП для продаж</button>
 <button onclick="showPrices()">Цены</button>
 <button onclick="loadSales()">Продажи</button>
-<button onclick="loadOrders()">Заказы</button><button onclick="openEditor()">AI-редактор</button>
+<button onclick="loadOrders()">Заказы</button><button onclick="openEditor()">AI-редактор</button><button onclick="loadAdCandidates()">ТОП-30 для рекламы</button>
 </div>
 
 <div id="status" class="card">Проверяем...</div>
@@ -70,7 +78,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v6.2: рынок Prom + безопасный AI-редактор основаны на закупке и марже. Это не анализ цен конкурентов.
+v7: рейтинг рекламы + рынок Prom + безопасный AI основаны на закупке и марже. Это не анализ цен конкурентов.
 </div>
 </div>
 
@@ -306,6 +314,7 @@ async function marketCheck(){
      `<div style="padding:6px 0;border-bottom:1px solid #333">
        <b>${money(c.price)}</b> · ${esc(c.match)}
        <br><a href="${esc(c.url)}" target="_blank" rel="noopener">${esc(c.title||c.url)}</a>
+       ${c.reason?`<br><span class="muted small">${esc(c.reason)}</span>`:""}
      </div>`
    ).join("");
 
@@ -324,6 +333,7 @@ async function marketCheck(){
        <span class="tag">Прибыль: ${money(m.expectedProfit)}</span>
        <span class="tag">Маржа: ${m.expectedMargin==null?"—":m.expectedMargin+"%"}</span>
      </div>
+     ${m.adDecision?`<div class="card ad-${esc(m.adDecision.color)}"><span class="adbadge ${esc(m.adDecision.color)}">${esc(m.adDecision.label)}</span> <b>Score ${esc(m.adDecision.score)}</b><br><span class="muted small">${esc(m.adDecision.reason||"")}</span></div>`:""}
      <p><strong>${esc(m.status||"")}</strong></p>
      ${m.usedFallback?'<div class="warn small">Использован резервный web search без domain filter.</div>':''}
      <div class="muted small">${esc(m.comment||"")}</div>
@@ -368,6 +378,41 @@ async function applyEdit(){
  }catch(e){
    $("#applyStatus").innerHTML=`<b class="bad">Prom не принял изменение:</b><br>${esc(e.message)}<br><span class="muted small">Это безопасно: если API вернул ошибку, массовых изменений не делаем.</span>`;
  }
+}
+
+async function loadAdCandidates(){
+ $("#content").innerHTML='<div class="card">Формирую предварительный ТОП-30 по марже, прибыли и надёжности match…</div>';
+ try{
+   const d=await j("/api/ads/candidates?limit=30");
+   const rows=(d.items||[]).map((x,i)=>`
+     <div class="card">
+       <b>${i+1}. ${esc(x.product.name)}</b>
+       <div class="row" style="margin-top:6px">
+         <span class="tag">Pre-score ${esc(x.preScore)}</span>
+         <span class="tag">Цена ${money(x.promPrice)}</span>
+         <span class="tag">Закупка ${money(x.buyPrice)}</span>
+         <span class="tag">Прибыль ${money(x.grossProfit)}</span>
+         <span class="tag">Маржа ${x.marginPct==null?"—":x.marginPct+"%"}</span>
+       </div>
+       <div class="muted small" style="margin-top:6px">Это предварительный рейтинг. Для финального решения нажми «Проверить рынок Prom» в AI-редакторе.</div>
+       <button style="margin-top:8px" onclick="openEditorFor('${esc(x.product.id)}')">Открыть в AI-редакторе</button>
+     </div>
+   `).join("");
+   $("#content").innerHTML=`<div class="card"><b>ТОП-30 кандидатов на рекламу</b><div class="muted small">${esc(d.note||"")}</div></div>${rows}`;
+ }catch(e){
+   $("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
+ }
+}
+
+function openEditorFor(productId){
+ openEditor();
+ setTimeout(()=>{
+   const sel=document.getElementById("editProduct");
+   if(sel){
+     sel.value=String(productId);
+     sel.scrollIntoView({behavior:"smooth",block:"center"});
+   }
+ },50);
 }
 
 health();
