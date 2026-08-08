@@ -2,7 +2,7 @@ import express from "express";
 import { XMLParser } from "fast-xml-parser";
 
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "3mb" }));
 app.use(express.static("public"));
 
 const PORT = process.env.PORT || 3000;
@@ -34,9 +34,11 @@ async function promRequest(path) {
       Accept: "application/json"
     }
   });
+
   const text = await response.text();
   let data;
   try { data = JSON.parse(text); } catch { data = { raw: text }; }
+
   if (!response.ok) {
     const err = new Error(`Prom API: ${response.status}`);
     err.status = response.status;
@@ -109,6 +111,15 @@ function brandDiscount(brandOrName) {
   return 0.15;
 }
 
+function discountLabel(brandOrName) {
+  const s = normalizeText(brandOrName);
+  if (s.includes("salomon")) return "Salomon";
+  if (s.includes("helikon")) return "Helikon-Tex";
+  if (s.includes("lowa")) return "LOWA";
+  if (s.includes("belleville")) return "Belleville";
+  return "Остальные";
+}
+
 function walkForProductArrays(node, out = []) {
   if (!node || typeof node !== "object") return out;
   for (const [k, v] of Object.entries(node)) {
@@ -138,11 +149,11 @@ function normalizeMilitarisItem(x) {
 
 async function refreshMilitaris() {
   const r = await fetch(MILITARIS_XML_URL, {
-    headers: { "User-Agent": "PrimeTacPromAI/2.0" }
+    headers: { "User-Agent": "PrimeTacPromAI/3.0" }
   });
   if (!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
-  const xml = await r.text();
 
+  const xml = await r.text();
   const parser = new XMLParser({
     ignoreAttributes: false,
     attributeNamePrefix: "@_",
@@ -150,6 +161,7 @@ async function refreshMilitaris() {
     processEntities: true,
     trimValues: true
   });
+
   const parsed = parser.parse(xml);
   const raw = walkForProductArrays(parsed);
   const items = raw
@@ -159,6 +171,7 @@ async function refreshMilitaris() {
 
   const byId = new Map();
   const bySku = new Map();
+
   for (const x of items) {
     if (x.id) byId.set(normalizeText(x.id), x);
     if (x.sku) bySku.set(normalizeText(x.sku), x);
@@ -172,6 +185,7 @@ async function refreshMilitaris() {
     rawCount: raw.length,
     error: null
   };
+
   return {
     loadedAt: militarisCache.loadedAt,
     count: items.length,
@@ -183,6 +197,28 @@ function promProducts(data) {
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.products)) return data.products;
   return [];
+}
+
+async function fetchAllPromProducts(maxPages = 30) {
+  const all = [];
+  let lastId = null;
+
+  for (let page = 0; page < maxPages; page++) {
+    const suffix = lastId ? `&last_id=${encodeURIComponent(lastId)}` : "";
+    const data = await promRequest(`/products/list?limit=100${suffix}`);
+    const batch = promProducts(data);
+
+    if (!batch.length) break;
+    all.push(...batch);
+
+    if (batch.length < 100) break;
+
+    const newLastId = batch[batch.length - 1]?.id;
+    if (!newLastId || String(newLastId) === String(lastId)) break;
+    lastId = newLastId;
+  }
+
+  return all;
 }
 
 function findMilitarisMatch(p) {
@@ -202,11 +238,12 @@ function findMilitarisMatch(p) {
   }
 
   const name = p.name || "";
-  let best = null;
-  let bestScore = 0;
-  // Ограничиваем работу: сначала товары с общими словами/брендом.
   const np = normalizeText(name);
   const words = [...tokens(name)];
+
+  let best = null;
+  let bestScore = 0;
+
   for (const m of militarisCache.items) {
     const nm = normalizeText(m.name);
     if (words.length && !words.some(w => nm.includes(w))) continue;
@@ -217,14 +254,49 @@ function findMilitarisMatch(p) {
     }
   }
 
-  if (best && bestScore >= 0.55) {
-    return { item: best, method: "name", confidence: Number(bestScore.toFixed(3)) };
+  if (best && bestScore >= 0.60) {
+    return {
+      item: best,
+      method: "name",
+      confidence: Number(bestScore.toFixed(3))
+    };
   }
+
   return null;
+}
+
+function round2(v) {
+  return Math.round(v * 100) / 100;
+}
+
+function smartPrice(value) {
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const n = Math.ceil(value);
+  if (n < 300) return Math.ceil(n / 10) * 10 - 1;
+  if (n < 1500) return Math.ceil(n / 20) * 20 - 1;
+  if (n < 5000) return Math.ceil(n / 50) * 50 - 1;
+  return Math.ceil(n / 100) * 100 - 10;
+}
+
+function priceForMargin(buyPrice, targetMarginPct) {
+  const m = targetMarginPct / 100;
+  if (!buyPrice || m <= 0 || m >= 1) return null;
+  return smartPrice(buyPrice / (1 - m));
+}
+
+function riskFlags(promPrice, buyPrice, marginPct, match) {
+  const flags = [];
+  if (!match) flags.push("Нет сопоставления");
+  if (match?.method === "name") flags.push("Проверить совпадение");
+  if (buyPrice != null && promPrice < buyPrice) flags.push("Цена ниже закупки");
+  if (marginPct != null && marginPct < 8) flags.push("Очень низкая маржа");
+  else if (marginPct != null && marginPct < 15) flags.push("Низкая маржа");
+  return flags;
 }
 
 function productMetrics(p, match) {
   const promPrice = Number(p.price || 0);
+
   if (!match?.item?.price) {
     return {
       matched: false,
@@ -233,12 +305,17 @@ function productMetrics(p, match) {
       buyPrice: null,
       grossProfit: null,
       marginPct: null,
-      discountPct: null
+      discountPct: null,
+      discountGroup: null,
+      recommended15: null,
+      recommended20: null,
+      recommended25: null,
+      flags: ["Нет сопоставления"]
     };
   }
 
-  const brand = match.item.brand || match.item.name || p.name || "";
-  const d = brandDiscount(brand);
+  const brandSource = `${match.item.brand || ""} ${match.item.name || ""} ${p.name || ""}`;
+  const d = brandDiscount(brandSource);
   const supplierPrice = Number(match.item.price);
   const buyPrice = supplierPrice * (1 - d);
   const grossProfit = promPrice - buyPrice;
@@ -247,18 +324,53 @@ function productMetrics(p, match) {
   return {
     matched: true,
     promPrice,
-    supplierPrice: Math.round(supplierPrice * 100) / 100,
-    buyPrice: Math.round(buyPrice * 100) / 100,
-    grossProfit: Math.round(grossProfit * 100) / 100,
+    supplierPrice: round2(supplierPrice),
+    buyPrice: round2(buyPrice),
+    grossProfit: round2(grossProfit),
     marginPct: marginPct == null ? null : Math.round(marginPct * 10) / 10,
     discountPct: Math.round(d * 100),
+    discountGroup: discountLabel(brandSource),
     matchMethod: match.method,
     matchConfidence: match.confidence,
     supplierName: match.item.name,
     supplierBrand: match.item.brand || null,
     supplierSku: match.item.sku || null,
     supplierId: match.item.id || null,
-    supplierUrl: match.item.url || null
+    supplierUrl: match.item.url || null,
+    recommended15: priceForMargin(buyPrice, 15),
+    recommended20: priceForMargin(buyPrice, 20),
+    recommended25: priceForMargin(buyPrice, 25),
+    flags: riskFlags(promPrice, buyPrice, marginPct, match)
+  };
+}
+
+function summarize(report) {
+  const matched = report.filter(x => x.matched);
+  const profitable = matched.filter(x => (x.grossProfit ?? 0) > 0);
+  const loss = matched.filter(x => (x.grossProfit ?? 0) <= 0);
+  const highMargin = matched.filter(x => (x.marginPct ?? -999) >= 20);
+  const lowMargin = matched.filter(x => (x.marginPct ?? 999) < 10);
+  const nameMatches = matched.filter(x => x.matchMethod === "name");
+
+  const oneUnitGross = matched.reduce((s, x) => s + (x.grossProfit || 0), 0);
+
+  const byDiscount = {};
+  for (const x of matched) {
+    const k = `${x.discountGroup} −${x.discountPct}%`;
+    byDiscount[k] = (byDiscount[k] || 0) + 1;
+  }
+
+  return {
+    total: report.length,
+    matched: matched.length,
+    unmatched: report.length - matched.length,
+    profitable: profitable.length,
+    loss: loss.length,
+    highMargin: highMargin.length,
+    lowMargin: lowMargin.length,
+    approximateMatches: nameMatches.length,
+    oneUnitGross: round2(oneUnitGross),
+    byDiscount
   };
 }
 
@@ -286,34 +398,23 @@ app.post("/api/militaris/refresh", async (req, res) => {
   }
 });
 
-app.get("/api/products", requirePromToken, async (req, res) => {
-  try {
-    const limit = Math.min(Math.max(Number(req.query.limit || 50), 1), 100);
-    const lastId = req.query.last_id ? `&last_id=${encodeURIComponent(req.query.last_id)}` : "";
-    const data = await promRequest(`/products/list?limit=${limit}${lastId}`);
-    res.json(data);
-  } catch (e) {
-    res.status(e.status || 500).json({ error: e.message, details: e.data || null });
-  }
-});
-
 app.get("/api/orders", requirePromToken, async (req, res) => {
   try {
     const data = await promRequest("/orders/list");
     res.json(data);
   } catch (e) {
-    res.status(e.status || 500).json({ error: e.message, details: e.data || null });
+    res.status(e.status || 500).json({
+      error: e.message,
+      details: e.data || null
+    });
   }
 });
 
-app.get("/api/catalog/report", requirePromToken, async (req, res) => {
+app.get("/api/catalog/report-all", requirePromToken, async (req, res) => {
   try {
-    if (!militarisCache.items.length) {
-      await refreshMilitaris();
-    }
-    const limit = Math.min(Math.max(Number(req.query.limit || 100), 1), 100);
-    const data = await promRequest(`/products/list?limit=${limit}`);
-    const products = promProducts(data);
+    if (!militarisCache.items.length) await refreshMilitaris();
+
+    const products = await fetchAllPromProducts(30);
     const report = products.map(p => {
       const match = findMilitarisMatch(p);
       return {
@@ -323,19 +424,23 @@ app.get("/api/catalog/report", requirePromToken, async (req, res) => {
           name: p.name,
           price: p.price,
           currency: p.currency || "UAH",
-          presence: p.presence ?? null
+          presence: p.presence ?? null,
+          sku: p.sku || p.article || p.code || null
         },
         ...productMetrics(p, match)
       };
     });
+
     res.json({
-      count: report.length,
-      matched: report.filter(x => x.matched).length,
       loadedAt: militarisCache.loadedAt,
+      summary: summarize(report),
       report
     });
   } catch (e) {
-    res.status(e.status || 500).json({ error: e.message, details: e.data || null });
+    res.status(e.status || 500).json({
+      error: e.message,
+      details: e.data || null
+    });
   }
 });
 
@@ -344,25 +449,28 @@ app.post("/api/analyze", async (req, res) => {
     if (!process.env.OPENAI_API_KEY) {
       return res.status(400).json({ error: "OPENAI_API_KEY не задан на сервере" });
     }
+
     const payload = req.body || {};
     const model = process.env.OPENAI_MODEL || "gpt-5-mini";
 
     const prompt = `
 Ты аналитик украинского интернет-магазина тактической одежды и снаряжения PrimeTac Group.
-Проанализируй товар на основании ТОЛЬКО переданных данных.
 
-Если есть supplierPrice и buyPrice — это цена сайта поставщика Militaris и рассчитанная закупка с учётом скидки.
-Если matched=false — не называй закупку реальной и укажи, что товар не сопоставлен.
-matchMethod=name означает приблизительное сопоставление по названию, его надо перепроверить.
-Не придумывай цены конкурентов.
+Используй только переданные данные.
+supplierPrice = розничная цена на сайте Militaris.
+buyPrice = расчетная закупка по согласованной скидке дропшиппера.
+recommended15/recommended20/recommended25 = технические цены для целевой валовой маржи 15/20/25%.
+Это НЕ цены рынка и НЕ цены конкурентов.
+Если matchMethod=name, совпадение приблизительное и его нужно перепроверить вручную.
+Не придумывай спрос, количество будущих заказов или цены конкурентов.
 
-Дай коротко:
-1. оценка карточки;
-2. прибыль и маржа, если рассчитаны;
-3. риск/ошибка сопоставления;
-4. стоит ли продвигать;
-5. улучшенное название на украинском;
-6. что исправить в карточке в первую очередь.
+Ответ кратко:
+1) текущая валовая прибыль и маржа;
+2) безопасна ли текущая цена;
+3) какую из технических цен 15/20/25% разумнее тестировать и почему;
+4) стоит ли товар включать в список кандидатов на продвижение;
+5) риск сопоставления;
+6) улучшенное название карточки на украинском.
 
 Данные:
 ${JSON.stringify(payload, null, 2)}
@@ -376,10 +484,16 @@ ${JSON.stringify(payload, null, 2)}
       },
       body: JSON.stringify({ model, input: prompt })
     });
+
     const data = await response.json();
+
     if (!response.ok) {
-      return res.status(response.status).json({ error: "OpenAI API error", details: data });
+      return res.status(response.status).json({
+        error: "OpenAI API error",
+        details: data
+      });
     }
+
     const text =
       data.output_text ||
       (data.output || [])
@@ -388,6 +502,7 @@ ${JSON.stringify(payload, null, 2)}
         .map(c => c.text)
         .join("\n") ||
       "Текст ответа не найден.";
+
     res.json({ text });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -395,5 +510,5 @@ ${JSON.stringify(payload, null, 2)}
 });
 
 app.listen(PORT, "0.0.0.0", () => {
-  console.log(`PrimeTac Prom AI v2 running on port ${PORT}`);
+  console.log(`PrimeTac Prom AI v3 running on port ${PORT}`);
 });
