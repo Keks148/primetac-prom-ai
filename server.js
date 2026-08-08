@@ -13,6 +13,8 @@ const MILITARIS_XML_URL =
 
 const WRITE_ENABLED = String(process.env.WRITE_ENABLED || "false").toLowerCase() === "true";
 const WRITE_PIN = process.env.WRITE_PIN || "";
+const OPENAI_WEB_MODEL = process.env.OPENAI_WEB_MODEL || "gpt-4.1-mini";
+const SELF_PROM_DOMAIN = process.env.SELF_PROM_DOMAIN || "cs4221574.prom.ua";
 
 let militarisCache = {
   loadedAt: null,
@@ -129,11 +131,12 @@ function normalizeItem(x){
     name: scalar(first(x,["name","title","g:title"])),
     brand: scalar(first(x,["brand","vendor","g:brand"])),
     url: scalar(first(x,["url","link","g:link"])),
+    description: scalar(first(x,["description","g:description","desc","full_description"])),
     price: cleanNumber(first(x,["price","g:price","priceuah","price_ua"]))
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/5.0"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/6.0"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -302,6 +305,7 @@ function metrics(p,match){
     matchConfidence:match.confidence,
     supplierName:match.item.name,
     supplierBrand:match.item.brand||null,
+    supplierDescription:match.item.description||null,
     supplierSku:match.item.sku||null,
     supplierUrl:match.item.url||null,
     recommended20:priceForMargin(buyPrice,20),
@@ -352,7 +356,10 @@ async function getCatalogReport(force=false){
         price:p.price,
         currency:p.currency||"UAH",
         external_id:p.external_id||null,
-        sku:p.sku||p.article||p.code||null
+        sku:p.sku||p.article||p.code||null,
+        description:p.description||"",
+        keywords:p.keywords||"",
+        category:p.category_name||p.category||""
       },
       ...metrics(p,match)
     };
@@ -625,11 +632,60 @@ async function promEditProduct(payload){
   return data;
 }
 
-function cleanHtmlText(s){
+function decodeBasicEntities(s){
   return String(s||"")
+    .replace(/&lt;/gi,"<")
+    .replace(/&gt;/gi,">")
+    .replace(/&quot;/gi,'"')
+    .replace(/&#39;/gi,"'")
+    .replace(/&amp;/gi,"&");
+}
+
+function cleanHtmlText(s){
+  let out=decodeBasicEntities(String(s||""))
+    .replace(/```html/gi,"")
+    .replace(/```/g,"")
     .replace(/<script[\s\S]*?<\/script>/gi,"")
     .replace(/<style[\s\S]*?<\/style>/gi,"")
     .trim();
+
+  // Оставляем только безопасные простые теги для карточки товара.
+  out=out.replace(/<(?!\/?(?:p|ul|li|strong|br)\b)[^>]*>/gi,"");
+  return out;
+}
+
+function stripHtml(s){
+  return decodeBasicEntities(String(s||""))
+    .replace(/<[^>]+>/g," ")
+    .replace(/\s+/g," ")
+    .trim();
+}
+
+function parseJsonText(text){
+  const raw=String(text||"").trim()
+    .replace(/^```json\s*/i,"")
+    .replace(/^```\s*/,"")
+    .replace(/\s*```$/,"");
+  try{return JSON.parse(raw)}catch{}
+  const start=raw.indexOf("{"), end=raw.lastIndexOf("}");
+  if(start>=0 && end>start){
+    try{return JSON.parse(raw.slice(start,end+1))}catch{}
+  }
+  return null;
+}
+
+function median(nums){
+  const a=[...nums].sort((x,y)=>x-y);
+  if(!a.length) return null;
+  const m=Math.floor(a.length/2);
+  return a.length%2?a[m]:(a[m-1]+a[m])/2;
+}
+
+function lowerQuartile(nums){
+  const a=[...nums].sort((x,y)=>x-y);
+  if(!a.length) return null;
+  const idx=Math.max(0,Math.floor((a.length-1)*0.25));
+  return a[idx];
 }
 
 app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
@@ -638,11 +694,12 @@ app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
     if(!productId) return res.status(400).json({error:"productId обязателен"});
 
     const x=await currentCatalogItem(productId);
-    if(!x) return res.status(404).json({error:"Товар не найден в отчёте. Сначала нажми «Анализ всего каталога»."});
+    if(!x) return res.status(404).json({error:"Товар не найден. Сначала нажми «Анализ всего каталога»."});
 
     const targetMargin=Math.max(5,Math.min(Number(req.body?.targetMargin||20),50));
     const changePrice=req.body?.changePrice!==false;
     const changeDescription=req.body?.changeDescription!==false;
+    const changeName=req.body?.changeName!==false;
 
     let proposedPrice=null;
     if(changePrice && x.matched && x.buyPrice){
@@ -650,29 +707,41 @@ app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
     }
 
     let proposedDescription=null;
-    if(changeDescription){
+    let proposedName=null;
+
+    if(changeDescription || changeName){
       if(!process.env.OPENAI_API_KEY){
         return res.status(400).json({error:"OPENAI_API_KEY не задан"});
       }
+
       const model=process.env.OPENAI_MODEL||"gpt-5-mini";
       const prompt=`
 Ты редактор карточек украинского магазина PrimeTac Group на Prom.ua.
 
-Создай улучшенное ОПИСАНИЕ ТОВАРА НА УКРАИНСКОМ ЯЗЫКЕ.
-Используй только факты из входных данных.
-НЕ придумывай состав, размеры, производителя, страну, защитный класс, материал или характеристики, которых нет во входных данных.
-Если данных мало — сделай краткое честное описание без выдумок.
-Не добавляй цену.
-Формат: простой HTML, разрешены только <p>, <ul>, <li>, <strong>, <br>.
-Объём примерно 700–1600 символов.
+Нужно вернуть ТОЛЬКО JSON:
+{
+  "name": "новое название на украинском",
+  "description": "HTML-описание"
+}
 
-Товар:
+Правила:
+- Используй ТОЛЬКО факты из исходной карточки и данных поставщика.
+- Данные поставщика приоритетнее общих догадок.
+- НЕ придумывай материал, размеры, классы защиты, технологии, комплектацию, страну, характеристики.
+- Если характеристики не указаны — не упоминай их вообще.
+- Название: понятное, поисковое, без спама, бренд + модель + тип товара + цвет, если это реально известно.
+- Описание: украинский язык, примерно 600–1600 символов.
+- HTML: только <p>, <ul>, <li>, <strong>, <br>.
+- Не пиши фразы «даних немає», «надайте інформацію», «уточніть».
+- Не добавляй цену.
+
+Данные:
 ${JSON.stringify({
-  name:x.product.name,
-  currentDescription:x.product.description||"",
+  promName:x.product.name,
+  promDescription:stripHtml(x.product.description||""),
   supplierName:x.supplierName||"",
   supplierBrand:x.supplierBrand||"",
-  supplierPrice:x.supplierPrice||null,
+  supplierDescription:stripHtml(x.supplierDescription||""),
   category:x.product.category||"",
   keywords:x.product.keywords||""
 },null,2)}
@@ -689,24 +758,34 @@ ${JSON.stringify({
       const data=await rr.json();
       if(!rr.ok) return res.status(rr.status).json({error:"OpenAI API error",details:data});
 
-      proposedDescription=
+      const text=
         data.output_text ||
-        (data.output||[]).flatMap(i=>i.content||[]).filter(c=>c.type==="output_text").map(c=>c.text).join("\n") ||
+        (data.output||[]).flatMap(i=>i.content||[]).filter(c=>c.type==="output_text").map(c=>c.text).join("
+") ||
         "";
-      proposedDescription=cleanHtmlText(proposedDescription);
+
+      const parsed=parseJsonText(text);
+      if(parsed){
+        if(changeName) proposedName=String(parsed.name||"").trim();
+        if(changeDescription) proposedDescription=cleanHtmlText(parsed.description||"");
+      }else{
+        if(changeDescription) proposedDescription=cleanHtmlText(text);
+      }
     }
 
     res.json({
       productId:x.product.id,
       name:x.product.name,
+      currentName:x.product.name,
       currentPrice:Number(x.promPrice||0),
       currentDescription:x.product.description||"",
       buyPrice:x.buyPrice,
       marginPct:x.marginPct,
       targetMargin,
       proposedPrice,
+      proposedName,
       proposedDescription,
-      warning:"Это предложение. Ничего в Prom ещё не изменено."
+      warning:"Цена пока техническая по марже. Для рыночной цены нажми «Проверить рынок Prom»."
     });
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
@@ -739,6 +818,14 @@ app.post("/api/editor/apply",requirePromToken,requireWritePin,async(req,res)=>{
       changes.price={from:old,to:price};
     }
 
+    if(req.body?.name!=null){
+      const name=String(req.body.name||"").trim();
+      if(name.length<8) return res.status(400).json({error:"Название слишком короткое"});
+      if(name.length>250) return res.status(400).json({error:"Название слишком длинное"});
+      edit.name=name;
+      changes.name={from:x.product.name,to:name};
+    }
+
     if(req.body?.description!=null){
       const description=cleanHtmlText(req.body.description);
       if(description.length<40) return res.status(400).json({error:"Описание слишком короткое"});
@@ -764,6 +851,196 @@ app.post("/api/editor/apply",requirePromToken,requireWritePin,async(req,res)=>{
       changes,
       promResponse:result
     });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.post("/api/market/check",requirePromToken,async(req,res)=>{
+  try{
+    if(!process.env.OPENAI_API_KEY){
+      return res.status(400).json({error:"OPENAI_API_KEY не задан"});
+    }
+
+    const productId=req.body?.productId;
+    const minMargin=Math.max(5,Math.min(Number(req.body?.minMargin||12),40));
+    const x=await currentCatalogItem(productId);
+
+    if(!x) return res.status(404).json({error:"Товар не найден"});
+    if(!x.matched || !x.buyPrice){
+      return res.status(400).json({error:"Нет надёжной закупочной цены для расчёта"});
+    }
+
+    const floorPrice=priceForMargin(Number(x.buyPrice),minMargin);
+    const prompt=`
+Найди на Prom.ua текущие предложения ТОЧНО ЭТОГО ЖЕ товара или максимально точной модели.
+
+Товар продавца:
+"${x.product.name}"
+
+Дополнительные данные:
+бренд: "${x.supplierBrand||""}"
+название поставщика: "${x.supplierName||""}"
+
+Исключи магазин ${SELF_PROM_DOMAIN}.
+Не смешивай другие модели, поколения, размеры комплектов или явно другой товар.
+Если точных совпадений мало — добавь близкие, но пометь их match="close".
+
+Верни ТОЛЬКО JSON:
+{
+  "competitors":[
+    {
+      "title":"...",
+      "price":1234,
+      "url":"https://...",
+      "match":"exact"
+    }
+  ],
+  "comment":"короткое замечание"
+}
+
+Нужно максимум 8 предложений. price только число в грн.
+`.trim();
+
+    const rr=await fetch("https://api.openai.com/v1/responses",{
+      method:"POST",
+      headers:{
+        Authorization:`Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type":"application/json"
+      },
+      body:JSON.stringify({
+        model:OPENAI_WEB_MODEL,
+        tools:[{
+          type:"web_search",
+          filters:{allowed_domains:["prom.ua"]}
+        }],
+        tool_choice:"required",
+        include:["web_search_call.action.sources"],
+        input:prompt
+      })
+    });
+
+    const data=await rr.json();
+    if(!rr.ok){
+      return res.status(rr.status).json({error:"OpenAI web search error",details:data});
+    }
+
+    const outputText=
+      data.output_text ||
+      (data.output||[]).flatMap(i=>i.content||[]).filter(c=>c.type==="output_text").map(c=>c.text).join("\n") ||
+      "";
+
+    const parsed=parseJsonText(outputText)||{competitors:[],comment:outputText};
+
+    let competitors=Array.isArray(parsed.competitors)?parsed.competitors:[];
+    competitors=competitors
+      .map(c=>({
+        title:String(c.title||"").trim(),
+        price:Number(c.price||0),
+        url:String(c.url||"").trim(),
+        match:String(c.match||"close").toLowerCase()==="exact"?"exact":"close"
+      }))
+      .filter(c=>c.price>0 && c.url.includes("prom.ua") && !c.url.includes(SELF_PROM_DOMAIN));
+
+    // Убираем явно аномальные результаты относительно нашей текущей цены.
+    const current=Number(x.promPrice||0);
+    competitors=competitors.filter(c=>{
+      if(!current) return true;
+      const ratio=Math.max(current,c.price)/Math.min(current,c.price);
+      return ratio<=2.2;
+    });
+
+    const exact=competitors.filter(c=>c.match==="exact");
+    const usable=exact.length>=3?exact:competitors;
+    const prices=usable.map(c=>c.price).filter(Boolean).sort((a,b)=>a-b);
+
+    const marketLow=prices[0]||null;
+    const marketMedian=median(prices);
+    const marketQ1=lowerQuartile(prices);
+
+    // Цель: быть в нижней конкурентной части рынка, но не уходить ниже минимальной маржи.
+    let marketTarget=null;
+    if(prices.length>=4){
+      marketTarget=marketQ1;
+    }else if(prices.length>=2){
+      marketTarget=prices[1]; // не ориентируемся на одиночный демпинг
+    }else if(prices.length===1){
+      marketTarget=prices[0];
+    }
+
+    let recommendedPrice=null;
+    let competitive=null;
+    let status="Недостаточно данных рынка";
+
+    if(marketTarget){
+      const desired=smartPrice(marketTarget*0.99);
+      recommendedPrice=Math.max(Number(floorPrice||0),Number(desired||0));
+      const expectedMargin=recommendedPrice
+        ? ((recommendedPrice-Number(x.buyPrice))/recommendedPrice)*100
+        : null;
+
+      competitive = marketMedian ? recommendedPrice <= marketMedian*1.03 : true;
+
+      if(!competitive){
+        status="При безопасной марже цена выше основной части рынка — товар лучше не продвигать ценой";
+      }else if(recommendedPrice <= (marketQ1||marketTarget)*1.03){
+        status="Конкурентная цена: нижняя часть рынка при сохранении маржи";
+      }else{
+        status="Цена безопасна по марже, но не самая низкая";
+      }
+
+      const sources=[];
+      for(const item of (data.output||[])){
+        if(item?.type==="web_search_call"){
+          for(const s of (item?.action?.sources||[])){
+            if(s?.url && !sources.some(x=>x.url===s.url)){
+              sources.push({url:s.url,title:s.title||s.url});
+            }
+          }
+        }
+      }
+
+      return res.json({
+        productId:x.product.id,
+        name:x.product.name,
+        currentPrice:current,
+        buyPrice:x.buyPrice,
+        minMargin,
+        floorPrice,
+        competitors,
+        marketLow,
+        marketMedian:marketMedian?round2(marketMedian):null,
+        marketQ1:marketQ1?round2(marketQ1):null,
+        recommendedPrice,
+        expectedProfit:recommendedPrice?round2(recommendedPrice-Number(x.buyPrice)):null,
+        expectedMargin:expectedMargin!=null?Math.round(expectedMargin*10)/10:null,
+        competitive,
+        status,
+        comment:String(parsed.comment||""),
+        sources:sources.slice(0,12)
+      });
+    }
+
+    return res.json({
+      productId:x.product.id,
+      name:x.product.name,
+      currentPrice:current,
+      buyPrice:x.buyPrice,
+      minMargin,
+      floorPrice,
+      competitors,
+      marketLow,
+      marketMedian,
+      marketQ1,
+      recommendedPrice:null,
+      expectedProfit:null,
+      expectedMargin:null,
+      competitive:null,
+      status,
+      comment:String(parsed.comment||""),
+      sources:[]
+    });
+
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
   }
@@ -807,4 +1084,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v5 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v6 running on ${PORT}`));
