@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v6.1</title>
+<title>PrimeTac Prom AI v6.2</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -70,7 +70,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v6.1: цена по рынку Prom + AI-редактор основаны на закупке и марже. Это не анализ цен конкурентов.
+v6.2: рынок Prom + безопасный AI-редактор основаны на закупке и марже. Это не анализ цен конкурентов.
 </div>
 </div>
 
@@ -290,7 +290,10 @@ async function marketCheck(){
      })
    });
    const m=await r.json();
-   if(!r.ok) throw new Error(m.error||"Ошибка поиска рынка");
+   if(!r.ok){
+     const extra=[m.apiMessage,m.apiType,m.apiCode].filter(Boolean).join(" · ");
+     throw new Error((m.error||"Ошибка поиска рынка") + (extra?` — ${extra}`:""));
+   }
 
    window._marketResult=m;
    if(m.recommendedPrice!=null){
@@ -322,6 +325,7 @@ async function marketCheck(){
        <span class="tag">Маржа: ${m.expectedMargin==null?"—":m.expectedMargin+"%"}</span>
      </div>
      <p><strong>${esc(m.status||"")}</strong></p>
+     ${m.usedFallback?'<div class="warn small">Использован резервный web search без domain filter.</div>':''}
      <div class="muted small">${esc(m.comment||"")}</div>
      <div style="margin-top:10px"><b>Найденные предложения</b>${comps||'<div class="muted">Точных предложений не найдено.</div>'}</div>
      ${sources?`<div style="margin-top:10px"><b>Источники поиска</b><br>${sources}</div>`:""}
