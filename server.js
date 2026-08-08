@@ -136,7 +136,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/6.1"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/6.2"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -725,17 +725,18 @@ app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
 }
 
 Правила:
-- Используй ТОЛЬКО факты из исходной карточки и данных поставщика.
-- Данные поставщика приоритетнее общих догадок.
-- НЕ придумывай материал, размеры, классы защиты, технологии, комплектацию, страну, характеристики.
-- Если характеристики не указаны — не упоминай их вообще.
-- Название: понятное, поисковое, без спама, бренд + модель + тип товара + цвет, если это реально известно.
-- Описание: украинский язык, примерно 600–1600 символов.
+- Используй ТОЛЬКО факты, которые буквально или однозначно присутствуют в SOURCE FACTS ниже.
+- Данные поставщика приоритетнее исходной карточки Prom.
+- ЗАПРЕЩЕНО выводить характеристики из названия товара, категории или общих знаний о похожих товарах.
+- Любой конкретный материал, процент состава, технология, мембрана, класс защиты, плотность, размер, страна, комплектность или особенность конструкции разрешены ТОЛЬКО если они явно есть в SOURCE FACTS.
+- Если технических фактов мало, делай короткое аккуратное описание без характеристик вместо догадок.
+- Название: понятное, поисковое, без спама; бренд + модель + тип товара + цвет только если это реально указано.
+- Описание: украинский язык. При малом количестве фактов 250–700 символов, при достаточном 700–1600.
 - HTML: только <p>, <ul>, <li>, <strong>, <br>.
-- Не пиши фразы «даних немає», «надайте інформацію», «уточніть».
+- Не пиши «даних немає», «надайте інформацію», «уточніть».
 - Не добавляй цену.
 
-Данные:
+SOURCE FACTS:
 ${JSON.stringify({
   promName:x.product.name,
   promDescription:stripHtml(x.product.description||""),
@@ -901,27 +902,57 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
 Нужно максимум 8 предложений. price только число в грн.
 `.trim();
 
-    const rr=await fetch("https://api.openai.com/v1/responses",{
-      method:"POST",
-      headers:{
-        Authorization:`Bearer ${process.env.OPENAI_API_KEY}`,
-        "Content-Type":"application/json"
-      },
-      body:JSON.stringify({
-        model:OPENAI_WEB_MODEL,
-        tools:[{
-          type:"web_search",
-          filters:{allowed_domains:["prom.ua"]}
-        }],
-        tool_choice:"required",
-        include:["web_search_call.action.sources"],
-        input:prompt
-      })
-    });
+    async function runSearch(useFilter){
+      const tool=useFilter
+        ? {type:"web_search",filters:{allowed_domains:["prom.ua"]}}
+        : {type:"web_search"};
 
-    const data=await rr.json();
+      const searchPrompt=useFilter
+        ? prompt
+        : `${prompt}
+
+ВАЖНО: ищи только страницы сайта prom.ua. Используй запросы вида site:prom.ua и не используй цены с других сайтов.`;
+
+      const response=await fetch("https://api.openai.com/v1/responses",{
+        method:"POST",
+        headers:{
+          Authorization:`Bearer ${process.env.OPENAI_API_KEY}`,
+          "Content-Type":"application/json"
+        },
+        body:JSON.stringify({
+          model:OPENAI_WEB_MODEL,
+          tools:[tool],
+          tool_choice:"auto",
+          include:["web_search_call.action.sources"],
+          input:searchPrompt
+        })
+      });
+      const body=await response.json();
+      return {response,body};
+    }
+
+    // Основной поиск: жёсткий фильтр prom.ua.
+    // Если API отклонит фильтр/параметр, делаем один резервный запрос без filters,
+    // но с явным site:prom.ua в промпте.
+    let attempt=await runSearch(true);
+    let usedFallback=false;
+
+    if(!attempt.response.ok){
+      usedFallback=true;
+      attempt=await runSearch(false);
+    }
+
+    const rr=attempt.response;
+    const data=attempt.body
     if(!rr.ok){
-      return res.status(rr.status).json({error:"OpenAI web search error",details:data});
+      const apiError=data?.error||{};
+      return res.status(rr.status).json({
+        error:"OpenAI web search error",
+        apiMessage:apiError.message||null,
+        apiType:apiError.type||null,
+        apiCode:apiError.code||null,
+        details:data
+      });
     }
 
     const outputText=
@@ -1016,6 +1047,7 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
         competitive,
         status,
         comment:String(parsed.comment||""),
+        usedFallback,
         sources:sources.slice(0,12)
       });
     }
@@ -1037,6 +1069,7 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
       competitive:null,
       status,
       comment:String(parsed.comment||""),
+      usedFallback,
       sources:[]
     });
 
@@ -1083,4 +1116,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v6.1 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v6.2 running on ${PORT}`));
