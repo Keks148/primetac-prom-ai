@@ -136,7 +136,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/6.0"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/6.1"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -760,8 +760,7 @@ ${JSON.stringify({
 
       const text=
         data.output_text ||
-        (data.output||[]).flatMap(i=>i.content||[]).filter(c=>c.type==="output_text").map(c=>c.text).join("
-") ||
+        (data.output||[]).flatMap(i=>i.content||[]).filter(c=>c.type==="output_text").map(c=>c.text).join("\n") ||
         "";
 
       const parsed=parseJsonText(text);
@@ -1084,4 +1083,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v6 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v6.1 running on ${PORT}`));
