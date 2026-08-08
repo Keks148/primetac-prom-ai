@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v3.1</title>
+<title>PrimeTac Prom AI v4</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -28,13 +28,16 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </head>
 <body>
 <div class="wrap">
-<h1>PrimeTac Prom AI <span class="muted">v3.1</span></h1>
-<div class="muted">Безопасное сопоставление Prom ↔ Militaris</div>
+<h1>PrimeTac Prom AI <span class="muted">v4</span></h1>
+<div class="muted">Панель прибыли: Prom + Militaris + AI + продажи</div>
 
 <div class="bar">
 <button onclick="health()">Проверить подключение</button>
 <button onclick="refreshMilitaris()">Обновить Militaris</button>
 <button onclick="loadAll()">Анализ всего каталога</button>
+<button onclick="showTop()">ТОП для продаж</button>
+<button onclick="showPrices()">Цены</button>
+<button onclick="loadSales()">Продажи</button>
 <button onclick="loadOrders()">Заказы</button>
 </div>
 
@@ -55,6 +58,9 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 <option value="salomon">Salomon</option>
 <option value="helikon">Helikon-Tex</option>
 <option value="lowa">LOWA</option>
+<option value="raise">Поднять цену</option>
+<option value="keep">Оставить цену</option>
+<option value="test_lower">Можно снизить</option>
 </select>
 <select id="sort" onchange="render()">
 <option value="margin">Маржа ↓</option>
@@ -64,7 +70,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v3.1 специально предпочитает «не сопоставить», чем ошибочно связать разные товары.
+v4: рекомендации цены основаны на закупке и марже. Это не анализ цен конкурентов.
 </div>
 </div>
 
@@ -96,7 +102,10 @@ function stats(s){
  <div class="stat"><span class="muted">Маржа <10%</span><b class="warn">${s.lowMargin}</b></div>
  <div class="stat"><span class="muted">Убыток</span><b class="bad">${s.loss}</b></div>
  <div class="stat"><span class="muted">Проверить match</span><b class="warn">${s.approximateMatches}</b></div>
- <div class="stat"><span class="muted">Условная прибыль*</span><b>${money(s.oneUnitGross)}</b></div>`;
+ <div class="stat"><span class="muted">Условная прибыль*</span><b>${money(s.oneUnitGross)}</b></div>
+ <div class="stat"><span class="muted">Поднять цену</span><b class="warn">${s.raisePrice||0}</b></div>
+ <div class="stat"><span class="muted">Оставить</span><b class="good">${s.keepPrice||0}</b></div>
+ <div class="stat"><span class="muted">Можно тестировать ниже</span><b>${s.testLower||0}</b></div>`;
 }
 async function loadAll(){
  $("#content").innerHTML='<div class="card">Загрузка и строгая проверка совпадений…</div>';
@@ -120,6 +129,7 @@ function render(){
  if(f==="salomon") rows=rows.filter(x=>x.discountGroup==="Salomon");
  if(f==="helikon") rows=rows.filter(x=>x.discountGroup==="Helikon-Tex");
  if(f==="lowa") rows=rows.filter(x=>x.discountGroup==="LOWA");
+ if(["raise","keep","test_lower"].includes(f)) rows=rows.filter(x=>x.decision===f);
 
  const s=$("#sort").value;
  rows.sort((a,b)=>{
@@ -131,7 +141,7 @@ function render(){
 
  if(!rows.length){$("#content").innerHTML='<div class="card">По фильтру ничего нет.</div>';return;}
  $("#content").innerHTML=`<div class="tablewrap"><table>
- <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Прибыль</th><th>Маржа</th><th>Рекоменд.20%</th><th>Match</th><th>AI</th></tr></thead>
+ <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Прибыль</th><th>Маржа</th><th>Рекомендация</th><th>Рекоменд.20%</th><th>Score</th><th>Match</th><th>AI</th></tr></thead>
  <tbody>${rows.map(x=>{
    const idx=REPORT.indexOf(x);
    const cls=(x.marginPct??-999)>=20?'good':((x.grossProfit??0)>0?'warn':'bad');
@@ -142,10 +152,10 @@ function render(){
    <td>${money(x.buyPrice)}${x.discountPct!=null?`<br><span class="muted small">−${x.discountPct}% ${esc(x.discountGroup||"")}</span>`:''}</td>
    <td class="${cls}">${money(x.grossProfit)}</td>
    <td class="${cls}">${x.marginPct==null?'—':x.marginPct+'%'}</td>
-   <td>${money(x.recommended20)}</td>
+   <td>${esc(x.label||"—")}</td><td>${money(x.recommended20)}</td><td>${x.score??0}</td>
    <td>${x.matched?`<span class="tag">${esc(x.matchMethod)}</span> <span class="tag">${esc(x.matchConfidence)}</span>`:'<span class="tag">нет</span>'}${(x.flags||[]).map(v=>`<div class="small warn">${esc(v)}</div>`).join("")}</td>
    <td><button onclick="ai(${idx})">AI</button></td>
-   </tr><tr id="airow${idx}" style="display:none"><td colspan="9"><pre id="ai${idx}"></pre></td></tr>`;
+   </tr><tr id="airow${idx}" style="display:none"><td colspan="11"><pre id="ai${idx}"></pre></td></tr>`;
  }).join("")}</tbody></table></div>`;
 }
 async function ai(i){
@@ -153,6 +163,19 @@ async function ai(i){
  row.style.display="table-row"; box.textContent="Анализ…";
  try{const d=await j("/api/analyze",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(REPORT[i])});box.textContent=d.text}
  catch(e){box.textContent=e.message}
+}
+function showTop(){
+ const rows=[...REPORT].filter(x=>x.matched).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,30);
+ if(!rows.length){loadAll();return;}
+ $("#content").innerHTML=`<div class="card"><b>ТОП для продаж</b><div class="muted small">Рейтинг учитывает маржу, прибыль и надёжность match. Спрос рынка пока не учитывается.</div></div>`+rows.map((x,i)=>`<div class="card"><b>${i+1}. ${esc(x.product.name)}</b><div class="row"><span class="tag">Score ${x.score}</span><span class="tag">Маржа ${x.marginPct}%</span><span class="tag">Прибыль ${money(x.grossProfit)}</span><span class="tag">${esc(x.label)}</span></div><div class="muted small">Prom ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · техническая цена 20% ${money(x.recommended20)}</div></div>`).join("");
+}
+function showPrices(){
+ const groups=[['raise','Поднять цену'],['keep','Оставить цену'],['test_lower','Можно тестировать снижение']];
+ $("#content").innerHTML=groups.map(([k,t])=>{const a=REPORT.filter(x=>x.decision===k);return `<div class="card"><b>${t}: ${a.length}</b>${a.slice(0,25).map(x=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(x.product.name)}</b><br><span class="muted small">Сейчас ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · 20% ${money(x.recommended20)} · маржа ${x.marginPct}%</span></div>`).join('')}</div>`}).join('');
+}
+async function loadSales(){
+ $("#content").innerHTML='<div class="card">Считаю продажи и расчётную прибыль по последним заказам Prom…</div>';
+ try{const d=await j('/api/orders/analytics');$("#content").innerHTML=`<div class="stats"><div class="stat"><span class="muted">Заказов</span><b>${d.orders}</b></div><div class="stat"><span class="muted">Единиц</span><b>${d.units}</b></div><div class="stat"><span class="muted">Оборот</span><b>${money(d.revenue)}</b></div><div class="stat"><span class="muted">Расчётная валовая прибыль</span><b class="good">${money(d.estimatedGross)}</b></div></div><div class="card"><b>Товары в заказах</b><div class="muted small">Прибыль расчётная: цена продажи минус текущая расчётная закупка Militaris.</div>${(d.top||[]).map(x=>`<div style="padding:8px 0;border-bottom:1px solid #333"><b>${esc(x.name)}</b><br><span class="muted small">${x.qty} шт. · оборот ${money(x.revenue)} · расчётная прибыль ${money(x.estimatedGross)} ${x.matched?'':'· нет match'}</span></div>`).join('')}</div>`}catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
 }
 async function loadOrders(){
  $("#content").innerHTML='<div class="card">Загрузка заказов…</div>';
