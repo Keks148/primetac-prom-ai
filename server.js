@@ -136,7 +136,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/6.2"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/7.0"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -467,6 +467,48 @@ async function hydrateOrders(orders){
   return result;
 }
 
+function clamp(v,min,max){ return Math.max(min,Math.min(max,v)); }
+
+function adStatusFromMarket(x, market){
+  if(!x?.matched || !x?.buyPrice){
+    return {color:"red",label:"НЕ РЕКЛАМИРОВАТЬ",reason:"Нет надёжной закупочной цены",score:0};
+  }
+  const margin=Number(market?.expectedMargin ?? x.marginPct ?? 0);
+  const competitorCount=(market?.competitors||[]).filter(c=>c.match==="exact").length;
+  const recommended=Number(market?.recommendedPrice||0);
+  const current=Number(x.promPrice||0);
+  const profit=Number(market?.expectedProfit ?? x.grossProfit ?? 0);
+  const competitive=market?.competitive;
+  let score=0;
+  score += clamp(margin,0,35)*2.0;
+  score += clamp(profit/100,0,20);
+  score += clamp(competitorCount*2,0,10);
+  if(competitive===false) score-=25;
+  if(margin<10) score-=30;
+  if(profit<100) score-=10;
+  if(recommended && current && recommended>current*1.25) score-=10;
+  score=Math.round(clamp(score,0,100));
+  if(competitive===true && margin>=15 && profit>=150 && competitorCount>=2){
+    return {color:"green",label:"РЕКЛАМИРОВАТЬ",reason:"Конкурентная цена и нормальная прибыль",score};
+  }
+  if(margin>=10 && profit>0){
+    return {color:"yellow",label:"ОСТАВИТЬ ОРГАНИЧЕСКИ",reason:competitive===false?"При безопасной марже цена выше основной части рынка":"Маржа/прибыль средняя — реклама под вопросом",score};
+  }
+  return {color:"red",label:"НЕ РЕКЛАМИРОВАТЬ",reason:"Слишком низкая маржа или слабая конкурентоспособность",score};
+}
+
+function preAdScore(x){
+  if(!x?.matched) return 0;
+  let score=0;
+  const m=Number(x.marginPct||0);
+  const p=Number(x.grossProfit||0);
+  score += clamp(m,0,35)*1.8;
+  score += clamp(p/100,0,25);
+  if(x.matchMethod==="sku+name") score+=8;
+  if(x.matchMethod==="name_strong") score-=5;
+  return Math.round(clamp(score,0,100));
+}
+
 app.get("/api/health",(req,res)=>{
   res.json({
     ok:true,
@@ -726,7 +768,7 @@ app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
 
 Правила:
 - Используй ТОЛЬКО факты, которые буквально или однозначно присутствуют в SOURCE FACTS ниже.
-- Данные поставщика приоритетнее исходной карточки Prom.
+- Для технических характеристик единственный источник истины — supplierDescription из XML Militaris.
 - ЗАПРЕЩЕНО выводить характеристики из названия товара, категории или общих знаний о похожих товарах.
 - Любой конкретный материал, процент состава, технология, мембрана, класс защиты, плотность, размер, страна, комплектность или особенность конструкции разрешены ТОЛЬКО если они явно есть в SOURCE FACTS.
 - Если технических фактов мало, делай короткое аккуратное описание без характеристик вместо догадок.
@@ -739,13 +781,15 @@ app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
 SOURCE FACTS:
 ${JSON.stringify({
   promName:x.product.name,
-  promDescription:stripHtml(x.product.description||""),
   supplierName:x.supplierName||"",
   supplierBrand:x.supplierBrand||"",
-  supplierDescription:stripHtml(x.supplierDescription||""),
-  category:x.product.category||"",
-  keywords:x.product.keywords||""
+  supplierDescription:stripHtml(x.supplierDescription||"")
 },null,2)}
+
+ВАЖНО:
+- promName можно использовать только как идентификатор модели/цвета.
+- Технические характеристики разрешены ТОЛЬКО из supplierDescription.
+- Если supplierDescription пустое или почти пустое, НЕ добавляй технические характеристики вообще.
 `.trim();
 
       const rr=await fetch("https://api.openai.com/v1/responses",{
@@ -873,18 +917,24 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
 
     const floorPrice=priceForMargin(Number(x.buyPrice),minMargin);
     const prompt=`
-Найди на Prom.ua текущие предложения ТОЧНО ЭТОГО ЖЕ товара или максимально точной модели.
+Найди на Prom.ua текущие предложения ТОЧНО ЭТОЙ ЖЕ модели товара.
 
 Товар продавца:
 "${x.product.name}"
 
-Дополнительные данные:
+Данные поставщика:
 бренд: "${x.supplierBrand||""}"
-название поставщика: "${x.supplierName||""}"
+точное название: "${x.supplierName||""}"
 
 Исключи магазин ${SELF_PROM_DOMAIN}.
-Не смешивай другие модели, поколения, размеры комплектов или явно другой товар.
-Если точных совпадений мало — добавь близкие, но пометь их match="close".
+
+Строгие правила сопоставления:
+- exact = совпадает бренд + модель/линейка + тип товара; цвет может отличаться.
+- close = похожий товар той же категории, но модель отличается.
+- Если в названии есть номер модели, поколение, серия, GTX/Mid/Forces/Level и т.п. — exact допускается только при совпадении этих ключевых слов.
+- Не помечай generic-футболки, generic-куртки и просто похожие товары как exact.
+- Для расчёта рыночной цены мы будем использовать exact в приоритете.
+- Если exact меньше 2, верни их как есть и добавь close, но не маскируй close под exact.
 
 Верни ТОЛЬКО JSON:
 {
@@ -893,13 +943,14 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
       "title":"...",
       "price":1234,
       "url":"https://...",
-      "match":"exact"
+      "match":"exact",
+      "reason":"почему exact или close"
     }
   ],
   "comment":"короткое замечание"
 }
 
-Нужно максимум 8 предложений. price только число в грн.
+Нужно максимум 10 предложений. price только число в грн.
 `.trim();
 
     async function runSearch(useFilter){
@@ -968,7 +1019,8 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
         title:String(c.title||"").trim(),
         price:Number(c.price||0),
         url:String(c.url||"").trim(),
-        match:String(c.match||"close").toLowerCase()==="exact"?"exact":"close"
+        match:String(c.match||"close").toLowerCase()==="exact"?"exact":"close",
+        reason:String(c.reason||"").trim()
       }))
       .filter(c=>c.price>0 && c.url.includes("prom.ua") && !c.url.includes(SELF_PROM_DOMAIN));
 
@@ -1030,7 +1082,7 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
         }
       }
 
-      return res.json({
+      const marketPayload={
         productId:x.product.id,
         name:x.product.name,
         currentPrice:current,
@@ -1049,10 +1101,12 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
         comment:String(parsed.comment||""),
         usedFallback,
         sources:sources.slice(0,12)
-      });
+      };
+      marketPayload.adDecision=adStatusFromMarket(x,marketPayload);
+      return res.json(marketPayload);
     }
 
-    return res.json({
+    const marketPayload={
       productId:x.product.id,
       name:x.product.name,
       currentPrice:current,
@@ -1071,8 +1125,25 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
       comment:String(parsed.comment||""),
       usedFallback,
       sources:[]
-    });
+    };
+    marketPayload.adDecision=adStatusFromMarket(x,marketPayload);
+    return res.json(marketPayload);
 
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.get("/api/ads/candidates",requirePromToken,async(req,res)=>{
+  try{
+    const limit=Math.max(5,Math.min(Number(req.query.limit)||30,100));
+    const data=await getCatalogReport(false);
+    const items=[...data.report]
+      .filter(x=>x.matched && Number(x.grossProfit||0)>0)
+      .map(x=>({...x,preScore:preAdScore(x)}))
+      .sort((a,b)=>b.preScore-a.preScore || Number(b.grossProfit||0)-Number(a.grossProfit||0))
+      .slice(0,limit);
+    res.json({count:items.length,note:"Предварительный рейтинг без web search. Для финального зелёный/жёлтый/красный нужно проверить рынок конкретного товара.",items});
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
   }
@@ -1116,4 +1187,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v6.2 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v7 running on ${PORT}`));
