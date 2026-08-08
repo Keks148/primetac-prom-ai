@@ -124,7 +124,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/3.1"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/4.0"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -298,6 +298,19 @@ function metrics(p,match){
     flags
   };
 }
+function decisionFor(x){
+  if(!x.matched) return {decision:"unmatched",label:"Сопоставить вручную",score:0};
+  const m=Number(x.marginPct||0), profit=Number(x.grossProfit||0), price=Number(x.promPrice||0);
+  let decision="keep", label="Оставить цену";
+  if(profit<=0 || m<10){ decision="raise"; label="Поднять цену"; }
+  else if(m>=30){ decision="test_lower"; label="Можно тестировать снижение"; }
+  const confidence=Number(x.matchConfidence||0);
+  const score=Math.max(0,Math.round((Math.min(m,40)*2)+(Math.min(profit/100,30))+(confidence*20)-(x.matchMethod==="name_strong"?15:0)));
+  return {decision,label,score};
+}
+function enrichReport(report){
+  return report.map(x=>({...x,...decisionFor(x)}));
+}
 function summarize(report){
   const matched=report.filter(x=>x.matched);
   return {
@@ -308,7 +321,10 @@ function summarize(report){
     lowMargin:matched.filter(x=>(x.marginPct??999)<10).length,
     loss:matched.filter(x=>(x.grossProfit??1)<=0).length,
     approximateMatches:matched.filter(x=>x.matchMethod==="name_strong").length,
-    oneUnitGross:round2(matched.reduce((s,x)=>s+(x.grossProfit||0),0))
+    oneUnitGross:round2(matched.reduce((s,x)=>s+(x.grossProfit||0),0)),
+    raisePrice:matched.filter(x=>x.decision==="raise").length,
+    keepPrice:matched.filter(x=>x.decision==="keep").length,
+    testLower:matched.filter(x=>x.decision==="test_lower").length
   };
 }
 
@@ -330,17 +346,41 @@ app.get("/api/catalog/report-all",requirePromToken,async(req,res)=>{
   try{
     if(!militarisCache.items.length) await refreshMilitaris();
     const products=await fetchAllPromProducts();
-    const report=products.map(p=>{
+    const report=enrichReport(products.map(p=>{
       const match=findMilitarisMatch(p);
       return {
         product:{id:p.id,name:p.name,price:p.price,currency:p.currency||"UAH",external_id:p.external_id||null,sku:p.sku||p.article||p.code||null},
         ...metrics(p,match)
       };
-    });
+    }));
     res.json({loadedAt:militarisCache.loadedAt,summary:summarize(report),report});
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
   }
+});
+
+app.get("/api/orders/analytics",requirePromToken,async(req,res)=>{
+  try{
+    if(!militarisCache.items.length) await refreshMilitaris();
+    const products=enrichReport((await fetchAllPromProducts()).map(p=>({product:{id:p.id,name:p.name,price:p.price,currency:p.currency||"UAH",external_id:p.external_id||null,sku:p.sku||p.article||p.code||null},...metrics(p,findMilitarisMatch(p))})));
+    const byId=new Map(products.map(x=>[String(x.product.id),x]));
+    const od=await promRequest("/orders/list?limit=100");
+    const orders=Array.isArray(od)?od:(Array.isArray(od?.orders)?od.orders:[]);
+    let revenue=0, estimatedGross=0, units=0, matchedUnits=0;
+    const productSales=new Map();
+    for(const o of orders){
+      const ps=Array.isArray(o.products)?o.products:[];
+      for(const op of ps){
+        const qty=Number(op.quantity||1); const sale=Number(op.price||0)*qty; units+=qty; revenue+=sale;
+        const x=byId.get(String(op.id||op.product_id||""));
+        if(x?.matched){ matchedUnits+=qty; estimatedGross+=(Number(op.price||x.promPrice)-Number(x.buyPrice||0))*qty; }
+        const key=String(op.id||op.product_id||op.name||"unknown");
+        const cur=productSales.get(key)||{name:op.name||x?.product?.name||key,qty:0,revenue:0,estimatedGross:0,matched:Boolean(x?.matched)};
+        cur.qty+=qty;cur.revenue+=sale;if(x?.matched)cur.estimatedGross+=(Number(op.price||x.promPrice)-Number(x.buyPrice||0))*qty;productSales.set(key,cur);
+      }
+    }
+    res.json({orders:orders.length,units,revenue:round2(revenue),estimatedGross:round2(estimatedGross),matchedUnits,top:[...productSales.values()].sort((a,b)=>b.estimatedGross-a.estimatedGross||b.revenue-a.revenue).slice(0,30)});
+  }catch(e){res.status(e.status||500).json({error:e.message,details:e.data||null});}
 });
 
 app.get("/api/orders",requirePromToken,async(req,res)=>{
@@ -386,4 +426,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v3.1 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v4 running on ${PORT}`));
