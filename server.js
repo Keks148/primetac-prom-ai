@@ -129,7 +129,7 @@ async function refreshCommissionTable(force=false){
 
   try{
     const r=await fetch(PROM_COMMISSION_CSV_URL,{
-      headers:{"User-Agent":"PrimeTacPromAI/9.1"}
+      headers:{"User-Agent":"PrimeTacPromAI/9.2"}
     });
     if(!r.ok) throw new Error(`Prom commission CSV: HTTP ${r.status}`);
 
@@ -301,7 +301,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/9.1"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/9.2"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -1511,6 +1511,116 @@ app.get("/api/markup20/preview",requirePromToken,async(req,res)=>{
   }
 });
 
+
+
+app.get("/api/markup20/status",(req,res)=>{
+  res.json({
+    ok:true,
+    version:"9.2",
+    routeReady:true,
+    writeEnabled:WRITE_ENABLED,
+    markupPct:CATALOG_MARKUP_PCT
+  });
+});
+
+app.post("/api/markup20/apply",requirePromToken,requireWritePin,async(req,res)=>{
+  try{
+    const ids=Array.isArray(req.body?.productIds)
+      ? req.body.productIds.map(v=>String(v))
+      : [];
+
+    if(!ids.length){
+      return res.status(400).json({error:"productIds required"});
+    }
+    if(ids.length>50){
+      return res.status(400).json({error:"Максимум 50 товаров за один пакет"});
+    }
+
+    const data=await getCatalogReport(false);
+    const byId=new Map((data.report||[]).map(x=>[String(x.product.id),x]));
+    const results=[];
+
+    for(const id of ids){
+      const x=byId.get(String(id));
+
+      if(!x){
+        results.push({productId:id,ok:false,error:"Товар не найден в каталоге"});
+        continue;
+      }
+
+      if(!x.matched || !x.buyPrice){
+        results.push({productId:id,ok:false,error:"Нет надёжной закупочной цены"});
+        continue;
+      }
+
+      const price=priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT);
+      if(!price || !Number.isFinite(price)){
+        results.push({productId:id,ok:false,error:"Не удалось рассчитать цену"});
+        continue;
+      }
+
+      const oldPrice=Number(x.promPrice||0);
+
+      // Если цена уже такая же — не отправляем лишний запрос в Prom.
+      if(oldPrice===price){
+        results.push({
+          productId:id,
+          ok:true,
+          unchanged:true,
+          oldPrice,
+          newPrice:price,
+          buyPrice:x.buyPrice,
+          markupPct:Math.round(((price-x.buyPrice)/x.buyPrice)*1000)/10
+        });
+        continue;
+      }
+
+      try{
+        const promResponse=await promEditProduct({
+          id:Number(x.product.id),
+          price:Number(price)
+        });
+
+        results.push({
+          productId:id,
+          ok:true,
+          unchanged:false,
+          oldPrice,
+          newPrice:price,
+          buyPrice:x.buyPrice,
+          markupPct:Math.round(((price-x.buyPrice)/x.buyPrice)*1000)/10,
+          promResponse
+        });
+      }catch(e){
+        results.push({
+          productId:id,
+          ok:false,
+          error:e.message,
+          details:e.data||null
+        });
+      }
+    }
+
+    // Сбрасываем кэш после пакета.
+    catalogCache={loadedAt:null,report:[],summary:null};
+
+    res.json({
+      ok:true,
+      markupPct:CATALOG_MARKUP_PCT,
+      success:results.filter(x=>x.ok && !x.unchanged).length,
+      unchanged:results.filter(x=>x.ok && x.unchanged).length,
+      failed:results.filter(x=>!x.ok).length,
+      results
+    });
+
+  }catch(e){
+    res.status(e.status||500).json({
+      error:e.message,
+      details:e.data||null
+    });
+  }
+});
+
 app.get("/api/pricing/policies",(req,res)=>{
   res.json({
     supplierDiscounts:[
@@ -1581,4 +1691,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v9.1 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v9.2 running on ${PORT}`));
