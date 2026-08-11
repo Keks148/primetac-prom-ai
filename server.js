@@ -201,7 +201,7 @@ async function refreshCommissionTable(force=false){
 
   try{
     const r=await fetch(PROM_COMMISSION_CSV_URL,{
-      headers:{"User-Agent":"PrimeTacPromAI/10.0"}
+      headers:{"User-Agent":"PrimeTacPromAI/10.1"}
     });
     if(!r.ok) throw new Error(`Prom commission CSV: HTTP ${r.status}`);
 
@@ -395,7 +395,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/10.0"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/10.1"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -678,12 +678,32 @@ function metrics(p,match){
 
 function decisionFor(x){
   if(!x.matched) return {decision:"unmatched",label:"Сопоставить вручную",score:0};
-  const m=Number(x.netMarginPct||0), profit=Number(x.netProfit||0), price=Number(x.promPrice||0);
-  let decision="keep", label=`Оставить: чистая маржа ≥${TARGET_NET_MARGIN_PCT}%`;
-  if(profit<=0 || m<TARGET_NET_MARGIN_PCT){ decision="raise"; label=`Поднять до чистых ${TARGET_NET_MARGIN_PCT}%`; }
-  else if(m>=35){ decision="test_lower"; label=`Можно оптимизировать, не ниже ${TARGET_NET_MARGIN_PCT}%`; }
+
+  const current=Number(x.promPrice||0);
+  const target=Number(x.recommendedMarkup20||priceForMarkup(Number(x.buyPrice||0),CATALOG_MARKUP_PCT)||0);
+  const netMargin=Number(x.netMarginPct||0);
+  const profit=Number(x.netProfit||0);
+
+  let decision="keep";
+  let label=`Цена по правилу +${CATALOG_MARKUP_PCT}%`;
+
+  if(target && current<target){
+    decision="raise";
+    label=`Поднять до +${CATALOG_MARKUP_PCT}%: ${target} грн`;
+  }else if(target && current>target){
+    decision="test_lower";
+    label=`Снизить до +${CATALOG_MARKUP_PCT}%: ${target} грн`;
+  }
+
   const confidence=Number(x.matchConfidence||0);
-  const score=Math.max(0,Math.round((Math.min(m,40)*2)+(Math.min(profit/100,30))+(confidence*20)-(x.matchMethod==="name_strong"?15:0)));
+  let score=50;
+  score += Math.min(Math.max(netMargin,0),25);
+  score += Math.min(Math.max(profit/100,0),15);
+  score += confidence*15;
+  if(x.matchMethod==="name_strong") score-=12;
+  if(netMargin<MANAGER_MIN_NET_ALERT_PCT) score-=15;
+  score=Math.max(0,Math.min(100,Math.round(score)));
+
   return {decision,label,score};
 }
 function enrichReport(report){
@@ -691,19 +711,30 @@ function enrichReport(report){
 }
 function summarize(report){
   const matched=report.filter(x=>x.matched);
+  const targetFor=x=>Number(x.recommendedMarkup20||priceForMarkup(Number(x.buyPrice||0),CATALOG_MARKUP_PCT)||0);
+  const currentFor=x=>Number(x.promPrice||0);
+
   return {
     total:report.length,
     matched:matched.length,
     unmatched:report.length-matched.length,
-    highMargin:matched.filter(x=>(x.netMarginPct??-999)>=TARGET_NET_MARGIN_PCT).length,
-    lowMargin:matched.filter(x=>(x.netMarginPct??999)<TARGET_NET_MARGIN_PCT).length,
+
+    priceCorrect:matched.filter(x=>targetFor(x)===currentFor(x)).length,
+    priceDrift:matched.filter(x=>targetFor(x)!==currentFor(x)).length,
+
+    highMargin:matched.filter(x=>(x.netMarginPct??-999)>=20).length,
+    lowMargin:matched.filter(x=>(x.netMarginPct??999)<20).length,
+    lowNet5:matched.filter(x=>(x.netProfit??0)>0 && (x.netMarginPct??999)<MANAGER_MIN_NET_ALERT_PCT).length,
     loss:matched.filter(x=>(x.netProfit??1)<=0).length,
+
     approximateMatches:matched.filter(x=>x.matchMethod==="name_strong").length,
     oneUnitGross:round2(matched.reduce((s,x)=>s+(x.netProfit||0),0)),
     targetNetMarginPct:TARGET_NET_MARGIN_PCT,
     catalogMarkupPct:CATALOG_MARKUP_PCT,
+
     raisePrice:matched.filter(x=>x.decision==="raise").length,
     keepPrice:matched.filter(x=>x.decision==="keep").length,
+    lowerPrice:matched.filter(x=>x.decision==="test_lower").length,
     testLower:matched.filter(x=>x.decision==="test_lower").length
   };
 }
@@ -1060,30 +1091,72 @@ function managerSummary(items){
 }
 
 function supplierOnlyProducts(report,limit=50){
-  const used=new Set();
+  const usedSku=new Set();
+  const usedName=new Set();
+
   for(const x of report){
     if(!x.matched) continue;
-    for(const k of [x.supplierSku,x.supplierName]){
-      const n=norm(k);
-      if(n) used.add(n);
-    }
+    const sku=norm(x.supplierSku);
+    const name=norm(x.supplierName);
+    if(sku) usedSku.add(sku);
+    if(name) usedName.add(name);
   }
-  const seen=new Set();
-  const rows=[];
+
+  const groups=new Map();
+
   for(const m of militarisCache.items||[]){
-    const sku=norm(m.sku), name=norm(m.name);
-    if((sku&&used.has(sku)) || (name&&used.has(name))) continue;
-    const uniq=sku||name;
-    if(!uniq || seen.has(uniq)) continue;
-    seen.add(uniq);
+    const sku=norm(m.sku);
+    const name=norm(m.name);
+    if(!name) continue;
+    if((sku && usedSku.has(sku)) || usedName.has(name)) continue;
     if(m.available===false) continue;
-    rows.push({
-      id:m.id,sku:m.sku,name:m.name,brand:m.brand,price:m.price,
-      available:m.available,paramCount:(m.params||[]).length,url:m.url
-    });
-    if(rows.length>=limit) break;
+
+    let g=groups.get(name);
+    if(!g){
+      g={
+        id:m.id,
+        sku:m.sku,
+        name:m.name,
+        brand:m.brand,
+        minPrice:Number(m.price||0),
+        maxPrice:Number(m.price||0),
+        available:m.available,
+        maxParamCount:(m.params||[]).length,
+        url:m.url,
+        variantCount:0
+      };
+      groups.set(name,g);
+    }
+
+    g.variantCount++;
+    const p=Number(m.price||0);
+    if(p){
+      if(!g.minPrice || p<g.minPrice) g.minPrice=p;
+      if(p>g.maxPrice) g.maxPrice=p;
+    }
+    g.maxParamCount=Math.max(g.maxParamCount,(m.params||[]).length);
   }
-  return rows;
+
+  return [...groups.values()]
+    .sort((a,b)=>{
+      const ab=norm(a.brand), bb=norm(b.brand);
+      if(ab!==bb) return ab.localeCompare(bb);
+      return norm(a.name).localeCompare(norm(b.name));
+    })
+    .slice(0,limit)
+    .map(g=>({
+      id:g.id,
+      sku:g.sku,
+      name:g.name,
+      brand:g.brand,
+      price:g.minPrice,
+      minPrice:g.minPrice,
+      maxPrice:g.maxPrice,
+      available:g.available,
+      paramCount:g.maxParamCount,
+      url:g.url,
+      variantCount:g.variantCount
+    }));
 }
 
 async function syncMarkupPriceItems(items){
@@ -1160,7 +1233,7 @@ app.get("/api/manager/today",requirePromToken,async(req,res)=>{
         lastRun:managerState.lastAutoRun,
         lastResult:managerState.lastAutoResult
       },
-      supplierOnlyCount:Math.max(0,(militarisCache.items||[]).length-data.report.filter(x=>x.matched).length),
+      supplierOnlyCount:supplierOnly.length,
       supplierOnly,
       items:audit.slice(0,250)
     });
@@ -2210,4 +2283,4 @@ setInterval(async()=>{
   }
 }, AUTO_PRICE_SYNC_INTERVAL_MIN*60*1000);
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v10 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v10.1 running on ${PORT}`));
