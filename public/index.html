@@ -812,21 +812,35 @@ async function startMarkup20All(){
    try{
      const r=await fetch("/api/markup20/apply",{
        method:"POST",
-       headers:{"Content-Type":"application/json"},
-       body:JSON.stringify({pin,productIds:chunk.map(x=>x.productId)})
+       headers:{
+         "Content-Type":"application/json",
+         "x-write-pin":pin
+       },
+       body:JSON.stringify({productIds:chunk.map(x=>x.productId)})
      });
-     const jx=await r.json();
-     if(!r.ok) throw new Error(jx.error||"Ошибка пакетного изменения");
+
+     const raw=await r.text();
+     let jx={};
+     try{
+       jx=raw?JSON.parse(raw):{};
+     }catch{
+       throw new Error(`Сервер вернул не JSON: HTTP ${r.status} · ${raw.slice(0,160)}`);
+     }
+
+     if(!r.ok) throw new Error(jx.error||`HTTP ${r.status}`);
 
      ok += Number(jx.success||0);
+     const unchanged=Number(jx.unchanged||0);
      fail += Number(jx.failed||0);
 
      const log=document.getElementById("markup20Log");
      (jx.results||[]).forEach(x=>{
        const div=document.createElement("div");
-       div.className=x.ok?"good":"bad";
+       div.className=x.ok?(x.unchanged?"muted":"good"):"bad";
        div.textContent=x.ok
-         ? `✓ ID ${x.productId}: ${x.oldPrice} → ${x.newPrice} грн | закупка ${x.buyPrice} | +${x.markupPct}%`
+         ? (x.unchanged
+            ? `• ID ${x.productId}: уже ${x.newPrice} грн | изменений не требуется`
+            : `✓ ID ${x.productId}: ${x.oldPrice} → ${x.newPrice} грн | закупка ${x.buyPrice} | +${x.markupPct}%`)
          : `✗ ID ${x.productId}: ${x.error}`;
        log.appendChild(div);
      });
@@ -851,7 +865,11 @@ async function startMarkup20All(){
 
  window.MARKUP20_RUNNING=false;
  const stats=document.getElementById("markup20Stats");
- if(stats) stats.innerHTML+=`<br><b class="good">Готово. Все надёжно сопоставленные товары обработаны.</b>`;
+ if(stats){
+   stats.innerHTML+= fail===0
+     ? `<br><b class="good">Готово. Массовое изменение завершено без ошибок.</b>`
+     : `<br><b class="warn">Проход завершён, но есть ошибки. Не запускай повторно весь каталог, пока не посмотришь журнал.</b>`;
+ }
 }
 
 health();
