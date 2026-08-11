@@ -20,6 +20,9 @@ const PROM_COMMISSION_CSV_URL = process.env.PROM_COMMISSION_CSV_URL ||
 const TARGET_NET_MARGIN_PCT = Number(process.env.TARGET_NET_MARGIN_PCT || 20);
 const CATALOG_MARKUP_PCT = Number(process.env.CATALOG_MARKUP_PCT || 20);
 const ECONOM_FALLBACK_PCT = Number(process.env.ECONOM_FALLBACK_PCT || 12.5);
+const MANAGER_MIN_NET_ALERT_PCT = Number(process.env.MANAGER_MIN_NET_ALERT_PCT || 5);
+const AUTO_PRICE_SYNC_INTERVAL_MIN = Math.max(15, Number(process.env.AUTO_PRICE_SYNC_INTERVAL_MIN || 60));
+const AUTO_PRICE_SYNC_DEFAULT = String(process.env.AUTO_PRICE_SYNC_DEFAULT || "false").toLowerCase() === "true";
 
 let militarisCache = {
   loadedAt: null,
@@ -41,6 +44,15 @@ let commissionCache = {
   byName: new Map(),
   count: 0,
   error: null
+};
+
+let supplierSnapshot = new Map();
+let managerState = {
+  autoPriceSync: AUTO_PRICE_SYNC_DEFAULT,
+  lastAutoRun: null,
+  lastAutoResult: null,
+  lastSupplierChanges: null,
+  running: false
 };
 
 function requirePromToken(req, res, next) {
@@ -91,6 +103,66 @@ function cleanNumber(v){
   return m?Number(m[0]):0;
 }
 
+function boolish(v){
+  if(v==null) return null;
+  const s=scalar(v).trim().toLowerCase();
+  if(["true","1","yes","так","да","склад","in stock","instock"].includes(s)) return true;
+  if(["false","0","no","ні","нет","out of stock","outofstock"].includes(s)) return false;
+  if(s==="") return false;
+  return null;
+}
+
+function normalizeParamList(v){
+  let raw=v;
+  if(raw && !Array.isArray(raw) && typeof raw==="object" && raw.param!=null) raw=raw.param;
+  const list=arr(raw);
+  const out=[];
+  for(const p of list){
+    if(p==null) continue;
+    if(typeof p==="string" || typeof p==="number"){
+      const value=String(p).trim();
+      if(value) out.push({name:"",value,unit:""});
+      continue;
+    }
+    const name=scalar(first(p,["@_name","name","title"])).trim();
+    const unit=scalar(first(p,["@_unit","unit"])).trim();
+    const value=scalar(first(p,["#text","value","@_value"])).trim();
+    if(name || value) out.push({name,value,unit});
+  }
+  return out.slice(0,100);
+}
+
+function genericCount(v){
+  if(v==null) return null;
+  if(Array.isArray(v)) return v.length;
+  if(typeof v==="object"){
+    for(const k of ["param","characteristic","characteristics","image","images","picture","pictures"]){
+      if(v[k]!=null) return genericCount(v[k]);
+    }
+    return Object.keys(v).length ? 1 : 0;
+  }
+  if(String(v).trim()) return 1;
+  return 0;
+}
+
+function promAvailableFromProduct(p){
+  const candidates=[
+    p?.available,p?.presence,p?.is_available,p?.in_stock,
+    p?.status,p?.availability
+  ];
+  for(const v of candidates){
+    if(v==null) continue;
+    const b=boolish(v);
+    if(b!=null) return b;
+    const n=norm(v);
+    if(n.includes("в наличии") || n.includes("в наявності") || n==="available") return true;
+    if(n.includes("нет в наличии") || n.includes("немає в наявності") || n==="not available") return false;
+  }
+  const q=first(p||{},["quantity_in_stock","stock_quantity","quantity"]);
+  if(q!=null && String(q).trim()!=="") return cleanNumber(q)>0;
+  return null;
+}
+
 function parseCsv(text){
   const rows=[]; let row=[], cell="", quoted=false;
   const s=String(text||"");
@@ -129,7 +201,7 @@ async function refreshCommissionTable(force=false){
 
   try{
     const r=await fetch(PROM_COMMISSION_CSV_URL,{
-      headers:{"User-Agent":"PrimeTacPromAI/9.2"}
+      headers:{"User-Agent":"PrimeTacPromAI/10.0"}
     });
     if(!r.ok) throw new Error(`Prom commission CSV: HTTP ${r.status}`);
 
@@ -290,18 +362,40 @@ function walk(node,out=[]){
   return out;
 }
 function normalizeItem(x){
+  const quantityRaw=first(x,["quantity_in_stock","stock_quantity","quantity"]);
+  const quantity=quantityRaw==null || String(scalar(quantityRaw)).trim()==="" ? null : cleanNumber(quantityRaw);
+  let available=boolish(first(x,["@_available","available","presence"]));
+  if(available==null && quantity!=null) available=quantity>0;
+
+  const params=normalizeParamList(
+    first(x,["param","params","characteristics","characteristic"])
+  );
+  const pictures=arr(first(x,["picture","pictures","image","images"]))
+    .map(scalar).filter(Boolean);
+
   return {
     id: scalar(first(x,["id","g:id","offer_id","external_id","@_id"])),
-    sku: scalar(first(x,["sku","vendorCode","g:mpn","article","articul","code"])),
-    name: scalar(first(x,["name","title","g:title"])),
+    sku: scalar(first(x,["sku","vendorCode","g:mpn","article","articul","code","barcode"])),
+    name: scalar(first(x,["name","name_ua","title","g:title"])),
+    nameUa: scalar(first(x,["name_ua"])),
     brand: scalar(first(x,["brand","vendor","g:brand"])),
     url: scalar(first(x,["url","link","g:link"])),
-    description: scalar(first(x,["description","g:description","desc","full_description"])),
-    price: cleanNumber(first(x,["price","g:price","priceuah","price_ua"]))
+    description: scalar(first(x,["description_ua","description","g:description","desc","full_description"])),
+    price: cleanNumber(first(x,["price","g:price","priceuah","price_ua"])),
+    available,
+    inStock: boolish(first(x,["@_in_stock","in_stock"])),
+    quantity,
+    params,
+    pictures,
+    categoryId: scalar(first(x,["categoryId","category_id"])),
+    portalCategoryId: scalar(first(x,["portal_category_id"])),
+    country: scalar(first(x,["country"])),
+    gtin: scalar(first(x,["gtin"])),
+    mpn: scalar(first(x,["mpn","g:mpn"]))
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/9.2"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/10.0"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -494,7 +588,7 @@ function metrics(p,match){
       netProfit:null,
       netMarginPct:null,
       targetMarginPct:TARGET_NET_MARGIN_PCT,
-      minMarketMarginPct:TARGET_NET_MARGIN_PCT,
+      minMarketMarginPct:MANAGER_MIN_NET_ALERT_PCT,
       recommendedAuto:null,
       recommended20:null,
       recommendedNet20:null,
@@ -502,6 +596,12 @@ function metrics(p,match){
       recommendedMarkup20:null,
       discountPct:null,
       discountGroup:null,
+      supplierAvailable:null,
+      supplierInStock:null,
+      supplierQuantity:null,
+      supplierParams:[],
+      supplierParamCount:0,
+      supplierPictureCount:0,
       flags:["Нет надёжного сопоставления"]
     };
   }
@@ -563,6 +663,15 @@ function metrics(p,match){
     supplierDescription:match.item.description||null,
     supplierSku:match.item.sku||null,
     supplierUrl:match.item.url||null,
+    supplierAvailable:match.item.available,
+    supplierInStock:match.item.inStock,
+    supplierQuantity:match.item.quantity,
+    supplierParams:match.item.params||[],
+    supplierParamCount:(match.item.params||[]).length,
+    supplierPictureCount:(match.item.pictures||[]).length,
+    supplierCountry:match.item.country||null,
+    supplierGtin:match.item.gtin||null,
+    supplierMpn:match.item.mpn||null,
     flags
   };
 }
@@ -618,7 +727,12 @@ async function getCatalogReport(force=false){
         description:p.description||"",
         keywords:p.keywords||"",
         category:p.category_name||p.category||"",
-        category_id:p.category_id||p.portal_category_id||p.marketplace_category_id||(p.category&&typeof p.category==="object"?p.category.id:null)||null
+        category_id:p.category_id||p.portal_category_id||p.marketplace_category_id||(p.category&&typeof p.category==="object"?p.category.id:null)||null,
+        available:promAvailableFromProduct(p),
+        quantity:first(p,["quantity_in_stock","stock_quantity","quantity"])??null,
+        paramCount:genericCount(first(p,["characteristics","characteristic","params","param"])),
+        imageCount:genericCount(first(p,["images","image","pictures","picture"])),
+        status:p.status||p.presence||null
       },
       ...metrics(p,match)
     };
@@ -768,6 +882,388 @@ function preAdScore(x){
   return Math.round(clamp(score,0,100));
 }
 
+
+function normalizedTextLen(s){
+  return stripHtml(String(s||"")).trim().length;
+}
+
+function supplierSnapshotMap(){
+  const m=new Map();
+  for(const x of militarisCache.items||[]){
+    const key=norm(x.sku)||norm(x.id)||norm(x.name);
+    if(key) m.set(key,{
+      price:Number(x.price||0),
+      available:x.available,
+      quantity:x.quantity,
+      name:x.name,
+      sku:x.sku,
+      id:x.id
+    });
+  }
+  return m;
+}
+
+function compareSupplierSnapshot(){
+  if(!supplierSnapshot.size){
+    return {hasBaseline:false,changedPrice:0,becameUnavailable:0,backInStock:0,details:[]};
+  }
+  const now=supplierSnapshotMap();
+  const details=[];
+  let changedPrice=0,becameUnavailable=0,backInStock=0;
+
+  for(const [key,cur] of now){
+    const old=supplierSnapshot.get(key);
+    if(!old) continue;
+    if(old.price && cur.price && Math.abs(old.price-cur.price)>=0.01){
+      changedPrice++;
+      details.push({type:"price",name:cur.name,from:old.price,to:cur.price});
+    }
+    if(old.available===true && cur.available===false){
+      becameUnavailable++;
+      details.push({type:"out",name:cur.name});
+    }
+    if(old.available===false && cur.available===true){
+      backInStock++;
+      details.push({type:"back",name:cur.name});
+    }
+  }
+  return {hasBaseline:true,changedPrice,becameUnavailable,backInStock,details:details.slice(0,100)};
+}
+
+function looseMatchSuggestions(p,limit=3){
+  const pName=p?.product?.name||p?.name||"";
+  const pPrice=Number(p?.promPrice||p?.price||0);
+  const pBrand=detectBrandFromName(pName);
+  const candidates=[];
+
+  for(const m of militarisCache.items||[]){
+    const mBrand=detectBrandFromName(`${m.brand||""} ${m.name||""}`);
+    if(pBrand && mBrand && pBrand!==mBrand) continue;
+
+    const nameScore=overlap(pName,m.name);
+    if(nameScore<0.18) continue;
+
+    let score=nameScore*75;
+    if(pBrand && mBrand && pBrand===mBrand) score+=12;
+    if(compatibleCategory(pName,m.name)) score+=8;
+
+    if(pPrice && m.price){
+      const ratio=Math.max(pPrice,m.price)/Math.max(1,Math.min(pPrice,m.price));
+      if(ratio<=1.6) score+=5;
+      else if(ratio>3) score-=15;
+    }
+
+    candidates.push({
+      supplierId:m.id,
+      sku:m.sku,
+      name:m.name,
+      brand:m.brand,
+      price:m.price,
+      available:m.available,
+      score:Math.round(score*10)/10
+    });
+  }
+  return candidates.sort((a,b)=>b.score-a.score).slice(0,limit);
+}
+
+function managerAuditItem(x){
+  const issues=[];
+  const current=Number(x.promPrice||0);
+  const target=x.matched&&x.buyPrice?priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT):null;
+  const drift=target!=null?target-current:null;
+  const descLen=normalizedTextLen(x.product?.description);
+  const nameLen=String(x.product?.name||"").trim().length;
+  const keywords=String(x.product?.keywords||"").trim();
+
+  if(!x.matched){
+    issues.push({code:"unmatched",level:"high",text:"Нет надёжного совпадения с Militaris"});
+  }else{
+    if(target!=null && Math.abs(drift)>=1){
+      issues.push({code:"price_drift",level:"high",text:`Цена не по правилу +${CATALOG_MARKUP_PCT}%`,targetPrice:target,delta:round2(drift)});
+    }
+    if(x.supplierAvailable===false){
+      issues.push({code:"supplier_out",level:"high",text:"У поставщика нет в наличии"});
+    }else if(x.supplierAvailable===true && x.product?.available===false){
+      issues.push({code:"back_in_stock",level:"medium",text:"У поставщика есть, а в Prom похоже выключен"});
+    }
+
+    if(x.netProfit!=null && Number(x.netProfit)<=0){
+      issues.push({code:"net_loss",level:"high",text:"После Econom расчётная прибыль ≤0"});
+    }else if(x.netMarginPct!=null && Number(x.netMarginPct)<MANAGER_MIN_NET_ALERT_PCT){
+      issues.push({code:"low_net",level:"medium",text:`Чистая маржа после Econom <${MANAGER_MIN_NET_ALERT_PCT}%`});
+    }
+  }
+
+  if(nameLen<25 || nameLen>140){
+    issues.push({code:"name",level:"medium",text:nameLen<25?"Название слишком короткое":"Название слишком длинное"});
+  }
+  if(descLen<250){
+    issues.push({code:"description",level:"medium",text:"Описание короткое или пустое"});
+  }
+  if(!keywords){
+    issues.push({code:"keywords",level:"low",text:"Нет поисковых ключей"});
+  }
+  if(x.supplierParamCount>=2 && x.product?.paramCount===0){
+    issues.push({code:"characteristics",level:"medium",text:`В XML есть ${x.supplierParamCount} характеристик, в Prom не обнаружены`});
+  }
+  if(x.product?.imageCount===0){
+    issues.push({code:"images",level:"high",text:"Не обнаружены фото товара"});
+  }
+  if(x.commissionSource==="fallback"){
+    issues.push({code:"category",level:"medium",text:"Не удалось точно привязать комиссию к категории"});
+  }
+
+  let priority=0;
+  for(const i of issues){
+    priority += i.level==="high"?30:(i.level==="medium"?12:4);
+  }
+
+  return {
+    productId:x.product?.id,
+    name:x.product?.name,
+    promPrice:x.promPrice,
+    buyPrice:x.buyPrice,
+    targetPrice:target,
+    priceDelta:drift==null?null:round2(drift),
+    netProfit:x.netProfit,
+    netMarginPct:x.netMarginPct,
+    economCommissionPct:x.economCommissionPct,
+    matched:x.matched,
+    matchMethod:x.matchMethod||null,
+    supplierAvailable:x.supplierAvailable,
+    supplierQuantity:x.supplierQuantity,
+    supplierParamCount:x.supplierParamCount||0,
+    promParamCount:x.product?.paramCount,
+    descriptionLen:descLen,
+    nameLen,
+    issues,
+    priority
+  };
+}
+
+function managerSummary(items){
+  const has=code=>items.filter(x=>x.issues.some(i=>i.code===code)).length;
+  return {
+    total:items.length,
+    attention:items.filter(x=>x.issues.length).length,
+    priceDrift:has("price_drift"),
+    supplierOut:has("supplier_out"),
+    backInStock:has("back_in_stock"),
+    unmatched:has("unmatched"),
+    descriptions:has("description"),
+    names:has("name"),
+    characteristics:has("characteristics"),
+    categoryReview:has("category"),
+    netLoss:has("net_loss"),
+    lowNet:has("low_net")
+  };
+}
+
+function supplierOnlyProducts(report,limit=50){
+  const used=new Set();
+  for(const x of report){
+    if(!x.matched) continue;
+    for(const k of [x.supplierSku,x.supplierName]){
+      const n=norm(k);
+      if(n) used.add(n);
+    }
+  }
+  const seen=new Set();
+  const rows=[];
+  for(const m of militarisCache.items||[]){
+    const sku=norm(m.sku), name=norm(m.name);
+    if((sku&&used.has(sku)) || (name&&used.has(name))) continue;
+    const uniq=sku||name;
+    if(!uniq || seen.has(uniq)) continue;
+    seen.add(uniq);
+    if(m.available===false) continue;
+    rows.push({
+      id:m.id,sku:m.sku,name:m.name,brand:m.brand,price:m.price,
+      available:m.available,paramCount:(m.params||[]).length,url:m.url
+    });
+    if(rows.length>=limit) break;
+  }
+  return rows;
+}
+
+async function syncMarkupPriceItems(items){
+  const results=[];
+  for(const x of items){
+    if(!x?.matched || !x?.buyPrice) continue;
+    const target=priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT);
+    const current=Number(x.promPrice||0);
+    if(!target || target===current) continue;
+    try{
+      const response=await promEditProduct({id:Number(x.product.id),price:Number(target)});
+      results.push({ok:true,productId:x.product.id,name:x.product.name,from:current,to:target,response});
+    }catch(e){
+      results.push({ok:false,productId:x.product.id,name:x.product.name,error:e.message,details:e.data||null});
+    }
+  }
+  if(results.length) catalogCache={loadedAt:null,report:[],summary:null};
+  return results;
+}
+
+async function runManagerAutoPriceSync(){
+  if(managerState.running) return managerState.lastAutoResult;
+  managerState.running=true;
+  try{
+    if(!process.env.PROM_TOKEN || !WRITE_ENABLED){
+      managerState.lastAutoResult={ok:false,error:"PROM_TOKEN/WRITE_ENABLED не готовы"};
+      return managerState.lastAutoResult;
+    }
+    const before=supplierSnapshot.size?compareSupplierSnapshot():null;
+    await refreshMilitaris();
+    const changes=supplierSnapshot.size?compareSupplierSnapshot():before;
+    const data=await getCatalogReport(true);
+    const drift=data.report.filter(x=>x.matched&&x.buyPrice&&priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT)!==Number(x.promPrice||0));
+    const results=await syncMarkupPriceItems(drift);
+    supplierSnapshot=supplierSnapshotMap();
+    managerState.lastSupplierChanges=changes;
+    managerState.lastAutoRun=new Date().toISOString();
+    managerState.lastAutoResult={
+      ok:true,
+      checked:data.report.length,
+      drift:drift.length,
+      changed:results.filter(x=>x.ok).length,
+      errors:results.filter(x=>!x.ok).length,
+      supplierChanges:changes
+    };
+    return managerState.lastAutoResult;
+  }catch(e){
+    managerState.lastAutoResult={ok:false,error:e.message};
+    managerState.lastAutoRun=new Date().toISOString();
+    return managerState.lastAutoResult;
+  }finally{
+    managerState.running=false;
+  }
+}
+
+app.get("/api/manager/today",requirePromToken,async(req,res)=>{
+  try{
+    const force=String(req.query.force||"")==="1";
+    if(force) await refreshMilitaris();
+    const data=await getCatalogReport(force);
+    const audit=data.report.map(managerAuditItem).sort((a,b)=>b.priority-a.priority);
+    const snapshot=compareSupplierSnapshot();
+    const supplierOnly=supplierOnlyProducts(data.report,30);
+
+    res.json({
+      generatedAt:new Date().toISOString(),
+      markupPct:CATALOG_MARKUP_PCT,
+      minNetAlertPct:MANAGER_MIN_NET_ALERT_PCT,
+      summary:managerSummary(audit),
+      supplierSnapshot:snapshot,
+      autoPriceSync:{
+        enabled:managerState.autoPriceSync,
+        intervalMinutes:AUTO_PRICE_SYNC_INTERVAL_MIN,
+        lastRun:managerState.lastAutoRun,
+        lastResult:managerState.lastAutoResult
+      },
+      supplierOnlyCount:Math.max(0,(militarisCache.items||[]).length-data.report.filter(x=>x.matched).length),
+      supplierOnly,
+      items:audit.slice(0,250)
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.post("/api/manager/snapshot",requirePromToken,(req,res)=>{
+  supplierSnapshot=supplierSnapshotMap();
+  res.json({ok:true,count:supplierSnapshot.size,createdAt:new Date().toISOString()});
+});
+
+app.get("/api/manager/unmatched",requirePromToken,async(req,res)=>{
+  try{
+    const data=await getCatalogReport(false);
+    const rows=data.report.filter(x=>!x.matched).map(x=>({
+      productId:x.product.id,
+      name:x.product.name,
+      price:x.promPrice,
+      suggestions:looseMatchSuggestions(x,3)
+    }));
+    res.json({count:rows.length,rows});
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.post("/api/manager/sync-prices",requirePromToken,requireWritePin,async(req,res)=>{
+  try{
+    const ids=Array.isArray(req.body?.productIds)?new Set(req.body.productIds.map(String)):null;
+    const data=await getCatalogReport(true);
+    let items=data.report.filter(x=>x.matched&&x.buyPrice);
+    if(ids) items=items.filter(x=>ids.has(String(x.product.id)));
+    items=items.filter(x=>priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT)!==Number(x.promPrice||0));
+    const results=await syncMarkupPriceItems(items);
+    res.json({
+      ok:true,
+      requested:items.length,
+      changed:results.filter(x=>x.ok).length,
+      errors:results.filter(x=>!x.ok).length,
+      results:results.slice(0,200)
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.get("/api/manager/availability",requirePromToken,async(req,res)=>{
+  try{
+    const data=await getCatalogReport(false);
+    const rows=data.report.filter(x=>x.matched).map(x=>({
+      productId:x.product.id,
+      name:x.product.name,
+      promAvailable:x.product.available,
+      supplierAvailable:x.supplierAvailable,
+      supplierQuantity:x.supplierQuantity,
+      supplierInStock:x.supplierInStock
+    })).filter(x=>x.supplierAvailable===false || (x.supplierAvailable===true && x.promAvailable===false));
+    res.json({
+      count:rows.length,
+      note:"Наличие читается из XML Militaris. Автозапись наличия в Prom в v10 не включена: публичный products/edit используется только для проверенных полей цена/название/описание.",
+      rows
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.get("/api/manager/characteristics",requirePromToken,async(req,res)=>{
+  try{
+    const data=await getCatalogReport(false);
+    const rows=data.report.filter(x=>x.matched&&(x.supplierParamCount||0)>0).map(x=>({
+      productId:x.product.id,
+      name:x.product.name,
+      supplierParamCount:x.supplierParamCount||0,
+      promParamCount:x.product.paramCount,
+      params:(x.supplierParams||[]).slice(0,30)
+    })).sort((a,b)=>b.supplierParamCount-a.supplierParamCount);
+    res.json({
+      count:rows.length,
+      note:"XML Militaris содержит параметры <param>. v10 показывает их для аудита; массовую запись характеристик лучше делать через проверенный YML-импорт после теста на нескольких товарах.",
+      rows:rows.slice(0,250)
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.post("/api/manager/auto-price-sync",requirePromToken,requireWritePin,async(req,res)=>{
+  const enabled=req.body?.enabled!==false;
+  managerState.autoPriceSync=enabled;
+  let test=null;
+  if(enabled && req.body?.runNow===true) test=await runManagerAutoPriceSync();
+  res.json({
+    ok:true,
+    enabled:managerState.autoPriceSync,
+    intervalMinutes:AUTO_PRICE_SYNC_INTERVAL_MIN,
+    lastRun:managerState.lastAutoRun,
+    test
+  });
+});
+
 app.get("/api/health",(req,res)=>{
   res.json({
     ok:true,
@@ -780,6 +1276,13 @@ app.get("/api/health",(req,res)=>{
       error:commissionCache.error,
       fallbackPct:ECONOM_FALLBACK_PCT,
       targetNetMarginPct:TARGET_NET_MARGIN_PCT
+    },
+    manager:{
+      markupPct:CATALOG_MARKUP_PCT,
+      minNetAlertPct:MANAGER_MIN_NET_ALERT_PCT,
+      autoPriceSync:managerState.autoPriceSync,
+      intervalMinutes:AUTO_PRICE_SYNC_INTERVAL_MIN,
+      lastRun:managerState.lastAutoRun
     }
   });
 });
@@ -827,6 +1330,7 @@ app.get("/api/orders/analytics",requirePromToken,async(req,res)=>{
 
     let revenue=0;
     let estimatedGross=0;
+    let estimatedNet=0;
     let units=0;
     let matchedUnits=0;
     let ordersWithItems=0;
@@ -852,10 +1356,13 @@ app.get("/api/orders/analytics",requirePromToken,async(req,res)=>{
         orderLinesRevenue+=sale;
 
         let lineGross=0;
+        let lineNet=0;
         if(x?.matched){
           matchedUnits+=qty;
           lineGross=(unitPrice-Number(x.buyPrice||0))*qty;
+          lineNet=(unitPrice*(1-Number(x.economCommissionPct||0)/100)-Number(x.buyPrice||0))*qty;
           estimatedGross+=lineGross;
+          estimatedNet+=lineNet;
         }
 
         const key=String(
@@ -870,12 +1377,14 @@ app.get("/api/orders/analytics",requirePromToken,async(req,res)=>{
           qty:0,
           revenue:0,
           estimatedGross:0,
+          estimatedNet:0,
           matched:Boolean(x?.matched)
         };
 
         cur.qty+=qty;
         cur.revenue+=sale;
         cur.estimatedGross+=lineGross;
+        cur.estimatedNet+=lineNet;
         cur.matched=cur.matched||Boolean(x?.matched);
         productSales.set(key,cur);
       }
@@ -896,6 +1405,7 @@ app.get("/api/orders/analytics",requirePromToken,async(req,res)=>{
       units,
       revenue:round2(revenue),
       estimatedGross:round2(estimatedGross),
+      estimatedNet:round2(estimatedNet),
       matchedUnits,
       catalogCachedAt:catalog.loadedAt,
       note:"Расчёт по последним 100 заказам Prom. Прибыль считается только по товарным строкам, которые удалось сопоставить с каталогом.",
@@ -1039,17 +1549,17 @@ app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
     const x=await currentCatalogItem(productId);
     if(!x) return res.status(404).json({error:"Товар не найден. Сначала нажми «Анализ всего каталога»."});
 
-    const defaultTarget=TARGET_NET_MARGIN_PCT;
+    const defaultTarget=CATALOG_MARKUP_PCT;
     const targetMargin=req.body?.targetMargin==null
       ? defaultTarget
-      : Math.max(TARGET_NET_MARGIN_PCT,Math.min(Number(req.body.targetMargin),50));
+      : Math.max(CATALOG_MARKUP_PCT,Math.min(Number(req.body.targetMargin),80));
     const changePrice=req.body?.changePrice!==false;
     const changeDescription=req.body?.changeDescription!==false;
     const changeName=req.body?.changeName!==false;
 
     let proposedPrice=null;
     if(changePrice && x.matched && x.buyPrice){
-      proposedPrice=priceForNetMargin(Number(x.buyPrice),Number(x.economCommissionPct||ECONOM_FALLBACK_PCT),targetMargin);
+      proposedPrice=priceForMarkup(Number(x.buyPrice),targetMargin);
     }
 
     let proposedDescription=null;
@@ -1144,7 +1654,7 @@ ${JSON.stringify({
       proposedDescription,
       groundingSafe:grounding.safe,
       groundingIssues:grounding.issues,
-      warning:`Цена рассчитана так, чтобы после комиссии Econom осталось не меньше ${TARGET_NET_MARGIN_PCT}% чистой маржи. Рынок Prom можно проверить отдельно.`
+      warning:`Цена рассчитана по текущему правилу магазина: закупка + ${targetMargin}% наценки. Комиссия Econom показывается отдельно и уменьшает чистую прибыль.`
     });
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
@@ -1175,14 +1685,16 @@ app.post("/api/editor/apply",requirePromToken,requireWritePin,async(req,res)=>{
       }
       const c=Number(x.economCommissionPct||ECONOM_FALLBACK_PCT);
       const nm=netMarginAtPrice(price,Number(x.buyPrice||0),c);
-      if(x.matched && x.buyPrice && (nm==null || nm < TARGET_NET_MARGIN_PCT-0.05)){
-        const floor=priceForNetMargin(Number(x.buyPrice),c,TARGET_NET_MARGIN_PCT);
-        return res.status(400).json({
-          error:`Цена не даёт ${TARGET_NET_MARGIN_PCT}% чистой маржи после Econom`,
-          netMarginPct:nm,
-          floorPrice:floor,
-          economCommissionPct:c
-        });
+      if(x.matched && x.buyPrice){
+        const floor=priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT);
+        if(price<floor){
+          return res.status(400).json({
+            error:`Цена ниже правила магазина: закупка + ${CATALOG_MARKUP_PCT}%`,
+            floorPrice:floor,
+            netMarginPct:nm,
+            economCommissionPct:c
+          });
+        }
       }
       edit.price=price;
       changes.price={from:old,to:price};
@@ -1234,10 +1746,10 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
 
     const productId=req.body?.productId;
     const x=await currentCatalogItem(productId);
-    const defaultMin=TARGET_NET_MARGIN_PCT;
+    const defaultMin=MANAGER_MIN_NET_ALERT_PCT;
     const minMargin=req.body?.minMargin==null
       ? defaultMin
-      : Math.max(TARGET_NET_MARGIN_PCT,Math.min(Number(req.body.minMargin),40));
+      : Math.max(0,Math.min(Number(req.body.minMargin),40));
 
     if(!x) return res.status(404).json({error:"Товар не найден"});
     if(!x.matched || !x.buyPrice){
@@ -1245,7 +1757,7 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
     }
 
     const economCommissionPct=Number(x.economCommissionPct||ECONOM_FALLBACK_PCT);
-    const floorPrice=priceForNetMargin(Number(x.buyPrice),economCommissionPct,minMargin);
+    const floorPrice=priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT);
     const prompt=`
 Найди на Prom.ua текущие предложения ТОЧНО ЭТОЙ ЖЕ модели товара.
 
@@ -1691,4 +2203,11 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v9.2 running on ${PORT}`));
+
+setInterval(async()=>{
+  if(managerState.autoPriceSync){
+    await runManagerAutoPriceSync();
+  }
+}, AUTO_PRICE_SYNC_INTERVAL_MIN*60*1000);
+
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v10 running on ${PORT}`));
