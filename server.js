@@ -15,6 +15,11 @@ const WRITE_ENABLED = String(process.env.WRITE_ENABLED || "false").toLowerCase()
 const WRITE_PIN = process.env.WRITE_PIN || "";
 const OPENAI_WEB_MODEL = process.env.OPENAI_WEB_MODEL || "gpt-4.1-mini";
 const SELF_PROM_DOMAIN = process.env.SELF_PROM_DOMAIN || "cs4221574.prom.ua";
+const PROM_COMMISSION_CSV_URL = process.env.PROM_COMMISSION_CSV_URL ||
+  "https://docs.google.com/spreadsheets/d/1mQ86nxmPTsEj23MAAu4bGn4iKtaX-yEIiKefu4SqvkA/export?format=csv&gid=688167001";
+const TARGET_NET_MARGIN_PCT = Number(process.env.TARGET_NET_MARGIN_PCT || 20);
+const CATALOG_MARKUP_PCT = Number(process.env.CATALOG_MARKUP_PCT || 20);
+const ECONOM_FALLBACK_PCT = Number(process.env.ECONOM_FALLBACK_PCT || 12.5);
 
 let militarisCache = {
   loadedAt: null,
@@ -28,6 +33,14 @@ let catalogCache = {
   loadedAt: null,
   report: [],
   summary: null
+};
+
+let commissionCache = {
+  loadedAt: null,
+  byId: new Map(),
+  byName: new Map(),
+  count: 0,
+  error: null
 };
 
 function requirePromToken(req, res, next) {
@@ -77,6 +90,144 @@ function cleanNumber(v){
   const m=s.match(/-?\d+(?:\.\d+)?/);
   return m?Number(m[0]):0;
 }
+
+function parseCsv(text){
+  const rows=[]; let row=[], cell="", quoted=false;
+  const s=String(text||"");
+  for(let i=0;i<s.length;i++){
+    const ch=s[i], next=s[i+1];
+    if(ch === '"'){
+      if(quoted && next === '"'){ cell+='"'; i++; }
+      else quoted=!quoted;
+    }else if(ch === "," && !quoted){
+      row.push(cell); cell="";
+    }else if((ch === "\n" || ch === "\r") && !quoted){
+      if(ch === "\r" && next === "\n") i++;
+      row.push(cell); cell="";
+      if(row.some(x=>String(x).trim()!=="")) rows.push(row);
+      row=[];
+    }else{
+      cell+=ch;
+    }
+  }
+  row.push(cell);
+  if(row.some(x=>String(x).trim()!=="")) rows.push(row);
+  return rows;
+}
+
+function parsePct(v){
+  const n=cleanNumber(String(v||"").replace("%",""));
+  return Number.isFinite(n) ? n : null;
+}
+
+async function refreshCommissionTable(force=false){
+  const fresh = commissionCache.loadedAt &&
+    (Date.now() - new Date(commissionCache.loadedAt).getTime()) < 6*60*60*1000 &&
+    commissionCache.count > 0;
+
+  if(!force && fresh) return commissionCache;
+
+  try{
+    const r=await fetch(PROM_COMMISSION_CSV_URL,{
+      headers:{"User-Agent":"PrimeTacPromAI/9.1"}
+    });
+    if(!r.ok) throw new Error(`Prom commission CSV: HTTP ${r.status}`);
+
+    const text=await r.text();
+    const rows=parseCsv(text);
+    const headerIndex=rows.findIndex(row=>{
+      const n=row.map(norm);
+      return n.some(x=>x.includes("id категор")) &&
+             n.some(x=>x.includes("комісія для режиму") && x.includes("економ"));
+    });
+    if(headerIndex<0) throw new Error("Не найден заголовок таблицы комиссий Prom");
+
+    const header=rows[headerIndex];
+    const nh=header.map(norm);
+    const idCol=nh.findIndex(x=>x.includes("id категор"));
+    const econCol=nh.findIndex(x=>x.includes("комісія для режиму") && x.includes("економ"));
+
+    let nameCol=-1;
+    for(let i=0;i<nh.length;i++){
+      if(nh[i]==="категорія") nameCol=i;
+    }
+
+    if(idCol<0 || econCol<0) throw new Error("Не найдены колонки ID/Econom");
+
+    const byId=new Map(), byName=new Map();
+    let count=0;
+
+    for(const row of rows.slice(headerIndex+1)){
+      const id=String(row[idCol]||"").trim();
+      const pct=parsePct(row[econCol]);
+      const name=String(row[nameCol]||"").trim();
+      if(!id || pct==null || pct<=0) continue;
+
+      const item={categoryId:id,categoryName:name,economPct:pct};
+      byId.set(id,item);
+      if(name) byName.set(norm(name),item);
+      count++;
+    }
+
+    if(!count) throw new Error("Таблица комиссий Prom загрузилась пустой");
+
+    commissionCache={
+      loadedAt:new Date().toISOString(),
+      byId,byName,count,error:null
+    };
+    catalogCache={loadedAt:null,report:[],summary:null};
+    return commissionCache;
+  }catch(e){
+    commissionCache.error=e.message;
+    if(commissionCache.count>0) return commissionCache;
+    return commissionCache;
+  }
+}
+
+function categoryInfoFromProduct(p){
+  const c=p?.category;
+  const idCandidates=[
+    p?.category_id,
+    p?.portal_category_id,
+    p?.marketplace_category_id,
+    p?.catalog_category_id,
+    c && typeof c==="object" ? c.id : null,
+    c && typeof c==="object" ? c.category_id : null,
+    c && typeof c==="object" ? c.portal_category_id : null
+  ].filter(v=>v!=null && String(v).trim()!=="");
+
+  const nameCandidates=[
+    p?.category_name,
+    p?.portal_category_name,
+    c && typeof c==="object" ? c.name : null,
+    c && typeof c==="object" ? c.title : null,
+    typeof c==="string" ? c : null
+  ].filter(Boolean);
+
+  return {
+    id:idCandidates.length?String(idCandidates[0]).trim():null,
+    name:nameCandidates.length?String(nameCandidates[0]).trim():""
+  };
+}
+
+function economCommissionForProduct(p){
+  const cat=categoryInfoFromProduct(p);
+  if(cat.id && commissionCache.byId.has(cat.id)){
+    const x=commissionCache.byId.get(cat.id);
+    return {pct:Number(x.economPct),source:"official_id",categoryId:cat.id,categoryName:x.categoryName||cat.name};
+  }
+  const nn=norm(cat.name);
+  if(nn && commissionCache.byName.has(nn)){
+    const x=commissionCache.byName.get(nn);
+    return {pct:Number(x.economPct),source:"official_name",categoryId:x.categoryId||cat.id,categoryName:x.categoryName||cat.name};
+  }
+  return {
+    pct:ECONOM_FALLBACK_PCT,
+    source:"fallback",
+    categoryId:cat.id,
+    categoryName:cat.name
+  };
+}
 function norm(s){
   return String(s||"").toLowerCase()
     .replace(/<[^>]*>/g," ")
@@ -114,6 +265,20 @@ function discountGroup(s){
   if(n.includes("belleville")) return "Belleville";
   return "Остальные";
 }
+function brandMarginPolicy(discountPct, group){
+  const d=Number(discountPct||0);
+  // Целевая валовая маржа = реальная скидка поставщика от его розничной цены.
+  // Минимум для рыночного поиска ниже цели, чтобы можно было конкурировать,
+  // но не уходить в нулевую прибыль.
+  const target=Math.max(3,Math.min(d||15,30));
+  const min=Math.max(3,Math.round(target*0.60));
+  return {
+    supplierDiscountPct:d,
+    targetMarginPct:target,
+    minMarketMarginPct:min,
+    group:group||"Остальные"
+  };
+}
 function walk(node,out=[]){
   if(!node || typeof node!=="object") return out;
   for(const [k,v] of Object.entries(node)){
@@ -136,7 +301,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/7.1"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/9.1"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -263,35 +428,108 @@ function findMilitarisMatch(p){
 function round2(v){ return Math.round(v*100)/100; }
 function smartPrice(v){
   if(!Number.isFinite(v)||v<=0) return null;
-  const n=Math.ceil(v);
-  if(n<300) return Math.ceil(n/10)*10-1;
-  if(n<1500) return Math.ceil(n/20)*20-1;
-  if(n<5000) return Math.ceil(n/50)*50-1;
-  return Math.ceil(n/100)*100-10;
+  let step=100, ending=10;
+  if(v<300){ step=10; ending=1; }
+  else if(v<1500){ step=20; ending=1; }
+  else if(v<5000){ step=50; ending=1; }
+
+  let candidate=Math.ceil((v+ending)/step)*step-ending;
+  if(candidate<v) candidate+=step;
+  return Math.ceil(candidate);
 }
+
 function priceForMargin(buy,m){
   const x=m/100;
   if(!buy||x<=0||x>=1) return null;
   return smartPrice(buy/(1-x));
 }
+
+function priceForMarkup(buy,markupPct=CATALOG_MARKUP_PCT){
+  const b=Number(buy||0);
+  const m=Number(markupPct||0)/100;
+  if(!b || m<0) return null;
+  // integer UAH, never below exact requested markup
+  return Math.ceil(b*(1+m));
+}
+
+function netProfitAtPrice(price,buy,commissionPct){
+  const p=Number(price||0), b=Number(buy||0), c=Number(commissionPct||0)/100;
+  if(!p) return null;
+  return p*(1-c)-b;
+}
+
+function netMarginAtPrice(price,buy,commissionPct){
+  const p=Number(price||0);
+  if(!p) return null;
+  const profit=netProfitAtPrice(p,buy,commissionPct);
+  return profit==null?null:(profit/p)*100;
+}
+
+function priceForNetMargin(buy,commissionPct,targetNetMarginPct){
+  const b=Number(buy||0);
+  const c=Number(commissionPct||0)/100;
+  const m=Number(targetNetMarginPct||0)/100;
+  const denom=1-c-m;
+  if(!b || denom<=0.05) return null;
+  return smartPrice(b/denom);
+}
 function metrics(p,match){
   const promPrice=Number(p.price||0);
+  const commissionInfo=economCommissionForProduct(p);
+  const economCommissionPct=Number(commissionInfo.pct||ECONOM_FALLBACK_PCT);
+
   if(!match?.item?.price){
     return {
-      matched:false,promPrice,supplierPrice:null,buyPrice:null,grossProfit:null,marginPct:null,
-      discountPct:null,discountGroup:null,recommended20:null,flags:["Нет надёжного сопоставления"]
+      matched:false,
+      promPrice,
+      supplierPrice:null,
+      buyPrice:null,
+      grossProfit:null,
+      marginPct:null,
+      economCommissionPct,
+      commissionSource:commissionInfo.source,
+      categoryId:commissionInfo.categoryId,
+      categoryName:commissionInfo.categoryName,
+      commissionCost:promPrice?round2(promPrice*economCommissionPct/100):null,
+      netProfit:null,
+      netMarginPct:null,
+      targetMarginPct:TARGET_NET_MARGIN_PCT,
+      minMarketMarginPct:TARGET_NET_MARGIN_PCT,
+      recommendedAuto:null,
+      recommended20:null,
+      recommendedNet20:null,
+      markupTargetPct:CATALOG_MARKUP_PCT,
+      recommendedMarkup20:null,
+      discountPct:null,
+      discountGroup:null,
+      flags:["Нет надёжного сопоставления"]
     };
   }
+
   const src=`${match.item.brand||""} ${match.item.name||""} ${p.name||""}`;
   const d=brandDiscount(src);
+  const group=discountGroup(src);
   const supplierPrice=Number(match.item.price);
   const buyPrice=supplierPrice*(1-d);
+
   const grossProfit=promPrice-buyPrice;
   const marginPct=promPrice?(grossProfit/promPrice)*100:null;
+
+  const commissionCost=promPrice*economCommissionPct/100;
+  const netProfit=netProfitAtPrice(promPrice,buyPrice,economCommissionPct);
+  const netMarginPct=netMarginAtPrice(promPrice,buyPrice,economCommissionPct);
+  const safePrice=priceForNetMargin(buyPrice,economCommissionPct,TARGET_NET_MARGIN_PCT);
+
   const flags=[];
   if(match.method==="name_strong") flags.push("Проверить match");
   if(promPrice<buyPrice) flags.push("Цена ниже закупки");
-  if(marginPct!=null && marginPct<10) flags.push("Маржа <10%");
+  if(netMarginPct!=null && netMarginPct<TARGET_NET_MARGIN_PCT){
+    flags.push(`Чистая маржа <${TARGET_NET_MARGIN_PCT}% после Econom`);
+  }
+  if(commissionInfo.source==="fallback"){
+    flags.push(`Комиссия fallback ${economCommissionPct}%`);
+  }
+
   return {
     matched:true,
     promPrice,
@@ -300,7 +538,24 @@ function metrics(p,match){
     grossProfit:round2(grossProfit),
     marginPct:marginPct==null?null:Math.round(marginPct*10)/10,
     discountPct:Math.round(d*100),
-    discountGroup:discountGroup(src),
+    discountGroup:group,
+
+    economCommissionPct:round2(economCommissionPct),
+    commissionSource:commissionInfo.source,
+    categoryId:commissionInfo.categoryId,
+    categoryName:commissionInfo.categoryName,
+    commissionCost:round2(commissionCost),
+    netProfit:netProfit==null?null:round2(netProfit),
+    netMarginPct:netMarginPct==null?null:Math.round(netMarginPct*10)/10,
+
+    targetMarginPct:TARGET_NET_MARGIN_PCT,
+    minMarketMarginPct:TARGET_NET_MARGIN_PCT,
+    recommendedAuto:safePrice,
+    recommended20:safePrice,
+    recommendedNet20:safePrice,
+    markupTargetPct:CATALOG_MARKUP_PCT,
+    recommendedMarkup20:priceForMarkup(buyPrice,CATALOG_MARKUP_PCT),
+
     matchMethod:match.method,
     matchConfidence:match.confidence,
     supplierName:match.item.name,
@@ -308,16 +563,16 @@ function metrics(p,match){
     supplierDescription:match.item.description||null,
     supplierSku:match.item.sku||null,
     supplierUrl:match.item.url||null,
-    recommended20:priceForMargin(buyPrice,20),
     flags
   };
 }
+
 function decisionFor(x){
   if(!x.matched) return {decision:"unmatched",label:"Сопоставить вручную",score:0};
-  const m=Number(x.marginPct||0), profit=Number(x.grossProfit||0), price=Number(x.promPrice||0);
-  let decision="keep", label="Оставить цену";
-  if(profit<=0 || m<10){ decision="raise"; label="Поднять цену"; }
-  else if(m>=30){ decision="test_lower"; label="Можно тестировать снижение"; }
+  const m=Number(x.netMarginPct||0), profit=Number(x.netProfit||0), price=Number(x.promPrice||0);
+  let decision="keep", label=`Оставить: чистая маржа ≥${TARGET_NET_MARGIN_PCT}%`;
+  if(profit<=0 || m<TARGET_NET_MARGIN_PCT){ decision="raise"; label=`Поднять до чистых ${TARGET_NET_MARGIN_PCT}%`; }
+  else if(m>=35){ decision="test_lower"; label=`Можно оптимизировать, не ниже ${TARGET_NET_MARGIN_PCT}%`; }
   const confidence=Number(x.matchConfidence||0);
   const score=Math.max(0,Math.round((Math.min(m,40)*2)+(Math.min(profit/100,30))+(confidence*20)-(x.matchMethod==="name_strong"?15:0)));
   return {decision,label,score};
@@ -331,11 +586,13 @@ function summarize(report){
     total:report.length,
     matched:matched.length,
     unmatched:report.length-matched.length,
-    highMargin:matched.filter(x=>(x.marginPct??-999)>=20).length,
-    lowMargin:matched.filter(x=>(x.marginPct??999)<10).length,
-    loss:matched.filter(x=>(x.grossProfit??1)<=0).length,
+    highMargin:matched.filter(x=>(x.netMarginPct??-999)>=TARGET_NET_MARGIN_PCT).length,
+    lowMargin:matched.filter(x=>(x.netMarginPct??999)<TARGET_NET_MARGIN_PCT).length,
+    loss:matched.filter(x=>(x.netProfit??1)<=0).length,
     approximateMatches:matched.filter(x=>x.matchMethod==="name_strong").length,
-    oneUnitGross:round2(matched.reduce((s,x)=>s+(x.grossProfit||0),0)),
+    oneUnitGross:round2(matched.reduce((s,x)=>s+(x.netProfit||0),0)),
+    targetNetMarginPct:TARGET_NET_MARGIN_PCT,
+    catalogMarkupPct:CATALOG_MARKUP_PCT,
     raisePrice:matched.filter(x=>x.decision==="raise").length,
     keepPrice:matched.filter(x=>x.decision==="keep").length,
     testLower:matched.filter(x=>x.decision==="test_lower").length
@@ -345,6 +602,7 @@ function summarize(report){
 async function getCatalogReport(force=false){
   if(!force && catalogCache.report.length) return catalogCache;
   if(!militarisCache.items.length) await refreshMilitaris();
+  await refreshCommissionTable(false);
 
   const products=await fetchAllPromProducts();
   const report=enrichReport(products.map(p=>{
@@ -359,7 +617,8 @@ async function getCatalogReport(force=false){
         sku:p.sku||p.article||p.code||null,
         description:p.description||"",
         keywords:p.keywords||"",
-        category:p.category_name||p.category||""
+        category:p.category_name||p.category||"",
+        category_id:p.category_id||p.portal_category_id||p.marketplace_category_id||(p.category&&typeof p.category==="object"?p.category.id:null)||null
       },
       ...metrics(p,match)
     };
@@ -473,11 +732,11 @@ function adStatusFromMarket(x, market){
   if(!x?.matched || !x?.buyPrice){
     return {color:"red",label:"НЕ РЕКЛАМИРОВАТЬ",reason:"Нет надёжной закупочной цены",score:0};
   }
-  const margin=Number(market?.expectedMargin ?? x.marginPct ?? 0);
+  const margin=Number(market?.expectedMargin ?? x.netMarginPct ?? 0);
   const competitorCount=(market?.competitors||[]).filter(c=>c.match==="exact").length;
   const recommended=Number(market?.recommendedPrice||0);
   const current=Number(x.promPrice||0);
-  const profit=Number(market?.expectedProfit ?? x.grossProfit ?? 0);
+  const profit=Number(market?.expectedProfit ?? x.netProfit ?? 0);
   const competitive=market?.competitive;
   let score=0;
   score += clamp(margin,0,35)*2.0;
@@ -500,8 +759,8 @@ function adStatusFromMarket(x, market){
 function preAdScore(x){
   if(!x?.matched) return 0;
   let score=0;
-  const m=Number(x.marginPct||0);
-  const p=Number(x.grossProfit||0);
+  const m=Number(x.netMarginPct||0);
+  const p=Number(x.netProfit||0);
   score += clamp(m,0,35)*1.8;
   score += clamp(p/100,0,25);
   if(x.matchMethod==="sku+name") score+=8;
@@ -514,8 +773,31 @@ app.get("/api/health",(req,res)=>{
     ok:true,
     promConfigured:Boolean(process.env.PROM_TOKEN),
     aiConfigured:Boolean(process.env.OPENAI_API_KEY),
-    militaris:{loadedAt:militarisCache.loadedAt,count:militarisCache.items.length,error:militarisCache.error}
+    militaris:{loadedAt:militarisCache.loadedAt,count:militarisCache.items.length,error:militarisCache.error},
+    commissions:{
+      loadedAt:commissionCache.loadedAt,
+      count:commissionCache.count,
+      error:commissionCache.error,
+      fallbackPct:ECONOM_FALLBACK_PCT,
+      targetNetMarginPct:TARGET_NET_MARGIN_PCT
+    }
   });
+});
+
+app.post("/api/commissions/refresh",async(req,res)=>{
+  try{
+    const d=await refreshCommissionTable(true);
+    res.json({
+      ok:true,
+      loadedAt:d.loadedAt,
+      count:d.count,
+      error:d.error,
+      fallbackPct:ECONOM_FALLBACK_PCT,
+      targetNetMarginPct:TARGET_NET_MARGIN_PCT
+    });
+  }catch(e){
+    res.status(500).json({error:e.message});
+  }
 });
 
 app.post("/api/militaris/refresh",async(req,res)=>{
@@ -730,6 +1012,25 @@ function lowerQuartile(nums){
   return a[idx];
 }
 
+function descriptionGroundingCheck(description, source){
+  const d=norm(stripHtml(description||""));
+  const s=norm(stripHtml(source||""));
+  const issues=[];
+  const sensitive=[
+    "coolmax","ripstop","cordura","gore tex","goretex","поліестер","polyester",
+    "бавовна","cotton","нейлон","nylon","мембрана","водонепроник","вогнестій",
+    "клас захист","рівень захист","густина","щільність"
+  ];
+  for(const term of sensitive){
+    if(d.includes(term) && !s.includes(term)) issues.push(`Немає в XML: ${term}`);
+  }
+  const pct=[...d.matchAll(/\b\d+(?:[.,]\d+)?\s*%/g)].map(m=>m[0].replace(/\s/g,""));
+  for(const p of pct){
+    if(!s.replace(/\s/g,"").includes(p)) issues.push(`Відсоток не підтверджений XML: ${p}`);
+  }
+  return {safe:issues.length===0,issues:[...new Set(issues)].slice(0,10)};
+}
+
 app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
   try{
     const productId=req.body?.productId;
@@ -738,14 +1039,17 @@ app.post("/api/editor/propose",requirePromToken,async(req,res)=>{
     const x=await currentCatalogItem(productId);
     if(!x) return res.status(404).json({error:"Товар не найден. Сначала нажми «Анализ всего каталога»."});
 
-    const targetMargin=Math.max(5,Math.min(Number(req.body?.targetMargin||20),50));
+    const defaultTarget=TARGET_NET_MARGIN_PCT;
+    const targetMargin=req.body?.targetMargin==null
+      ? defaultTarget
+      : Math.max(TARGET_NET_MARGIN_PCT,Math.min(Number(req.body.targetMargin),50));
     const changePrice=req.body?.changePrice!==false;
     const changeDescription=req.body?.changeDescription!==false;
     const changeName=req.body?.changeName!==false;
 
     let proposedPrice=null;
     if(changePrice && x.matched && x.buyPrice){
-      proposedPrice=priceForMargin(Number(x.buyPrice),targetMargin);
+      proposedPrice=priceForNetMargin(Number(x.buyPrice),Number(x.economCommissionPct||ECONOM_FALLBACK_PCT),targetMargin);
     }
 
     let proposedDescription=null;
@@ -817,6 +1121,10 @@ ${JSON.stringify({
       }
     }
 
+    const grounding=changeDescription
+      ? descriptionGroundingCheck(proposedDescription||"",x.supplierDescription||"")
+      : {safe:true,issues:[]};
+
     res.json({
       productId:x.product.id,
       name:x.product.name,
@@ -826,10 +1134,17 @@ ${JSON.stringify({
       buyPrice:x.buyPrice,
       marginPct:x.marginPct,
       targetMargin,
+      minMarketMarginPct:TARGET_NET_MARGIN_PCT,
+      economCommissionPct:Number(x.economCommissionPct||ECONOM_FALLBACK_PCT),
+      commissionSource:x.commissionSource,
+      discountPct:x.discountPct,
+      discountGroup:x.discountGroup,
       proposedPrice,
       proposedName,
       proposedDescription,
-      warning:"Цена пока техническая по марже. Для рыночной цены нажми «Проверить рынок Prom»."
+      groundingSafe:grounding.safe,
+      groundingIssues:grounding.issues,
+      warning:`Цена рассчитана так, чтобы после комиссии Econom осталось не меньше ${TARGET_NET_MARGIN_PCT}% чистой маржи. Рынок Prom можно проверить отдельно.`
     });
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
@@ -857,6 +1172,17 @@ app.post("/api/editor/apply",requirePromToken,requireWritePin,async(req,res)=>{
       const old=Number(x.promPrice||0);
       if(old>0 && (price<old*0.5 || price>old*1.8)){
         return res.status(400).json({error:"Цена отличается от текущей более чем на допустимый безопасный диапазон 50%–180%."});
+      }
+      const c=Number(x.economCommissionPct||ECONOM_FALLBACK_PCT);
+      const nm=netMarginAtPrice(price,Number(x.buyPrice||0),c);
+      if(x.matched && x.buyPrice && (nm==null || nm < TARGET_NET_MARGIN_PCT-0.05)){
+        const floor=priceForNetMargin(Number(x.buyPrice),c,TARGET_NET_MARGIN_PCT);
+        return res.status(400).json({
+          error:`Цена не даёт ${TARGET_NET_MARGIN_PCT}% чистой маржи после Econom`,
+          netMarginPct:nm,
+          floorPrice:floor,
+          economCommissionPct:c
+        });
       }
       edit.price=price;
       changes.price={from:old,to:price};
@@ -907,15 +1233,19 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
     }
 
     const productId=req.body?.productId;
-    const minMargin=Math.max(5,Math.min(Number(req.body?.minMargin||12),40));
     const x=await currentCatalogItem(productId);
+    const defaultMin=TARGET_NET_MARGIN_PCT;
+    const minMargin=req.body?.minMargin==null
+      ? defaultMin
+      : Math.max(TARGET_NET_MARGIN_PCT,Math.min(Number(req.body.minMargin),40));
 
     if(!x) return res.status(404).json({error:"Товар не найден"});
     if(!x.matched || !x.buyPrice){
       return res.status(400).json({error:"Нет надёжной закупочной цены для расчёта"});
     }
 
-    const floorPrice=priceForMargin(Number(x.buyPrice),minMargin);
+    const economCommissionPct=Number(x.economCommissionPct||ECONOM_FALLBACK_PCT);
+    const floorPrice=priceForNetMargin(Number(x.buyPrice),economCommissionPct,minMargin);
     const prompt=`
 Найди на Prom.ua текущие предложения ТОЧНО ЭТОЙ ЖЕ модели товара.
 
@@ -1057,8 +1387,11 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
     if(marketTarget){
       const desired=smartPrice(marketTarget*0.99);
       recommendedPrice=Math.max(Number(floorPrice||0),Number(desired||0));
+      const expectedProfit=recommendedPrice
+        ? netProfitAtPrice(recommendedPrice,Number(x.buyPrice),economCommissionPct)
+        : null;
       const expectedMargin=recommendedPrice
-        ? ((recommendedPrice-Number(x.buyPrice))/recommendedPrice)*100
+        ? netMarginAtPrice(recommendedPrice,Number(x.buyPrice),economCommissionPct)
         : null;
 
       competitive = marketMedian ? recommendedPrice <= marketMedian*1.03 : true;
@@ -1094,7 +1427,8 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
         marketMedian:marketMedian?round2(marketMedian):null,
         marketQ1:marketQ1?round2(marketQ1):null,
         recommendedPrice,
-        expectedProfit:recommendedPrice?round2(recommendedPrice-Number(x.buyPrice)):null,
+        economCommissionPct,
+        expectedProfit:expectedProfit==null?null:round2(expectedProfit),
         expectedMargin:expectedMargin!=null?Math.round(expectedMargin*10)/10:null,
         competitive,
         status,
@@ -1113,6 +1447,7 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
       buyPrice:x.buyPrice,
       minMargin,
       floorPrice,
+      economCommissionPct,
       competitors,
       marketLow,
       marketMedian,
@@ -1134,14 +1469,73 @@ app.post("/api/market/check",requirePromToken,async(req,res)=>{
   }
 });
 
+app.get("/api/markup20/preview",requirePromToken,async(req,res)=>{
+  try{
+    const data=await getCatalogReport(false);
+    const rows=(data.report||[]).map(x=>{
+      const target=x.matched && x.buyPrice ? priceForMarkup(x.buyPrice,CATALOG_MARKUP_PCT) : null;
+      const current=Number(x.promPrice||0);
+      const delta=target!=null ? round2(target-current) : null;
+      const actualMarkup=target && x.buyPrice ? ((target-x.buyPrice)/x.buyPrice)*100 : null;
+      return {
+        productId:x.product.id,
+        name:x.product.name,
+        matched:x.matched,
+        matchMethod:x.matchMethod||null,
+        buyPrice:x.buyPrice,
+        currentPrice:current,
+        targetPrice:target,
+        delta,
+        actualMarkupPct:actualMarkup==null?null:Math.round(actualMarkup*10)/10,
+        discountPct:x.discountPct,
+        discountGroup:x.discountGroup,
+        economCommissionPct:x.economCommissionPct,
+        projectedNetProfit:target?round2(netProfitAtPrice(target,x.buyPrice,x.economCommissionPct||ECONOM_FALLBACK_PCT)):null,
+        projectedNetMarginPct:target?Math.round(netMarginAtPrice(target,x.buyPrice,x.economCommissionPct||ECONOM_FALLBACK_PCT)*10)/10:null
+      };
+    });
+
+    const matched=rows.filter(x=>x.matched && x.targetPrice);
+    res.json({
+      markupPct:CATALOG_MARKUP_PCT,
+      total:rows.length,
+      ready:matched.length,
+      skipped:rows.length-matched.length,
+      raise:matched.filter(x=>x.targetPrice>x.currentPrice).length,
+      lower:matched.filter(x=>x.targetPrice<x.currentPrice).length,
+      same:matched.filter(x=>x.targetPrice===x.currentPrice).length,
+      rows
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.get("/api/pricing/policies",(req,res)=>{
+  res.json({
+    supplierDiscounts:[
+      {brand:"Salomon",supplierDiscountPct:20},
+      {brand:"Helikon-Tex",supplierDiscountPct:10},
+      {brand:"LOWA",supplierDiscountPct:5},
+      {brand:"Belleville",supplierDiscountPct:15},
+      {brand:"Остальные",supplierDiscountPct:15}
+    ],
+    targetNetMarginPct:TARGET_NET_MARGIN_PCT,
+    commissionMode:"Econom",
+    fallbackCommissionPct:ECONOM_FALLBACK_PCT,
+    commissionTableLoaded:commissionCache.count,
+    note:"Скидка Militaris определяет закупку. Цена рассчитывается отдельно так, чтобы после комиссии Prom Econom осталось не меньше целевой чистой маржи."
+  });
+});
+
 app.get("/api/ads/candidates",requirePromToken,async(req,res)=>{
   try{
     const limit=Math.max(5,Math.min(Number(req.query.limit)||30,100));
     const data=await getCatalogReport(false);
     const items=[...data.report]
-      .filter(x=>x.matched && Number(x.grossProfit||0)>0)
+      .filter(x=>x.matched && Number(x.netProfit||0)>0)
       .map(x=>({...x,preScore:preAdScore(x)}))
-      .sort((a,b)=>b.preScore-a.preScore || Number(b.grossProfit||0)-Number(a.grossProfit||0))
+      .sort((a,b)=>b.preScore-a.preScore || Number(b.netProfit||0)-Number(a.netProfit||0))
       .slice(0,limit);
     res.json({count:items.length,note:"Предварительный рейтинг без web search. Для финального зелёный/жёлтый/красный нужно проверить рынок конкретного товара.",items});
   }catch(e){
@@ -1162,9 +1556,9 @@ app.post("/api/analyze",async(req,res)=>{
 Не придумывай цены конкурентов и спрос.
 
 Ответ:
-1) текущая прибыль/маржа;
+1) текущая чистая прибыль и чистая маржа после комиссии Prom Econom;
 2) безопасна ли цена;
-3) техническая цена для ~20% валовой маржи;
+3) минимальная цена для 20% чистой маржи после комиссии;
 4) стоит ли товар рассматривать для продвижения;
 5) риск сопоставления;
 6) улучшенное украинское название.
@@ -1187,4 +1581,4 @@ ${JSON.stringify(payload,null,2)}
   }catch(e){res.status(500).json({error:e.message});}
 });
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v7.1 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v9.1 running on ${PORT}`));
