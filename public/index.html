@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v10</title>
+<title>PrimeTac Prom AI v10.1</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -62,7 +62,7 @@ summary{cursor:pointer;font-weight:700}
 </head>
 <body>
 <div class="wrap">
-<h1>PrimeTac Prom AI <span class="muted">v10</span></h1>
+<h1>PrimeTac Prom AI <span class="muted">v10.1</span></h1>
 <div class="muted">Панель прибыли: Prom + Militaris + AI + продажи</div>
 
 <div class="bar">
@@ -86,14 +86,14 @@ summary{cursor:pointer;font-weight:700}
 <option value="matched">Сопоставленные</option>
 <option value="unmatched">Без сопоставления</option>
 <option value="approx">Нужно проверить match</option>
-<option value="margin20">Чистая маржа ≥20%</option>
-<option value="low">Чистая маржа <20%</option>
+<option value="margin20">Аналитика: чистыми ≥20%</option>
+<option value="low">Аналитика: чистыми <20%</option>
 <option value="loss">Убыток</option>
 <option value="salomon">Salomon</option>
 <option value="helikon">Helikon-Tex</option>
 <option value="lowa">LOWA</option>
-<option value="raise">Поднять цену</option>
-<option value="keep">Оставить цену</option>
+<option value="raise">Поднять до +20%</option>
+<option value="keep">Цена уже +20%</option>
 <option value="test_lower">Можно снизить</option>
 </select>
 <select id="sort" onchange="render()">
@@ -104,7 +104,7 @@ summary{cursor:pointer;font-weight:700}
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v10: правило цены = закупка Militaris +20%. Менеджер контролирует цены, наличие, карточки, match, характеристики и прибыль после Econom.
+v10.1: основное правило = закупка Militaris +20%. Чистая маржа после Econom — отдельная аналитика, а не команда поднять весь каталог.
 </div>
 </div>
 
@@ -132,14 +132,15 @@ function stats(s){
  <div class="stat"><span class="muted">Товаров Prom</span><b>${s.total}</b></div>
  <div class="stat"><span class="muted">Надёжно сопоставлено</span><b class="good">${s.matched}</b></div>
  <div class="stat"><span class="muted">Без match</span><b class="warn">${s.unmatched}</b></div>
- <div class="stat"><span class="muted">Чистая маржа ≥20%</span><b class="good">${s.highMargin}</b></div>
- <div class="stat"><span class="muted">Чистая маржа <20%</span><b class="warn">${s.lowMargin}</b></div>
- <div class="stat"><span class="muted">Убыток</span><b class="bad">${s.loss}</b></div>
+ <div class="stat"><span class="muted">Цена ровно +20%</span><b class="good">${s.priceCorrect||0}</b></div>
+ <div class="stat"><span class="muted">Цена съехала</span><b class="${(s.priceDrift||0)?'warn':'good'}">${s.priceDrift||0}</b></div>
+ <div class="stat"><span class="muted">Убыток после Econom</span><b class="bad">${s.loss}</b></div>
+ <div class="stat"><span class="muted">Чистыми <5%</span><b class="${(s.lowNet5||0)?'warn':'good'}">${s.lowNet5||0}</b></div>
  <div class="stat"><span class="muted">Проверить match</span><b class="warn">${s.approximateMatches}</b></div>
  <div class="stat"><span class="muted">Условная чистая прибыль*</span><b>${money(s.oneUnitGross)}</b></div>
- <div class="stat"><span class="muted">Поднять цену</span><b class="warn">${s.raisePrice||0}</b></div>
- <div class="stat"><span class="muted">Оставить</span><b class="good">${s.keepPrice||0}</b></div>
- <div class="stat"><span class="muted">Можно тестировать ниже</span><b>${s.testLower||0}</b></div>`;
+ <div class="stat"><span class="muted">Поднять до +20%</span><b class="warn">${s.raisePrice||0}</b></div>
+ <div class="stat"><span class="muted">Снизить до +20%</span><b class="warn">${s.lowerPrice||0}</b></div>
+ <div class="stat"><span class="muted">Оставить</span><b class="good">${s.keepPrice||0}</b></div>`;
 }
 async function loadAll(){
  $("#content").innerHTML='<div class="card">Загрузка и строгая проверка совпадений…</div>';
@@ -205,7 +206,7 @@ function showTop(){
  $("#content").innerHTML=`<div class="card"><b>ТОП для продаж</b><div class="muted small">Рейтинг учитывает маржу, прибыль и надёжность match. Спрос рынка пока не учитывается.</div></div>`+rows.map((x,i)=>`<div class="card"><b>${i+1}. ${esc(x.product.name)}</b><div class="row"><span class="tag">Score ${x.score}</span><span class="tag">Чистая маржа ${x.netMarginPct}%</span><span class="tag">Чистая прибыль ${money(x.netProfit)}</span><span class="tag">${esc(x.label)}</span></div><div class="muted small">Prom ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · +20% к закупке ${money(x.recommendedMarkup20||x.recommendedNet20||x.recommended20)}</div></div>`).join("");
 }
 function showPrices(){
- const groups=[['raise','Поднять цену'],['keep','Оставить цену'],['test_lower','Можно тестировать снижение']];
+ const groups=[['raise','Поднять до +20%'],['keep','Цена уже +20%'],['test_lower','Снизить до +20%']];
  $("#content").innerHTML=groups.map(([k,t])=>{const a=REPORT.filter(x=>x.decision===k);return `<div class="card"><b>${t}: ${a.length}</b>${a.slice(0,25).map(x=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(x.product.name)}</b><br><span class="muted small">Сейчас ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · +20% к закупке ${money(x.recommendedMarkup20||x.recommendedNet20||x.recommended20)} · чистая маржа ${x.netMarginPct}%</span></div>`).join('')}</div>`}).join('');
 }
 async function loadSales(){
@@ -907,7 +908,7 @@ async function openManager(force=false){
      <h3 style="margin:0">🧠 Что сделать сегодня</h3>
      <div class="muted small">Правило цены: закупка Militaris +${d.markupPct}% · Econom учитывается как контроль реальной прибыли.</div>
      <div class="manager-grid">
-       <div class="manager-stat"><span class="muted">Требуют внимания</span><b class="${s.attention?'warn':'good'}">${s.attention||0}</b></div>
+       <div class="manager-stat"><span class="muted">Товаров с задачами</span><b class="${s.attention?'warn':'good'}">${s.attention||0}</b></div>
        <div class="manager-stat"><span class="muted">Цена съехала</span><b class="${s.priceDrift?'bad':'good'}">${s.priceDrift||0}</b></div>
        <div class="manager-stat"><span class="muted">Нет у поставщика</span><b class="${s.supplierOut?'bad':'good'}">${s.supplierOut||0}</b></div>
        <div class="manager-stat"><span class="muted">Вернулись в наличие</span><b class="${s.backInStock?'warn':'good'}">${s.backInStock||0}</b></div>
@@ -949,7 +950,10 @@ async function openManager(force=false){
      <div class="card">
        <b>Ассортимент Militaris вне текущего магазина</b><br>
        <span class="muted small">Ориентировочно поставщик имеет больше позиций, чем сейчас сопоставлено в Prom. Ниже первые доступные кандидаты; это не команда добавлять всё подряд.</span>
-       ${(d.supplierOnly||[]).slice(0,10).map(x=>`<div style="padding:6px 0;border-bottom:1px solid #333"><b>${esc(x.name)}</b><br><span class="muted small">${esc(x.brand||"")} · ${money(x.price)} · параметров ${x.paramCount||0}</span></div>`).join("")}
+       ${(d.supplierOnly||[]).slice(0,10).map(x=>{
+         const pr=(x.minPrice&&x.maxPrice&&x.minPrice!==x.maxPrice)?`${money(x.minPrice)}–${money(x.maxPrice)}`:money(x.price);
+         return `<div style="padding:6px 0;border-bottom:1px solid #333"><b>${esc(x.name)}</b><br><span class="muted small">${esc(x.brand||"")} · ${pr} · вариантов ${x.variantCount||1} · параметров ${x.paramCount||0}</span></div>`;
+       }).join("")}
      </div>
    </div>
 
