@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v7.1</title>
+<title>PrimeTac Prom AI v10</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -46,11 +46,23 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 .markup20-box{border:1px solid #4e6b53;border-radius:12px;padding:12px;margin:10px 0}
 .markup20-progress{height:9px;background:#222;border-radius:999px;overflow:hidden;margin:8px 0}
 .markup20-progress>div{height:100%;background:#8fd18f;width:0%}
+
+.manager-hero{border:1px solid #3f5c45;background:#151b16}
+.manager-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:8px;margin:10px 0}
+.manager-stat{background:#141414;border:1px solid #333;border-radius:12px;padding:10px}
+.manager-stat b{font-size:20px;display:block;margin-top:3px}
+.issue-high{border-left:4px solid #ff8b8b}
+.issue-medium{border-left:4px solid #ffd27f}
+.issue-low{border-left:4px solid #8fb7ff}
+.manager-actions{display:flex;flex-wrap:wrap;gap:7px;margin-top:10px}
+.manager-log{max-height:360px;overflow:auto;background:#0b0b0b;border:1px solid #333;border-radius:10px;padding:10px}
+details{border-top:1px solid #333;padding-top:7px;margin-top:7px}
+summary{cursor:pointer;font-weight:700}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>PrimeTac Prom AI <span class="muted">v8</span></h1>
+<h1>PrimeTac Prom AI <span class="muted">v10</span></h1>
 <div class="muted">Панель прибыли: Prom + Militaris + AI + продажи</div>
 
 <div class="bar">
@@ -60,7 +72,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 <button onclick="showTop()">ТОП для продаж</button>
 <button onclick="showPrices()">Цены</button>
 <button onclick="loadSales()">Продажи</button>
-<button onclick="loadOrders()">Заказы</button><button onclick="openEditor()">AI-редактор</button><button onclick="loadAdCandidates()">ТОП-30 для рекламы</button><button onclick="openAutopilot()">⚡ АВТО-РЕДАКТОР</button><button onclick="openMarkup20()">💰 УРАВНЯТЬ +20%</button>
+<button onclick="loadOrders()">Заказы</button><button onclick="openManager()">🧠 МЕНЕДЖЕР</button><button onclick="openEditor()">AI-редактор</button><button onclick="loadAdCandidates()">ТОП-30 для рекламы</button><button onclick="openAutopilot()">⚡ АВТО-РЕДАКТОР</button><button onclick="openMarkup20()">💰 УРАВНЯТЬ +20%</button>
 </div>
 
 <div id="status" class="card">Проверяем...</div>
@@ -92,7 +104,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v8: автопилот + динамическая маржа по скидке Militaris + рынок Prom основаны на закупке и марже. Это не анализ цен конкурентов.
+v10: правило цены = закупка Militaris +20%. Менеджер контролирует цены, наличие, карточки, match, характеристики и прибыль после Econom.
 </div>
 </div>
 
@@ -107,7 +119,7 @@ function money(v){return v==null?"—":Math.round(Number(v)).toLocaleString("uk-
 async function health(){
  try{
   const d=await j("/api/health");
-  $("#status").innerHTML=`Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'не загружен'}</b> · Комиссии Econom: <b class="${d.commissions?.count?'good':'warn'}">${d.commissions?.count?d.commissions.count+' категорий':'fallback '+(d.commissions?.fallbackPct||12.5)+'%'}</b> · Цель: <b class="good">${d.commissions?.targetNetMarginPct||20}% чистыми</b>`;
+  $("#status").innerHTML=`Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'не загружен'}</b> · Комиссии Econom: <b class="${d.commissions?.count?'good':'warn'}">${d.commissions?.count?d.commissions.count+' категорий':'fallback '+(d.commissions?.fallbackPct||12.5)+'%'}</b> · Цена: <b class="good">закупка +${d.manager?.markupPct||20}%</b> · Автосинхр.: <b class="${d.manager?.autoPriceSync?'good':'muted'}">${d.manager?.autoPriceSync?'ВКЛ':'выкл'}</b>`;
  }catch(e){$("#status").textContent=e.message}
 }
 async function refreshMilitaris(){
@@ -121,7 +133,7 @@ function stats(s){
  <div class="stat"><span class="muted">Надёжно сопоставлено</span><b class="good">${s.matched}</b></div>
  <div class="stat"><span class="muted">Без match</span><b class="warn">${s.unmatched}</b></div>
  <div class="stat"><span class="muted">Чистая маржа ≥20%</span><b class="good">${s.highMargin}</b></div>
- <div class="stat"><span class="muted">Маржа <10%</span><b class="warn">${s.lowMargin}</b></div>
+ <div class="stat"><span class="muted">Чистая маржа <20%</span><b class="warn">${s.lowMargin}</b></div>
  <div class="stat"><span class="muted">Убыток</span><b class="bad">${s.loss}</b></div>
  <div class="stat"><span class="muted">Проверить match</span><b class="warn">${s.approximateMatches}</b></div>
  <div class="stat"><span class="muted">Условная чистая прибыль*</span><b>${money(s.oneUnitGross)}</b></div>
@@ -163,7 +175,7 @@ function render(){
 
  if(!rows.length){$("#content").innerHTML='<div class="card">По фильтру ничего нет.</div>';return;}
  $("#content").innerHTML=`<div class="tablewrap"><table>
- <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Econom</th><th>Чистая прибыль</th><th>Чистая маржа</th><th>Рекомендация</th><th>Мин. цена 20%</th><th>Score</th><th>Match</th><th>AI</th></tr></thead>
+ <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Econom</th><th>Чистая прибыль</th><th>Чистая маржа</th><th>Рекомендация</th><th>Цена +20% к закупке</th><th>Score</th><th>Match</th><th>AI</th></tr></thead>
  <tbody>${rows.map(x=>{
    const idx=REPORT.indexOf(x);
    const cls=(x.netMarginPct??-999)>=20?'good':((x.netProfit??0)>0?'warn':'bad');
@@ -175,7 +187,7 @@ function render(){
    <td>${x.economCommissionPct==null?'—':x.economCommissionPct+'%'}<br><span class="muted small">${money(x.commissionCost)} · ${esc(x.commissionSource||"")}</span></td>
    <td class="${cls}">${money(x.netProfit)}</td>
    <td class="${cls}">${x.netMarginPct==null?'—':x.netMarginPct+'%'}</td>
-   <td>${esc(x.label||"—")}</td><td>${money(x.recommendedNet20||x.recommended20)}</td><td>${x.score??0}</td>
+   <td>${esc(x.label||"—")}</td><td>${money(x.recommendedMarkup20||x.recommendedNet20||x.recommended20)}</td><td>${x.score??0}</td>
    <td>${x.matched?`<span class="tag">${esc(x.matchMethod)}</span> <span class="tag">${esc(x.matchConfidence)}</span>`:'<span class="tag">нет</span>'}${(x.flags||[]).map(v=>`<div class="small warn">${esc(v)}</div>`).join("")}</td>
    <td><button onclick="ai(${idx})">AI</button></td>
    </tr><tr id="airow${idx}" style="display:none"><td colspan="12"><pre id="ai${idx}"></pre></td></tr>`;
@@ -190,11 +202,11 @@ async function ai(i){
 function showTop(){
  const rows=[...REPORT].filter(x=>x.matched).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,30);
  if(!rows.length){loadAll();return;}
- $("#content").innerHTML=`<div class="card"><b>ТОП для продаж</b><div class="muted small">Рейтинг учитывает маржу, прибыль и надёжность match. Спрос рынка пока не учитывается.</div></div>`+rows.map((x,i)=>`<div class="card"><b>${i+1}. ${esc(x.product.name)}</b><div class="row"><span class="tag">Score ${x.score}</span><span class="tag">Чистая маржа ${x.netMarginPct}%</span><span class="tag">Чистая прибыль ${money(x.netProfit)}</span><span class="tag">${esc(x.label)}</span></div><div class="muted small">Prom ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · минимум 20% чистыми ${money(x.recommendedNet20||x.recommended20)}</div></div>`).join("");
+ $("#content").innerHTML=`<div class="card"><b>ТОП для продаж</b><div class="muted small">Рейтинг учитывает маржу, прибыль и надёжность match. Спрос рынка пока не учитывается.</div></div>`+rows.map((x,i)=>`<div class="card"><b>${i+1}. ${esc(x.product.name)}</b><div class="row"><span class="tag">Score ${x.score}</span><span class="tag">Чистая маржа ${x.netMarginPct}%</span><span class="tag">Чистая прибыль ${money(x.netProfit)}</span><span class="tag">${esc(x.label)}</span></div><div class="muted small">Prom ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · +20% к закупке ${money(x.recommendedMarkup20||x.recommendedNet20||x.recommended20)}</div></div>`).join("");
 }
 function showPrices(){
  const groups=[['raise','Поднять цену'],['keep','Оставить цену'],['test_lower','Можно тестировать снижение']];
- $("#content").innerHTML=groups.map(([k,t])=>{const a=REPORT.filter(x=>x.decision===k);return `<div class="card"><b>${t}: ${a.length}</b>${a.slice(0,25).map(x=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(x.product.name)}</b><br><span class="muted small">Сейчас ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · минимум 20% ${money(x.recommendedNet20||x.recommended20)} · чистая маржа ${x.netMarginPct}%</span></div>`).join('')}</div>`}).join('');
+ $("#content").innerHTML=groups.map(([k,t])=>{const a=REPORT.filter(x=>x.decision===k);return `<div class="card"><b>${t}: ${a.length}</b>${a.slice(0,25).map(x=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(x.product.name)}</b><br><span class="muted small">Сейчас ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · +20% к закупке ${money(x.recommendedMarkup20||x.recommendedNet20||x.recommended20)} · чистая маржа ${x.netMarginPct}%</span></div>`).join('')}</div>`}).join('');
 }
 async function loadSales(){
  $("#content").innerHTML='<div class="card">Получаю последние заказы Prom… В v4.1 каталог повторно не пересчитывается.</div>';
@@ -205,7 +217,8 @@ async function loadSales(){
     <div class="stat"><span class="muted">С товарными строками</span><b>${d.ordersWithItems??0}</b></div>
     <div class="stat"><span class="muted">Единиц</span><b>${d.units}</b></div>
     <div class="stat"><span class="muted">Оборот</span><b>${money(d.revenue)}</b></div>
-    <div class="stat"><span class="muted">Расчётная валовая прибыль</span><b class="good">${money(d.estimatedGross)}</b></div>
+    <div class="stat"><span class="muted">Валовая до Prom</span><b>${money(d.estimatedGross)}</b></div>
+    <div class="stat"><span class="muted">После Econom*</span><b class="good">${money(d.estimatedNet)}</b></div>
   </div>
   <div class="card">
     <b>Продажи по последним заказам</b>
@@ -213,7 +226,7 @@ async function loadSales(){
     <div class="muted small" style="margin-top:4px">Сопоставлено единиц: ${d.matchedUnits??0} из ${d.units??0}.</div>
   </div>
   <div class="card"><b>Товары в заказах</b>
-  ${(d.top||[]).length ? (d.top||[]).map(x=>`<div style="padding:8px 0;border-bottom:1px solid #333"><b>${esc(x.name)}</b><br><span class="muted small">${x.qty} шт. · оборот ${money(x.revenue)} · расчётная прибыль ${money(x.estimatedGross)} ${x.matched?'':'· нет match'}</span></div>`).join('') : '<div class="muted">В последних заказах товарные строки не найдены или заказов пока нет.</div>'}
+  ${(d.top||[]).length ? (d.top||[]).map(x=>`<div style="padding:8px 0;border-bottom:1px solid #333"><b>${esc(x.name)}</b><br><span class="muted small">${x.qty} шт. · оборот ${money(x.revenue)} · до Prom ${money(x.estimatedGross)} · после Econom* ${money(x.estimatedNet)} ${x.matched?'':'· нет match'}</span></div>`).join('') : '<div class="muted">В последних заказах товарные строки не найдены или заказов пока нет.</div>'}
   </div>`;
  }catch(e){
   $("#content").innerHTML=`<div class="card bad"><b>Ошибка продаж</b><br>${esc(e.message)}</div>`;
@@ -259,14 +272,14 @@ function editorNavHtml(selectedProductId){
 
 function productPolicy(x){
  const target=20;
- const min=20;
+ const min=5;
  return {
    target,
    min,
    discount:Number(x?.discountPct||0),
    group:x?.discountGroup||"—",
    commission:Number(x?.economCommissionPct||12.5),
-   safePrice:Number(x?.recommendedNet20||x?.recommended20||0)
+   safePrice:Number(x?.recommendedMarkup20||x?.recommendedNet20||x?.recommended20||0)
  };
 }
 
@@ -282,7 +295,7 @@ function syncEditorPolicy(){
  const m=document.getElementById("editMargin");
  if(m) m.value=p.target;
  const d=document.getElementById("editorDiscount");
- if(d) d.textContent=`${p.group}: скидка Militaris ${p.discount}% · Econom ${p.commission}% · цель ${p.target}% чистой маржи`;
+ if(d) d.textContent=`${p.group}: скидка Militaris ${p.discount}% · Econom ${p.commission}% · цель +${p.target}% к закупке`;
 }
 
 function openEditor(selectedProductId=null){
@@ -305,7 +318,7 @@ function openEditor(selectedProductId=null){
      <label><input id="editDesc" type="checkbox" checked> Описание</label>
      <label>Автоцель маржи <input id="editMargin" type="number" value="15" min="3" max="50" style="width:80px" readonly>%</label>
    </div>
-   <div id="editorDiscount" class="muted small" style="margin-top:6px">Цель фиксирована: минимум 20% чистой маржи после комиссии Prom Econom.</div>
+   <div id="editorDiscount" class="muted small" style="margin-top:6px">Цель цены фиксирована: закупка Militaris +20%. Чистая прибыль после Econom показывается отдельно.</div>
    <button style="margin-top:10px" onclick="proposeEdit()">Подготовить изменения AI</button>
  </div><div id="editorResult"></div>`;
 
@@ -550,7 +563,7 @@ function openAutopilot(){
    <div class="row">
     <label><input id="autoName" type="checkbox" checked> Авто-названия</label>
     <label><input id="autoDesc" type="checkbox" checked> Авто-описания</label>
-    <label><input id="autoPrice" type="checkbox" checked> Авто-цены: минимум 20% чистыми</label><label><input id="autoContinue" type="checkbox" checked> Продолжать автоматически до конца</label>
+    <label><input id="autoPrice" type="checkbox" checked> Авто-цены: закупка +20%</label><label><input id="autoContinue" type="checkbox" checked> Продолжать автоматически до конца</label>
    </div>
    <div style="margin-top:10px"><label>WRITE_PIN <input id="autoPin" type="password" autocomplete="off"></label></div>
    <div class="row" style="margin-top:10px">
@@ -624,22 +637,21 @@ async function startAutopilot(){
 
      let price=null;
      const current=Number(x.promPrice||0);
-     const safeFloor=Number(x.recommendedNet20||x.recommended20||policy.safePrice||0);
-     const currentNet=Number(x.netMarginPct??-999);
+     const safeFloor=Number(x.recommendedMarkup20||policy.safePrice||0);
 
-     if(doPrice && safeFloor>0 && (currentNet<20 || current<safeFloor)){
+     if(doPrice && safeFloor>0 && current!==safeFloor){
        price=safeFloor;
-       autoLog(`  базовая цена → ${safeFloor} грн, чтобы после Econom осталось ≥20% чистыми`,"auto-ok");
+       autoLog(`  базовая цена → ${safeFloor} грн по правилу закупка +20%`,"auto-ok");
      }
 
      const shouldMarket=doPrice && marketMode!=="off" && (marketMode==="all" || topIds.has(id) || Number(x.score||0)>=75);
      if(shouldMarket){
-       const r=await fetch("/api/market/check",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({productId:id,minMargin:20})});
+       const r=await fetch("/api/market/check",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({productId:id,minMargin:5})});
        const m=await r.json();
        if(r.ok){
          const exact=(m.competitors||[]).filter(c=>c.match==="exact").length;
          const candidate=Number(m.recommendedPrice||0);
-         if(exact>=2 && candidate>0 && Number(m.expectedMargin||0)>=20){
+         if(exact>=2 && candidate>0 && candidate>=safeFloor){
            const base=price!=null?price:current;
            if(!base || Math.abs(candidate-base)/base>=0.015){
              price=candidate;
@@ -870,6 +882,241 @@ async function startMarkup20All(){
      ? `<br><b class="good">Готово. Массовое изменение завершено без ошибок.</b>`
      : `<br><b class="warn">Проход завершён, но есть ошибки. Не запускай повторно весь каталог, пока не посмотришь журнал.</b>`;
  }
+}
+
+function issueClass(item){
+ if((item.issues||[]).some(i=>i.level==="high")) return "issue-high";
+ if((item.issues||[]).some(i=>i.level==="medium")) return "issue-medium";
+ return "issue-low";
+}
+function issueTags(item){
+ return (item.issues||[]).map(i=>`<span class="tag ${i.level==="high"?"bad":(i.level==="medium"?"warn":"muted")}">${esc(i.text)}</span>`).join("");
+}
+
+async function openManager(force=false){
+ $("#content").innerHTML='<div class="card">🧠 Менеджер проверяет Militaris, цены, наличие и карточки…</div>';
+ try{
+   const d=await j(`/api/manager/today${force?"?force=1":""}`);
+   window.MANAGER_DATA=d;
+   const s=d.summary||{};
+   const auto=d.autoPriceSync||{};
+   const snap=d.supplierSnapshot||{};
+
+   $("#content").innerHTML=`
+   <div class="card manager-hero">
+     <h3 style="margin:0">🧠 Что сделать сегодня</h3>
+     <div class="muted small">Правило цены: закупка Militaris +${d.markupPct}% · Econom учитывается как контроль реальной прибыли.</div>
+     <div class="manager-grid">
+       <div class="manager-stat"><span class="muted">Требуют внимания</span><b class="${s.attention?'warn':'good'}">${s.attention||0}</b></div>
+       <div class="manager-stat"><span class="muted">Цена съехала</span><b class="${s.priceDrift?'bad':'good'}">${s.priceDrift||0}</b></div>
+       <div class="manager-stat"><span class="muted">Нет у поставщика</span><b class="${s.supplierOut?'bad':'good'}">${s.supplierOut||0}</b></div>
+       <div class="manager-stat"><span class="muted">Вернулись в наличие</span><b class="${s.backInStock?'warn':'good'}">${s.backInStock||0}</b></div>
+       <div class="manager-stat"><span class="muted">Без match</span><b class="warn">${s.unmatched||0}</b></div>
+       <div class="manager-stat"><span class="muted">Описание</span><b>${s.descriptions||0}</b></div>
+       <div class="manager-stat"><span class="muted">Название</span><b>${s.names||0}</b></div>
+       <div class="manager-stat"><span class="muted">Характеристики</span><b>${s.characteristics||0}</b></div>
+       <div class="manager-stat"><span class="muted">Убыток после Econom</span><b class="${s.netLoss?'bad':'good'}">${s.netLoss||0}</b></div>
+     </div>
+
+     <div class="manager-actions">
+       <button onclick="openManager(true)">🔄 Полная проверка сейчас</button>
+       <button onclick="managerSyncPrices()">💰 Синхронизировать цены +20%</button>
+       <button onclick="managerFixCards()">✨ Исправить карточки AI</button>
+       <button onclick="managerUnmatched()">🔗 Разобрать без match</button>
+       <button onclick="managerAvailability()">📦 Наличие</button>
+       <button onclick="managerCharacteristics()">📋 Характеристики XML</button>
+       <button onclick="managerSnapshot()">📌 Запомнить прайс поставщика</button>
+     </div>
+
+     <div class="card" style="margin-top:10px">
+       <b>Автосинхронизация цен</b><br>
+       <span class="muted small">Проверка каждые ${auto.intervalMinutes||60} мин, пока Render-инстанс работает. После перезапуска состояние зависит от AUTO_PRICE_SYNC_DEFAULT.</span>
+       <div class="manager-actions">
+         <input id="managerPin" type="password" placeholder="WRITE_PIN" autocomplete="off">
+         <button onclick="managerAutoPrice(true)">Включить + проверить сейчас</button>
+         <button onclick="managerAutoPrice(false)">Выключить</button>
+       </div>
+       <div class="small ${auto.enabled?'good':'muted'}">Сейчас: ${auto.enabled?'ВКЛЮЧЕНО':'выключено'}${auto.lastRun?` · последний запуск ${esc(auto.lastRun)}`:""}</div>
+     </div>
+
+     <div class="card">
+       <b>Изменения у Militaris после снимка</b><br>
+       ${snap.hasBaseline
+         ? `<span class="tag">Цена изменилась: ${snap.changedPrice||0}</span><span class="tag">Закончились: ${snap.becameUnavailable||0}</span><span class="tag">Вернулись: ${snap.backInStock||0}</span>`
+         : `<span class="muted small">Снимка ещё нет. Нажми «Запомнить прайс поставщика» — после следующего обновления увидишь изменения.</span>`}
+     </div>
+
+     <div class="card">
+       <b>Ассортимент Militaris вне текущего магазина</b><br>
+       <span class="muted small">Ориентировочно поставщик имеет больше позиций, чем сейчас сопоставлено в Prom. Ниже первые доступные кандидаты; это не команда добавлять всё подряд.</span>
+       ${(d.supplierOnly||[]).slice(0,10).map(x=>`<div style="padding:6px 0;border-bottom:1px solid #333"><b>${esc(x.name)}</b><br><span class="muted small">${esc(x.brand||"")} · ${money(x.price)} · параметров ${x.paramCount||0}</span></div>`).join("")}
+     </div>
+   </div>
+
+   <div class="card"><b>Приоритетные проблемы</b></div>
+   ${(d.items||[]).filter(x=>x.issues?.length).slice(0,80).map(x=>`
+     <div class="card ${issueClass(x)}">
+       <b>${esc(x.name)}</b><br>
+       <span class="muted small">ID ${esc(x.productId)} · Prom ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · чистыми ${x.netMarginPct==null?"—":x.netMarginPct+"%"}</span>
+       <div style="margin-top:6px">${issueTags(x)}</div>
+       <div class="manager-actions">
+         <button onclick="openEditorFor('${esc(x.productId)}')">Открыть карточку</button>
+       </div>
+     </div>`).join("") || '<div class="card good">Критичных задач не найдено.</div>'}
+   <div id="managerLog"></div>`;
+ }catch(e){
+   $("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
+ }
+}
+
+async function managerSnapshot(){
+ try{
+   const d=await j("/api/manager/snapshot",{method:"POST"});
+   alert(`Снимок сохранён: ${d.count} позиций`);
+   openManager(false);
+ }catch(e){ alert(e.message); }
+}
+
+async function managerSyncPrices(){
+ const d=window.MANAGER_DATA;
+ if(!d) return openManager(true);
+ const need=(d.items||[]).filter(x=>x.issues?.some(i=>i.code==="price_drift"));
+ if(!need.length){ alert("Цены уже синхронизированы."); return; }
+ const pin=document.getElementById("managerPin")?.value||prompt("WRITE_PIN")||"";
+ if(!pin) return;
+ if(!confirm(`Синхронизировать ${need.length} цен по правилу закупка +${d.markupPct}%?`)) return;
+
+ const log=document.getElementById("managerLog");
+ if(log) log.innerHTML='<div class="card">Меняю цены…</div>';
+ let changed=0,errors=0;
+ for(let i=0;i<need.length;i+=50){
+   const ids=need.slice(i,i+50).map(x=>x.productId);
+   try{
+     const r=await fetch("/api/manager/sync-prices",{
+       method:"POST",
+       headers:{"Content-Type":"application/json","x-write-pin":pin},
+       body:JSON.stringify({productIds:ids})
+     });
+     const raw=await r.text(); let x={}; try{x=JSON.parse(raw)}catch{}
+     if(!r.ok) throw new Error(x.error||raw.slice(0,140));
+     changed+=Number(x.changed||0); errors+=Number(x.errors||0);
+     if(log) log.innerHTML=`<div class="card"><b>Цены:</b> ${changed} изменено · ${errors} ошибок · обработано ${Math.min(i+50,need.length)}/${need.length}</div>`;
+   }catch(e){
+     errors+=ids.length;
+     if(log) log.innerHTML+=`<div class="card bad">${esc(e.message)}</div>`;
+   }
+ }
+ await openManager(true);
+}
+
+async function managerFixCards(){
+ const d=window.MANAGER_DATA;
+ if(!d) return openManager(true);
+ const candidates=(d.items||[]).filter(x=>
+   x.matched && x.issues?.some(i=>["name","description"].includes(i.code))
+ ).slice(0,100);
+
+ if(!candidates.length){ alert("Карточек для AI-исправления не найдено."); return; }
+ const pin=document.getElementById("managerPin")?.value||prompt("WRITE_PIN")||"";
+ if(!pin) return;
+ const limit=Number(prompt(`Найдено ${candidates.length}. Сколько исправить сейчас?`, "20")||0);
+ if(!limit) return;
+
+ const list=candidates.slice(0,Math.max(1,Math.min(limit,100)));
+ const log=document.getElementById("managerLog");
+ if(log) log.innerHTML='<div class="card"><b>AI улучшает карточки…</b><div id="managerCardLog" class="manager-log"></div></div>';
+ const box=document.getElementById("managerCardLog");
+ let ok=0,skip=0,err=0;
+
+ for(const x of list){
+   try{
+     const needName=x.issues.some(i=>i.code==="name");
+     const needDesc=x.issues.some(i=>i.code==="description");
+     const p=await j("/api/editor/propose",{
+       method:"POST",
+       headers:{"Content-Type":"application/json"},
+       body:JSON.stringify({
+         productId:String(x.productId),
+         changePrice:false,
+         changeName:needName,
+         changeDescription:needDesc,
+         targetMargin:20
+       })
+     });
+
+     const payload={productId:String(x.productId),confirm:"APPLY"};
+     if(needName && p.proposedName) payload.name=p.proposedName;
+     if(needDesc && p.proposedDescription && p.groundingSafe===true) payload.description=p.proposedDescription;
+
+     if(Object.keys(payload).length<=2){skip++; if(box)box.innerHTML+=`<div class="warn">• ${esc(x.name)} — нет безопасного изменения</div>`;continue;}
+
+     const r=await fetch("/api/editor/apply",{
+       method:"POST",
+       headers:{"Content-Type":"application/json","x-write-pin":pin},
+       body:JSON.stringify(payload)
+     });
+     const raw=await r.text();let a={};try{a=JSON.parse(raw)}catch{}
+     if(!r.ok) throw new Error(a.error||raw.slice(0,140));
+     ok++;
+     if(box)box.innerHTML+=`<div class="good">✓ ${esc(x.name)}</div>`;
+   }catch(e){
+     err++;
+     if(box)box.innerHTML+=`<div class="bad">✗ ${esc(x.name)} — ${esc(e.message)}</div>`;
+   }
+   if(box) box.scrollTop=box.scrollHeight;
+ }
+ if(box) box.innerHTML+=`<div><b>Готово: ${ok} изменено · ${skip} пропущено · ${err} ошибок</b></div>`;
+}
+
+async function managerUnmatched(){
+ $("#content").innerHTML='<div class="card">Ищу кандидатов для несопоставленных товаров…</div>';
+ try{
+   const d=await j("/api/manager/unmatched");
+   $("#content").innerHTML=`<div class="card"><b>Без match: ${d.count}</b><div class="muted small">Это подсказки, а не автоматическое сопоставление. Лучше пропустить товар, чем привязать неправильную закупку.</div></div>`+
+   (d.rows||[]).map(x=>`<div class="card"><b>${esc(x.name)}</b><br><span class="muted small">Prom ${money(x.price)} · ID ${esc(x.productId)}</span>
+     <details><summary>Кандидаты Militaris</summary>
+       ${(x.suggestions||[]).length?(x.suggestions||[]).map(s=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(s.name)}</b><br><span class="muted small">${esc(s.brand||"")} · ${money(s.price)} · score ${s.score} · SKU ${esc(s.sku||"—")}</span></div>`).join(""):'<div class="muted">Надёжных кандидатов не найдено.</div>'}
+     </details>
+     <button style="margin-top:8px" onclick="openEditorFor('${esc(x.productId)}')">Открыть товар</button>
+   </div>`).join("");
+ }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
+}
+
+async function managerAvailability(){
+ $("#content").innerHTML='<div class="card">Проверяю наличие по XML Militaris…</div>';
+ try{
+   const d=await j("/api/manager/availability");
+   $("#content").innerHTML=`<div class="card"><b>Расхождения по наличию: ${d.count}</b><div class="muted small">${esc(d.note||"")}</div></div>`+
+     ((d.rows||[]).map(x=>`<div class="card ${x.supplierAvailable===false?"issue-high":"issue-medium"}"><b>${esc(x.name)}</b><br><span class="tag">Militaris: ${x.supplierAvailable===false?"НЕТ":"есть"}</span><span class="tag">Prom: ${x.promAvailable==null?"не определено":(x.promAvailable?"есть":"нет")}</span>${x.supplierQuantity!=null?`<span class="tag">остаток ${x.supplierQuantity}</span>`:""}</div>`).join("")||'<div class="card good">Явных расхождений не найдено.</div>');
+ }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
+}
+
+async function managerCharacteristics(){
+ $("#content").innerHTML='<div class="card">Читаю параметры &lt;param&gt; из XML Militaris…</div>';
+ try{
+   const d=await j("/api/manager/characteristics");
+   $("#content").innerHTML=`<div class="card"><b>Товары с характеристиками в XML: ${d.count}</b><div class="muted small">${esc(d.note||"")}</div></div>`+
+   (d.rows||[]).slice(0,100).map(x=>`<div class="card"><b>${esc(x.name)}</b><br><span class="muted small">XML: ${x.supplierParamCount} параметров · Prom: ${x.promParamCount==null?"не получено API":x.promParamCount}</span>
+     <details><summary>Показать параметры XML</summary>
+       ${(x.params||[]).map(p=>`<div class="small" style="padding:4px 0"><b>${esc(p.name||"Параметр")}:</b> ${esc(p.value)} ${esc(p.unit||"")}</div>`).join("")}
+     </details></div>`).join("");
+ }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
+}
+
+async function managerAutoPrice(enabled){
+ const pin=document.getElementById("managerPin")?.value||prompt("WRITE_PIN")||"";
+ if(!pin) return;
+ try{
+   const r=await fetch("/api/manager/auto-price-sync",{
+     method:"POST",
+     headers:{"Content-Type":"application/json","x-write-pin":pin},
+     body:JSON.stringify({enabled,runNow:enabled})
+   });
+   const raw=await r.text();let d={};try{d=JSON.parse(raw)}catch{}
+   if(!r.ok) throw new Error(d.error||raw.slice(0,140));
+   alert(enabled?`Автосинхронизация включена. Проверка сейчас: ${d.test?.changed||0} цен изменено.`:"Автосинхронизация выключена.");
+   openManager(false);
+ }catch(e){alert(e.message)}
 }
 
 health();
