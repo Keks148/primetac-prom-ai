@@ -36,11 +36,21 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 .ad-selected{outline:2px solid #8fd18f;box-shadow:0 0 0 3px rgba(143,209,143,.12)}
 .editor-nav{display:flex;gap:7px;flex-wrap:wrap;margin:10px 0}
 .editor-current{background:#151f17;border:1px solid #365c3c;border-radius:10px;padding:10px;margin:8px 0}
+
+.autopilot-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:8px;margin:10px 0}
+.auto-log{max-height:420px;overflow:auto;background:#0b0b0b;border:1px solid #333;border-radius:10px;padding:10px;font-size:12px}
+.auto-row{padding:6px 0;border-bottom:1px solid #252525}
+.auto-ok{color:#8fd18f}.auto-skip{color:#ffd27f}.auto-err{color:#ff8b8b}
+.policy-table{width:100%;border-collapse:collapse}.policy-table td,.policy-table th{padding:6px;border-bottom:1px solid #333}
+
+.markup20-box{border:1px solid #4e6b53;border-radius:12px;padding:12px;margin:10px 0}
+.markup20-progress{height:9px;background:#222;border-radius:999px;overflow:hidden;margin:8px 0}
+.markup20-progress>div{height:100%;background:#8fd18f;width:0%}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>PrimeTac Prom AI <span class="muted">v4</span></h1>
+<h1>PrimeTac Prom AI <span class="muted">v8</span></h1>
 <div class="muted">Панель прибыли: Prom + Militaris + AI + продажи</div>
 
 <div class="bar">
@@ -50,7 +60,7 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 <button onclick="showTop()">ТОП для продаж</button>
 <button onclick="showPrices()">Цены</button>
 <button onclick="loadSales()">Продажи</button>
-<button onclick="loadOrders()">Заказы</button><button onclick="openEditor()">AI-редактор</button><button onclick="loadAdCandidates()">ТОП-30 для рекламы</button>
+<button onclick="loadOrders()">Заказы</button><button onclick="openEditor()">AI-редактор</button><button onclick="loadAdCandidates()">ТОП-30 для рекламы</button><button onclick="openAutopilot()">⚡ АВТО-РЕДАКТОР</button><button onclick="openMarkup20()">💰 УРАВНЯТЬ +20%</button>
 </div>
 
 <div id="status" class="card">Проверяем...</div>
@@ -64,8 +74,8 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 <option value="matched">Сопоставленные</option>
 <option value="unmatched">Без сопоставления</option>
 <option value="approx">Нужно проверить match</option>
-<option value="margin20">Маржа ≥20%</option>
-<option value="low">Маржа <10%</option>
+<option value="margin20">Чистая маржа ≥20%</option>
+<option value="low">Чистая маржа <20%</option>
 <option value="loss">Убыток</option>
 <option value="salomon">Salomon</option>
 <option value="helikon">Helikon-Tex</option>
@@ -75,14 +85,14 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 <option value="test_lower">Можно снизить</option>
 </select>
 <select id="sort" onchange="render()">
-<option value="margin">Маржа ↓</option>
+<option value="margin">Чистая маржа ↓</option>
 <option value="profit">Прибыль ↓</option>
 <option value="price">Цена ↓</option>
 <option value="name">Название A→Я</option>
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v7.1: удобный ТОП-30 + рынок Prom + безопасный AI основаны на закупке и марже. Это не анализ цен конкурентов.
+v8: автопилот + динамическая маржа по скидке Militaris + рынок Prom основаны на закупке и марже. Это не анализ цен конкурентов.
 </div>
 </div>
 
@@ -97,7 +107,7 @@ function money(v){return v==null?"—":Math.round(Number(v)).toLocaleString("uk-
 async function health(){
  try{
   const d=await j("/api/health");
-  $("#status").innerHTML=`Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'не загружен'}</b>`;
+  $("#status").innerHTML=`Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'не загружен'}</b> · Комиссии Econom: <b class="${d.commissions?.count?'good':'warn'}">${d.commissions?.count?d.commissions.count+' категорий':'fallback '+(d.commissions?.fallbackPct||12.5)+'%'}</b> · Цель: <b class="good">${d.commissions?.targetNetMarginPct||20}% чистыми</b>`;
  }catch(e){$("#status").textContent=e.message}
 }
 async function refreshMilitaris(){
@@ -110,11 +120,11 @@ function stats(s){
  <div class="stat"><span class="muted">Товаров Prom</span><b>${s.total}</b></div>
  <div class="stat"><span class="muted">Надёжно сопоставлено</span><b class="good">${s.matched}</b></div>
  <div class="stat"><span class="muted">Без match</span><b class="warn">${s.unmatched}</b></div>
- <div class="stat"><span class="muted">Маржа ≥20%</span><b class="good">${s.highMargin}</b></div>
+ <div class="stat"><span class="muted">Чистая маржа ≥20%</span><b class="good">${s.highMargin}</b></div>
  <div class="stat"><span class="muted">Маржа <10%</span><b class="warn">${s.lowMargin}</b></div>
  <div class="stat"><span class="muted">Убыток</span><b class="bad">${s.loss}</b></div>
  <div class="stat"><span class="muted">Проверить match</span><b class="warn">${s.approximateMatches}</b></div>
- <div class="stat"><span class="muted">Условная прибыль*</span><b>${money(s.oneUnitGross)}</b></div>
+ <div class="stat"><span class="muted">Условная чистая прибыль*</span><b>${money(s.oneUnitGross)}</b></div>
  <div class="stat"><span class="muted">Поднять цену</span><b class="warn">${s.raisePrice||0}</b></div>
  <div class="stat"><span class="muted">Оставить</span><b class="good">${s.keepPrice||0}</b></div>
  <div class="stat"><span class="muted">Можно тестировать ниже</span><b>${s.testLower||0}</b></div>`;
@@ -135,9 +145,9 @@ function render(){
  if(f==="matched") rows=rows.filter(x=>x.matched);
  if(f==="unmatched") rows=rows.filter(x=>!x.matched);
  if(f==="approx") rows=rows.filter(x=>x.matchMethod==="name_strong");
- if(f==="margin20") rows=rows.filter(x=>(x.marginPct??-999)>=20);
- if(f==="low") rows=rows.filter(x=>x.matched && (x.marginPct??999)<10);
- if(f==="loss") rows=rows.filter(x=>x.matched && (x.grossProfit??1)<=0);
+ if(f==="margin20") rows=rows.filter(x=>(x.netMarginPct??-999)>=20);
+ if(f==="low") rows=rows.filter(x=>x.matched && (x.netMarginPct??999)<20);
+ if(f==="loss") rows=rows.filter(x=>x.matched && (x.netProfit??1)<=0);
  if(f==="salomon") rows=rows.filter(x=>x.discountGroup==="Salomon");
  if(f==="helikon") rows=rows.filter(x=>x.discountGroup==="Helikon-Tex");
  if(f==="lowa") rows=rows.filter(x=>x.discountGroup==="LOWA");
@@ -145,29 +155,30 @@ function render(){
 
  const s=$("#sort").value;
  rows.sort((a,b)=>{
-   if(s==="profit") return (b.grossProfit??-999999)-(a.grossProfit??-999999);
+   if(s==="profit") return (b.netProfit??-999999)-(a.netProfit??-999999);
    if(s==="price") return Number(b.promPrice||0)-Number(a.promPrice||0);
    if(s==="name") return String(a.product.name||"").localeCompare(String(b.product.name||""),"uk");
-   return (b.marginPct??-999)-(a.marginPct??-999);
+   return (b.netMarginPct??-999)-(a.netMarginPct??-999);
  });
 
  if(!rows.length){$("#content").innerHTML='<div class="card">По фильтру ничего нет.</div>';return;}
  $("#content").innerHTML=`<div class="tablewrap"><table>
- <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Прибыль</th><th>Маржа</th><th>Рекомендация</th><th>Рекоменд.20%</th><th>Score</th><th>Match</th><th>AI</th></tr></thead>
+ <thead><tr><th>Товар</th><th>Prom</th><th>Militaris</th><th>Закупка</th><th>Econom</th><th>Чистая прибыль</th><th>Чистая маржа</th><th>Рекомендация</th><th>Мин. цена 20%</th><th>Score</th><th>Match</th><th>AI</th></tr></thead>
  <tbody>${rows.map(x=>{
    const idx=REPORT.indexOf(x);
-   const cls=(x.marginPct??-999)>=20?'good':((x.grossProfit??0)>0?'warn':'bad');
+   const cls=(x.netMarginPct??-999)>=20?'good':((x.netProfit??0)>0?'warn':'bad');
    return `<tr>
    <td><b>${esc(x.product.name)}</b><br><span class="muted small">ID ${esc(x.product.id)}</span></td>
    <td>${money(x.promPrice)}</td>
    <td>${x.matched?`${money(x.supplierPrice)}<br><span class="muted small">${esc(x.supplierName||"")}</span>`:'—'}</td>
    <td>${money(x.buyPrice)}${x.discountPct!=null?`<br><span class="muted small">−${x.discountPct}% ${esc(x.discountGroup||"")}</span>`:''}</td>
-   <td class="${cls}">${money(x.grossProfit)}</td>
-   <td class="${cls}">${x.marginPct==null?'—':x.marginPct+'%'}</td>
-   <td>${esc(x.label||"—")}</td><td>${money(x.recommended20)}</td><td>${x.score??0}</td>
+   <td>${x.economCommissionPct==null?'—':x.economCommissionPct+'%'}<br><span class="muted small">${money(x.commissionCost)} · ${esc(x.commissionSource||"")}</span></td>
+   <td class="${cls}">${money(x.netProfit)}</td>
+   <td class="${cls}">${x.netMarginPct==null?'—':x.netMarginPct+'%'}</td>
+   <td>${esc(x.label||"—")}</td><td>${money(x.recommendedNet20||x.recommended20)}</td><td>${x.score??0}</td>
    <td>${x.matched?`<span class="tag">${esc(x.matchMethod)}</span> <span class="tag">${esc(x.matchConfidence)}</span>`:'<span class="tag">нет</span>'}${(x.flags||[]).map(v=>`<div class="small warn">${esc(v)}</div>`).join("")}</td>
    <td><button onclick="ai(${idx})">AI</button></td>
-   </tr><tr id="airow${idx}" style="display:none"><td colspan="11"><pre id="ai${idx}"></pre></td></tr>`;
+   </tr><tr id="airow${idx}" style="display:none"><td colspan="12"><pre id="ai${idx}"></pre></td></tr>`;
  }).join("")}</tbody></table></div>`;
 }
 async function ai(i){
@@ -179,11 +190,11 @@ async function ai(i){
 function showTop(){
  const rows=[...REPORT].filter(x=>x.matched).sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,30);
  if(!rows.length){loadAll();return;}
- $("#content").innerHTML=`<div class="card"><b>ТОП для продаж</b><div class="muted small">Рейтинг учитывает маржу, прибыль и надёжность match. Спрос рынка пока не учитывается.</div></div>`+rows.map((x,i)=>`<div class="card"><b>${i+1}. ${esc(x.product.name)}</b><div class="row"><span class="tag">Score ${x.score}</span><span class="tag">Маржа ${x.marginPct}%</span><span class="tag">Прибыль ${money(x.grossProfit)}</span><span class="tag">${esc(x.label)}</span></div><div class="muted small">Prom ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · техническая цена 20% ${money(x.recommended20)}</div></div>`).join("");
+ $("#content").innerHTML=`<div class="card"><b>ТОП для продаж</b><div class="muted small">Рейтинг учитывает маржу, прибыль и надёжность match. Спрос рынка пока не учитывается.</div></div>`+rows.map((x,i)=>`<div class="card"><b>${i+1}. ${esc(x.product.name)}</b><div class="row"><span class="tag">Score ${x.score}</span><span class="tag">Чистая маржа ${x.netMarginPct}%</span><span class="tag">Чистая прибыль ${money(x.netProfit)}</span><span class="tag">${esc(x.label)}</span></div><div class="muted small">Prom ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · минимум 20% чистыми ${money(x.recommendedNet20||x.recommended20)}</div></div>`).join("");
 }
 function showPrices(){
  const groups=[['raise','Поднять цену'],['keep','Оставить цену'],['test_lower','Можно тестировать снижение']];
- $("#content").innerHTML=groups.map(([k,t])=>{const a=REPORT.filter(x=>x.decision===k);return `<div class="card"><b>${t}: ${a.length}</b>${a.slice(0,25).map(x=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(x.product.name)}</b><br><span class="muted small">Сейчас ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · 20% ${money(x.recommended20)} · маржа ${x.marginPct}%</span></div>`).join('')}</div>`}).join('');
+ $("#content").innerHTML=groups.map(([k,t])=>{const a=REPORT.filter(x=>x.decision===k);return `<div class="card"><b>${t}: ${a.length}</b>${a.slice(0,25).map(x=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(x.product.name)}</b><br><span class="muted small">Сейчас ${money(x.promPrice)} · закупка ${money(x.buyPrice)} · минимум 20% ${money(x.recommendedNet20||x.recommended20)} · чистая маржа ${x.netMarginPct}%</span></div>`).join('')}</div>`}).join('');
 }
 async function loadSales(){
  $("#content").innerHTML='<div class="card">Получаю последние заказы Prom… В v4.1 каталог повторно не пересчитывается.</div>';
@@ -246,6 +257,34 @@ function editorNavHtml(selectedProductId){
  </div>`;
 }
 
+function productPolicy(x){
+ const target=20;
+ const min=20;
+ return {
+   target,
+   min,
+   discount:Number(x?.discountPct||0),
+   group:x?.discountGroup||"—",
+   commission:Number(x?.economCommissionPct||12.5),
+   safePrice:Number(x?.recommendedNet20||x?.recommended20||0)
+ };
+}
+
+function selectedReportItem(productId){
+ return REPORT.find(x=>String(x?.product?.id)===String(productId))||null;
+}
+
+function syncEditorPolicy(){
+ const sel=document.getElementById("editProduct");
+ if(!sel) return;
+ const x=selectedReportItem(sel.value);
+ const p=productPolicy(x);
+ const m=document.getElementById("editMargin");
+ if(m) m.value=p.target;
+ const d=document.getElementById("editorDiscount");
+ if(d) d.textContent=`${p.group}: скидка Militaris ${p.discount}% · Econom ${p.commission}% · цель ${p.target}% чистой маржи`;
+}
+
 function openEditor(selectedProductId=null){
  if(!REPORT.length){
    $("#content").innerHTML='<div class="card warn">Сначала нажми «Анализ всего каталога».</div>';
@@ -264,8 +303,9 @@ function openEditor(selectedProductId=null){
      <label><input id="editName" type="checkbox" checked> Название</label>
      <label><input id="editPrice" type="checkbox" checked> Цена</label>
      <label><input id="editDesc" type="checkbox" checked> Описание</label>
-     <label>Целевая маржа <input id="editMargin" type="number" value="20" min="5" max="50" style="width:80px">%</label>
+     <label>Автоцель маржи <input id="editMargin" type="number" value="15" min="3" max="50" style="width:80px" readonly>%</label>
    </div>
+   <div id="editorDiscount" class="muted small" style="margin-top:6px">Цель фиксирована: минимум 20% чистой маржи после комиссии Prom Econom.</div>
    <button style="margin-top:10px" onclick="proposeEdit()">Подготовить изменения AI</button>
  </div><div id="editorResult"></div>`;
 
@@ -273,6 +313,7 @@ function openEditor(selectedProductId=null){
  if(sel){
    sel.addEventListener("change",()=>{
      window._editorSelectedProductId=sel.value;
+     syncEditorPolicy();
      const idx=currentAdCandidateIndex(sel.value);
      if(idx>=0){
        const nav=document.querySelector(".editor-current");
@@ -280,6 +321,7 @@ function openEditor(selectedProductId=null){
      }
    });
  }
+ syncEditorPolicy();
 }
 
 async function proposeEdit(){
@@ -304,17 +346,20 @@ async function proposeEdit(){
    <input id="proposalName" style="width:100%" value="${esc(d.proposedName||d.currentName||"")}">
    <div class="row" style="margin-top:8px">
     <span class="tag">Текущая цена: ${money(d.currentPrice)}</span>
-    <span class="tag">Закупка: ${money(d.buyPrice)}</span>
+    <span class="tag">Закупка: ${money(d.buyPrice)}</span><span class="tag">Econom: ${d.economCommissionPct??"—"}%</span>
+    <span class="tag">Скидка Militaris: ${esc(d.discountPct)}% ${esc(d.discountGroup||"")}</span>
+    <span class="tag">Автоцель: ${esc(d.targetMargin)}%</span>
     <span class="tag" id="newPriceTag">Цена по марже: ${money(d.proposedPrice)}</span>
    </div>
    <div class="row" style="margin-top:10px">
-     <label>Минимальная маржа <input id="marketMinMargin" type="number" value="12" min="5" max="40" style="width:70px">%</label>
+     <label>Минимальная чистая маржа <input id="marketMinMargin" type="number" value="20" min="20" max="40" style="width:70px">%</label>
      <button onclick="marketCheck()">Проверить рынок Prom</button>
    </div>
    <div id="marketResult"></div>
    <div style="margin-top:12px"><b>Новое описание</b></div>
    <textarea id="proposalDescription" style="width:100%;min-height:260px;background:#0f0f0f;color:#fff;border:1px solid #444;border-radius:8px;padding:10px">${esc(d.proposedDescription||"")}</textarea>
    <div class="muted small">Можно вручную поправить текст перед записью.</div>
+   ${d.groundingSafe===false?`<div class="card bad"><b>Автопилот НЕ будет применять это описание:</b><br>${esc((d.groundingIssues||[]).join("; "))}</div>`:""}
    <div style="margin-top:10px">
     <label>WRITE_PIN <input id="writePin" type="password" autocomplete="off"></label>
    </div>
@@ -372,10 +417,10 @@ async function marketCheck(){
        <span class="tag">Минимум рынка: ${money(m.marketLow)}</span>
        <span class="tag">Медиана: ${money(m.marketMedian)}</span>
        <span class="tag">Нижняя четверть: ${money(m.marketQ1)}</span>
-       <span class="tag">Минимум по марже: ${money(m.floorPrice)}</span>
+       <span class="tag">Мин. цена для 20% чистыми: ${money(m.floorPrice)}</span>
        <span class="tag">Рекомендовано: ${money(m.recommendedPrice)}</span>
-       <span class="tag">Прибыль: ${money(m.expectedProfit)}</span>
-       <span class="tag">Маржа: ${m.expectedMargin==null?"—":m.expectedMargin+"%"}</span>
+       <span class="tag">Чистая прибыль: ${money(m.expectedProfit)}</span><span class="tag">Econom: ${m.economCommissionPct??"—"}%</span>
+       <span class="tag">Чистая маржа: ${m.expectedMargin==null?"—":m.expectedMargin+"%"}</span>
      </div>
      ${m.adDecision?`<div class="card ad-${esc(m.adDecision.color)}"><span class="adbadge ${esc(m.adDecision.color)}">${esc(m.adDecision.label)}</span> <b>Score ${esc(m.adDecision.score)}</b><br><span class="muted small">${esc(m.adDecision.reason||"")}</span></div>`:""}
      <p><strong>${esc(m.status||"")}</strong></p>
@@ -436,8 +481,8 @@ function renderAdCandidates(selectedId=null){
          <span class="tag">Pre-score ${esc(x.preScore)}</span>
          <span class="tag">Цена ${money(x.promPrice)}</span>
          <span class="tag">Закупка ${money(x.buyPrice)}</span>
-         <span class="tag">Прибыль ${money(x.grossProfit)}</span>
-         <span class="tag">Маржа ${x.marginPct==null?"—":x.marginPct+"%"}</span>
+         <span class="tag">Чистая прибыль ${money(x.netProfit)}</span>
+         <span class="tag">Чистая маржа ${x.netMarginPct==null?"—":x.netMarginPct+"%"}</span>
        </div>
        <div class="muted small" style="margin-top:6px">Это предварительный рейтинг. Для финального решения нажми «Проверить рынок Prom» в AI-редакторе.</div>
        <button style="margin-top:8px" onclick="openEditorFor('${esc(id)}')">Редактировать именно этот товар</button>
@@ -457,6 +502,197 @@ function renderAdCandidates(selectedId=null){
    },60);
  }
 }
+
+function needsNameAuto(x, full){
+ if(full) return true;
+ const n=String(x?.product?.name||"").toLowerCase();
+ return n.length<18 || n.length>115 || /(военная|летняя|зимняя|ботинки|брюки|перчатки|мужская|женская|камуфляжный)/i.test(n);
+}
+
+function plainLen(s){ return String(s||"").replace(/<[^>]+>/g," ").replace(/&[a-z#0-9]+;/gi," ").replace(/\s+/g," ").trim().length; }
+
+function needsDescriptionAuto(x, full){
+ const supplier=String(x?.supplierDescription||"");
+ if(plainLen(supplier)<80) return false; // без фактов XML описание автоматически не трогаем
+ if(full) return true;
+ const cur=String(x?.product?.description||"");
+ return plainLen(cur)<350 || /&lt;|&gt;|```/i.test(cur);
+}
+
+function autoEligibleItems(){
+ const mode=document.getElementById("autoScope")?.value||"safe";
+ let list=REPORT.filter(x=>x.matched && x.matchMethod==="sku+name");
+ if(mode==="top30"){
+   const ids=new Set((window.AD_CANDIDATES||[]).map(x=>String(x.product.id)));
+   if(ids.size) list=list.filter(x=>ids.has(String(x.product.id)));
+   else list=[...list].sort((a,b)=>(b.score||0)-(a.score||0)).slice(0,30);
+ }
+ return list;
+}
+
+function openAutopilot(){
+ if(!REPORT.length){
+   $("#content").innerHTML='<div class="card warn">Сначала нажми «Анализ всего каталога».</div>';
+   return;
+ }
+ const policies=[
+  ["Salomon",20],["Helikon-Tex",10],["LOWA",5],["Belleville",15],["Остальные",15]
+ ];
+ $("#content").innerHTML=`<div class="card">
+   <h3 style="margin-top:0">⚡ АВТО-РЕДАКТОР v9</h3>
+   <div class="muted">Один запуск сам выбирает нужные изменения, генерирует безопасный текст, при необходимости проверяет рынок и записывает результат в Prom без подтверждения каждого товара.</div>
+   <div class="autopilot-grid">
+    <label>Товары<select id="autoScope"><option value="safe">Все надёжно сопоставленные</option><option value="top30">Только ТОП-30</option></select></label>
+    <label>Режим текста<select id="autoTextMode"><option value="needed">Только где нужно</option><option value="full">Перегенерировать всё с XML</option></select></label>
+    <label>За один проход<select id="autoBatch"><option>10</option><option>25</option><option selected>50</option><option>100</option><option value="99999">ВСЕ ОСТАВШИЕСЯ</option></select></label>
+    <label>Рынок для оптимизации<select id="autoMarket"><option value="top30" selected>Только ТОП-30</option><option value="all">Для каждого товара (дорого)</option><option value="off">Не проверять рынок</option></select></label>
+   </div>
+   <div class="row">
+    <label><input id="autoName" type="checkbox" checked> Авто-названия</label>
+    <label><input id="autoDesc" type="checkbox" checked> Авто-описания</label>
+    <label><input id="autoPrice" type="checkbox" checked> Авто-цены: минимум 20% чистыми</label><label><input id="autoContinue" type="checkbox" checked> Продолжать автоматически до конца</label>
+   </div>
+   <div style="margin-top:10px"><label>WRITE_PIN <input id="autoPin" type="password" autocomplete="off"></label></div>
+   <div class="row" style="margin-top:10px">
+    <button onclick="startAutopilot()">▶ ЗАПУСТИТЬ АВТО</button>
+    <button onclick="stopAutopilot()">■ СТОП</button>
+    <button onclick="clearAutopilotProgress()">Сбросить прогресс</button>
+   </div>
+   <div class="muted small" style="margin-top:8px">Базовая цена меняется БЕЗ web search: если после Econom чистая маржа ниже 20%, цена автоматически поднимается до безопасного минимума. Web search нужен только для дополнительной оптимизации ТОП-товаров и никогда не может опустить цену ниже 20% чистой маржи.</div>
+  </div>
+  <div class="card"><b>Правила v9</b>
+   <table class="policy-table"><thead><tr><th>Бренд</th><th>Скидка Militaris</th><th>Цель после Prom Econom</th></tr></thead><tbody>
+    ${policies.map(p=>`<tr><td>${p[0]}</td><td>${p[1]}%</td><td><b>≥20% чистой маржи</b></td></tr>`).join("")}
+   </tbody></table>
+   <div class="muted small">Скидка Militaris используется только для расчёта закупки. Комиссия Econom берётся из официальной таблицы Prom по категории. Если категория не распознана — используется безопасный fallback.</div>
+  </div>
+  <div id="autoSummary" class="card">Готов к запуску.</div>
+  <div id="autoLog" class="auto-log"></div>`;
+}
+
+function autoLog(text, cls=""){
+ const el=document.getElementById("autoLog");
+ if(!el) return;
+ const d=document.createElement("div"); d.className=`auto-row ${cls}`; d.textContent=text; el.prepend(d);
+}
+
+function autoDoneSet(){
+ try{return new Set(JSON.parse(localStorage.getItem("primetac_auto_done_v9")||"[]").map(String))}catch{return new Set()}
+}
+function saveAutoDone(set){ localStorage.setItem("primetac_auto_done_v9",JSON.stringify([...set])); }
+function clearAutopilotProgress(){ localStorage.removeItem("primetac_auto_done_v9"); autoLog("Прогресс сброшен.","auto-skip"); }
+function stopAutopilot(){ window.AUTO_STOP=true; autoLog("Остановка запрошена. Текущий товар завершится и цикл остановится.","auto-skip"); }
+
+async function startAutopilot(){
+ if(window.AUTO_RUNNING) return;
+ const pin=document.getElementById("autoPin")?.value||"";
+ if(!pin){ alert("Введи WRITE_PIN"); return; }
+ const batch=Number(document.getElementById("autoBatch")?.value||50);
+ const full=document.getElementById("autoTextMode")?.value==="full";
+ const marketMode=document.getElementById("autoMarket")?.value||"top30";
+ const doName=document.getElementById("autoName")?.checked!==false;
+ const doDesc=document.getElementById("autoDesc")?.checked!==false;
+ const doPrice=document.getElementById("autoPrice")?.checked!==false;
+ const autoContinue=document.getElementById("autoContinue")?.checked!==false;
+ const topIds=new Set((window.AD_CANDIDATES||[]).map(x=>String(x.product.id)));
+ let queue=autoEligibleItems();
+ const done=autoDoneSet();
+ queue=queue.filter(x=>!done.has(String(x.product.id))).slice(0,batch);
+ if(!queue.length){ autoLog("Нет новых товаров в выбранной очереди.","auto-skip"); return; }
+
+ window.AUTO_RUNNING=true; window.AUTO_STOP=false;
+ let ok=0, skipped=0, errors=0;
+ const summary=document.getElementById("autoSummary");
+
+ for(let i=0;i<queue.length;i++){
+   if(window.AUTO_STOP) break;
+   const x=queue[i]; const id=String(x.product.id); const policy=productPolicy(x);
+   if(summary) summary.textContent=`Обрабатываю ${i+1}/${queue.length}: ${x.product.name}`;
+   autoLog(`→ ${x.product.name} | скидка ${policy.discount}% | Econom ${policy.commission}% | цель ≥${policy.target}% чистыми`);
+
+   try{
+     const needName=doName && needsNameAuto(x,full);
+     const needDesc=doDesc && needsDescriptionAuto(x,full);
+     let proposal=null;
+
+     if(needName || needDesc){
+       proposal=await j("/api/editor/propose",{
+         method:"POST",headers:{"Content-Type":"application/json"},
+         body:JSON.stringify({productId:id,targetMargin:policy.target,changePrice:false,changeName:needName,changeDescription:needDesc})
+       });
+     }
+
+     let price=null;
+     const current=Number(x.promPrice||0);
+     const safeFloor=Number(x.recommendedNet20||x.recommended20||policy.safePrice||0);
+     const currentNet=Number(x.netMarginPct??-999);
+
+     if(doPrice && safeFloor>0 && (currentNet<20 || current<safeFloor)){
+       price=safeFloor;
+       autoLog(`  базовая цена → ${safeFloor} грн, чтобы после Econom осталось ≥20% чистыми`,"auto-ok");
+     }
+
+     const shouldMarket=doPrice && marketMode!=="off" && (marketMode==="all" || topIds.has(id) || Number(x.score||0)>=75);
+     if(shouldMarket){
+       const r=await fetch("/api/market/check",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({productId:id,minMargin:20})});
+       const m=await r.json();
+       if(r.ok){
+         const exact=(m.competitors||[]).filter(c=>c.match==="exact").length;
+         const candidate=Number(m.recommendedPrice||0);
+         if(exact>=2 && candidate>0 && Number(m.expectedMargin||0)>=20){
+           const base=price!=null?price:current;
+           if(!base || Math.abs(candidate-base)/base>=0.015){
+             price=candidate;
+             autoLog(`  рынок: ${candidate} грн · чистая маржа ${m.expectedMargin}% · exact=${exact}`,"auto-ok");
+           }
+         }else{
+           autoLog(`  рынок не меняет базовую цену: exact=${exact}, ${m.status||"нет безопасной рыночной цены"}`,"auto-skip");
+         }
+       }else{
+         autoLog(`  рынок не проверен: ${m.error||"ошибка"}; базовая безопасная цена сохраняется`,"auto-skip");
+       }
+     }
+
+     const payload={productId:id,confirm:"APPLY"};
+     if(price!=null) payload.price=price;
+     if(needName && proposal?.proposedName) payload.name=proposal.proposedName;
+     if(needDesc && proposal?.proposedDescription){
+       if(proposal.groundingSafe===true) payload.description=proposal.proposedDescription;
+       else autoLog(`  описание пропущено: ${(proposal.groundingIssues||[]).join("; ")||"grounding risk"}`,"auto-skip");
+     }
+
+     if(Object.keys(payload).length<=2){
+       skipped++; done.add(id); saveAutoDone(done); autoLog("  изменений не требуется.","auto-skip"); continue;
+     }
+
+     const ar=await fetch("/api/editor/apply",{
+       method:"POST",headers:{"Content-Type":"application/json","X-Write-Pin":pin},body:JSON.stringify(payload)
+     });
+     const ao=await ar.json();
+     if(!ar.ok) throw new Error(ao.error||"Prom edit error");
+     ok++; done.add(id); saveAutoDone(done);
+     const parts=[]; if(payload.name) parts.push("название"); if(payload.description) parts.push("описание"); if(payload.price) parts.push(`цена ${payload.price} грн`);
+     autoLog(`✓ применено: ${parts.join(", ")}`,"auto-ok");
+   }catch(e){
+     errors++; autoLog(`✗ ${e.message}`,"auto-err");
+   }
+ }
+
+ window.AUTO_RUNNING=false;
+ if(summary) summary.innerHTML=`Готово: <b class="good">${ok} изменено</b> · ${skipped} без изменений · <span class="bad">${errors} ошибок</span>.`;
+
+ if(autoContinue && !window.AUTO_STOP){
+   const left=autoEligibleItems().filter(x=>!autoDoneSet().has(String(x.product.id))).length;
+   if(left>0){
+     autoLog(`Автопродолжение: осталось ${left} товаров. Следующий проход через 2 секунды.`,"auto-skip");
+     setTimeout(()=>startAutopilot(),2000);
+   }else{
+     autoLog("✓ Весь выбранный каталог обработан.","auto-ok");
+     if(summary) summary.innerHTML+=` <b class="good">Весь выбранный каталог обработан.</b>`;
+   }
+ }
+}
+
 
 async function loadAdCandidates(){
  $("#content").innerHTML='<div class="card">Формирую предварительный ТОП-30 по марже, прибыли и надёжности match…</div>';
@@ -496,6 +732,126 @@ function openAdCandidateRelative(delta){
  const id=String(list[next].product.id);
  window._lastAdCandidateId=id;
  openEditor(id);
+}
+
+function markup20Money(v){
+ return v==null || !Number.isFinite(Number(v)) ? "—" : `${Math.round(Number(v))} грн`;
+}
+
+async function openMarkup20(){
+ $("#content").innerHTML=`<div class="card">
+   <h3 style="margin-top:0">💰 Уравнять весь каталог: +20% к закупке</h3>
+   <div class="good"><b>Формула:</b> цена Prom = закупка Militaris × 1,20.</div>
+   <div class="warn small" style="margin-top:8px">
+     Это именно 20% НАЦЕНКИ на закупку. Комиссия Prom Econom потом вычитается из этих 20%, поэтому чистая прибыль после Prom будет меньше 20% и у части категорий может быть очень маленькой.
+   </div>
+   <div style="margin-top:10px">
+     <button onclick="previewMarkup20()">1. Рассчитать весь каталог</button>
+   </div>
+ </div>
+ <div id="markup20Result"></div>`;
+}
+
+async function previewMarkup20(){
+ const el=$("#markup20Result");
+ el.innerHTML='<div class="card">Считаю закупку и новую цену по всему каталогу…</div>';
+ try{
+   const d=await j("/api/markup20/preview");
+   window.MARKUP20_PREVIEW=d;
+   const badNet=(d.rows||[]).filter(x=>x.matched && Number(x.projectedNetProfit||0)<=0).length;
+   const lowNet=(d.rows||[]).filter(x=>x.matched && Number(x.projectedNetProfit||0)>0 && Number(x.projectedNetMarginPct||0)<5).length;
+
+   el.innerHTML=`<div class="card">
+     <b>Предпросмотр +${d.markupPct}%</b>
+     <div class="row" style="margin-top:8px">
+       <span class="tag">Всего ${d.total}</span>
+       <span class="tag good">Готово к изменению ${d.ready}</span>
+       <span class="tag">Поднять ${d.raise}</span>
+       <span class="tag">Снизить ${d.lower}</span>
+       <span class="tag warn">Без match ${d.skipped}</span>
+       <span class="tag ${badNet?'bad':'good'}">После Econom в минус: ${badNet}</span>
+       <span class="tag ${lowNet?'warn':'good'}">Чистыми <5%: ${lowNet}</span>
+     </div>
+     <div class="warn small" style="margin-top:10px">
+       Кнопка ниже реально перезапишет цены в Prom: и повысит слишком дешёвые, и снизит слишком дорогие до единого правила +20% к закупке.
+     </div>
+     <div style="margin-top:10px">
+       <label>WRITE_PIN <input id="markup20Pin" type="password" autocomplete="off"></label>
+       <button onclick="startMarkup20All()">⚡ ПРИМЕНИТЬ +20% КО ВСЕМ</button>
+     </div>
+   </div>
+   <div id="markup20Progress"></div>`;
+ }catch(e){
+   el.innerHTML=`<div class="card bad">${esc(e.message)}</div>`;
+ }
+}
+
+async function startMarkup20All(){
+ const d=window.MARKUP20_PREVIEW;
+ if(!d) return previewMarkup20();
+ const pin=document.getElementById("markup20Pin")?.value||"";
+ if(!pin){ alert("Введи WRITE_PIN"); return; }
+ if(window.MARKUP20_RUNNING) return;
+ if(!confirm(`Изменить цены у ${d.ready} товаров по формуле закупка × 1.20?`)) return;
+
+ window.MARKUP20_RUNNING=true;
+ const ready=(d.rows||[]).filter(x=>x.matched && x.targetPrice);
+ const chunks=[];
+ for(let i=0;i<ready.length;i+=50) chunks.push(ready.slice(i,i+50));
+
+ let ok=0, fail=0, done=0;
+ const box=$("#markup20Progress");
+ box.innerHTML=`<div class="card">
+   <b>Идёт массовое изменение цен…</b>
+   <div class="markup20-progress"><div id="markup20Bar"></div></div>
+   <div id="markup20Stats">0 / ${ready.length}</div>
+   <div id="markup20Log" class="small muted" style="max-height:280px;overflow:auto;margin-top:10px"></div>
+ </div>`;
+
+ for(const chunk of chunks){
+   try{
+     const r=await fetch("/api/markup20/apply",{
+       method:"POST",
+       headers:{"Content-Type":"application/json"},
+       body:JSON.stringify({pin,productIds:chunk.map(x=>x.productId)})
+     });
+     const jx=await r.json();
+     if(!r.ok) throw new Error(jx.error||"Ошибка пакетного изменения");
+
+     ok += Number(jx.success||0);
+     fail += Number(jx.failed||0);
+
+     const log=document.getElementById("markup20Log");
+     (jx.results||[]).forEach(x=>{
+       const div=document.createElement("div");
+       div.className=x.ok?"good":"bad";
+       div.textContent=x.ok
+         ? `✓ ID ${x.productId}: ${x.oldPrice} → ${x.newPrice} грн | закупка ${x.buyPrice} | +${x.markupPct}%`
+         : `✗ ID ${x.productId}: ${x.error}`;
+       log.appendChild(div);
+     });
+     log.scrollTop=log.scrollHeight;
+   }catch(e){
+     fail += chunk.length;
+     const log=document.getElementById("markup20Log");
+     const div=document.createElement("div");
+     div.className="bad";
+     div.textContent=`Ошибка пачки: ${e.message}`;
+     log.appendChild(div);
+   }
+
+   done += chunk.length;
+   const pct=ready.length?Math.round(done/ready.length*100):100;
+   const bar=document.getElementById("markup20Bar");
+   if(bar) bar.style.width=pct+"%";
+   const stats=document.getElementById("markup20Stats");
+   if(stats) stats.innerHTML=`${done} / ${ready.length} · <b class="good">${ok} изменено</b> · <b class="bad">${fail} ошибок</b>`;
+   await new Promise(r=>setTimeout(r,250));
+ }
+
+ window.MARKUP20_RUNNING=false;
+ const stats=document.getElementById("markup20Stats");
+ if(stats) stats.innerHTML+=`<br><b class="good">Готово. Все надёжно сопоставленные товары обработаны.</b>`;
 }
 
 health();
