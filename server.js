@@ -55,6 +55,10 @@ let managerState = {
   running: false
 };
 
+let manualMatches = new Map();       // Prom product ID -> supplier reference
+let manualRejects = new Map();       // Prom product ID -> Set(supplier keys)
+let manualNoMatch = new Set();       // Prom product IDs manually marked as absent in Militaris
+
 function requirePromToken(req, res, next) {
   if (!process.env.PROM_TOKEN) return res.status(500).json({ error: "PROM_TOKEN не задан" });
   next();
@@ -201,7 +205,7 @@ async function refreshCommissionTable(force=false){
 
   try{
     const r=await fetch(PROM_COMMISSION_CSV_URL,{
-      headers:{"User-Agent":"PrimeTacPromAI/10.1"}
+      headers:{"User-Agent":"PrimeTacPromAI/10.2"}
     });
     if(!r.ok) throw new Error(`Prom commission CSV: HTTP ${r.status}`);
 
@@ -395,7 +399,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/10.1"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/10.2"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -435,6 +439,95 @@ async function fetchAllPromProducts(maxPages=30){
   }
   return all;
 }
+
+function supplierManualKey(m){
+  if(!m) return "";
+  const id=norm(m.id);
+  if(id) return `id:${id}`;
+  const sku=norm(m.sku);
+  if(sku) return `sku:${sku}`;
+  const name=norm(m.name);
+  if(name) return `name:${name}`;
+  return "";
+}
+
+function supplierManualRef(m){
+  return {
+    key:supplierManualKey(m),
+    id:m?.id||"",
+    sku:m?.sku||"",
+    name:m?.name||"",
+    brand:m?.brand||""
+  };
+}
+
+function resolveManualSupplier(ref){
+  if(!ref) return null;
+  const key=String(ref.key||"");
+
+  if(key.startsWith("id:")){
+    const wanted=key.slice(3);
+    const found=(militarisCache.items||[]).find(x=>norm(x.id)===wanted);
+    if(found) return found;
+  }
+  if(key.startsWith("sku:")){
+    const wanted=key.slice(4);
+    const list=militarisCache.bySku.get(wanted)||[];
+    if(list.length) return list[0];
+  }
+  if(key.startsWith("name:")){
+    const wanted=key.slice(5);
+    const found=(militarisCache.items||[]).find(x=>norm(x.name)===wanted);
+    if(found) return found;
+  }
+
+  if(ref.id){
+    const found=(militarisCache.items||[]).find(x=>String(x.id)===String(ref.id));
+    if(found) return found;
+  }
+  if(ref.sku){
+    const list=militarisCache.bySku.get(norm(ref.sku))||[];
+    if(list.length) return list[0];
+  }
+  if(ref.name){
+    const found=(militarisCache.items||[]).find(x=>norm(x.name)===norm(ref.name));
+    if(found) return found;
+  }
+  return null;
+}
+
+function manualStateExport(){
+  return {
+    version:1,
+    matches:[...manualMatches.entries()].map(([productId,ref])=>({productId,ref})),
+    rejects:[...manualRejects.entries()].map(([productId,set])=>({productId,keys:[...set]})),
+    noMatch:[...manualNoMatch]
+  };
+}
+
+function manualStateRestore(state){
+  if(!state || typeof state!=="object") return;
+
+  for(const x of Array.isArray(state.matches)?state.matches:[]){
+    if(!x?.productId || !x?.ref) continue;
+    manualMatches.set(String(x.productId),x.ref);
+    manualNoMatch.delete(String(x.productId));
+  }
+
+  for(const x of Array.isArray(state.rejects)?state.rejects:[]){
+    if(!x?.productId) continue;
+    manualRejects.set(String(x.productId),new Set((x.keys||[]).map(String)));
+  }
+
+  for(const id of Array.isArray(state.noMatch)?state.noMatch:[]){
+    const pid=String(id);
+    manualNoMatch.add(pid);
+    manualMatches.delete(pid);
+  }
+
+  catalogCache={loadedAt:null,report:[],summary:null};
+}
+
 function detectBrandFromName(s){
   const n=norm(s);
   for(const b of ["salomon","helikon","lowa","belleville","snugpak","mil-tec","kiborg","ragnarok","mf h","mfh"]){
@@ -476,6 +569,14 @@ function priceRatioOkay(promPrice,supplierPrice){
 }
 function findMilitarisMatch(p){
   if(!militarisCache.items.length) return null;
+
+  const pid=String(p?.id||"");
+  if(pid && manualMatches.has(pid)){
+    const manualItem=resolveManualSupplier(manualMatches.get(pid));
+    if(manualItem){
+      return {item:manualItem,method:"manual",confidence:1};
+    }
+  }
 
   const pName=p.name||"";
   const pBrand=detectBrandFromName(pName);
@@ -622,6 +723,7 @@ function metrics(p,match){
 
   const flags=[];
   if(match.method==="name_strong") flags.push("Проверить match");
+  if(match.method==="manual") flags.push("Подтверждено вручную");
   if(promPrice<buyPrice) flags.push("Цена ниже закупки");
   if(netMarginPct!=null && netMarginPct<TARGET_NET_MARGIN_PCT){
     flags.push(`Чистая маржа <${TARGET_NET_MARGIN_PCT}% после Econom`);
@@ -961,18 +1063,23 @@ function compareSupplierSnapshot(){
   return {hasBaseline:true,changedPrice,becameUnavailable,backInStock,details:details.slice(0,100)};
 }
 
-function looseMatchSuggestions(p,limit=3){
+function looseMatchSuggestions(p,limit=3,offset=0){
   const pName=p?.product?.name||p?.name||"";
   const pPrice=Number(p?.promPrice||p?.price||0);
   const pBrand=detectBrandFromName(pName);
+  const pid=String(p?.product?.id||p?.productId||p?.id||"");
+  const rejected=manualRejects.get(pid)||new Set();
   const candidates=[];
 
   for(const m of militarisCache.items||[]){
+    const key=supplierManualKey(m);
+    if(!key || rejected.has(key)) continue;
+
     const mBrand=detectBrandFromName(`${m.brand||""} ${m.name||""}`);
     if(pBrand && mBrand && pBrand!==mBrand) continue;
 
     const nameScore=overlap(pName,m.name);
-    if(nameScore<0.18) continue;
+    if(nameScore<0.12) continue;
 
     let score=nameScore*75;
     if(pBrand && mBrand && pBrand===mBrand) score+=12;
@@ -985,16 +1092,36 @@ function looseMatchSuggestions(p,limit=3){
     }
 
     candidates.push({
+      supplierKey:key,
       supplierId:m.id,
       sku:m.sku,
       name:m.name,
       brand:m.brand,
       price:m.price,
       available:m.available,
+      quantity:m.quantity,
       score:Math.round(score*10)/10
     });
   }
-  return candidates.sort((a,b)=>b.score-a.score).slice(0,limit);
+
+  candidates.sort((a,b)=>b.score-a.score);
+
+  const unique=[];
+  const seen=new Set();
+  for(const c of candidates){
+    if(seen.has(c.supplierKey)) continue;
+    seen.add(c.supplierKey);
+    unique.push(c);
+  }
+
+  const start=Math.max(0,Number(offset)||0);
+  const take=Math.max(1,Math.min(Number(limit)||3,20));
+  return {
+    suggestions:unique.slice(start,start+take),
+    total:unique.length,
+    offset:start,
+    hasMore:start+take<unique.length
+  };
 }
 
 function managerAuditItem(x){
@@ -1007,7 +1134,12 @@ function managerAuditItem(x){
   const keywords=String(x.product?.keywords||"").trim();
 
   if(!x.matched){
-    issues.push({code:"unmatched",level:"high",text:"Нет надёжного совпадения с Militaris"});
+    const pid=String(x.product?.id||"");
+    if(manualNoMatch.has(pid)){
+      issues.push({code:"manual_no_match",level:"low",text:"Отмечено вручную: соответствия в Militaris нет"});
+    }else{
+      issues.push({code:"unmatched",level:"high",text:"Нет надёжного совпадения с Militaris"});
+    }
   }else{
     if(target!=null && Math.abs(drift)>=1){
       issues.push({code:"price_drift",level:"high",text:`Цена не по правилу +${CATALOG_MARKUP_PCT}%`,targetPrice:target,delta:round2(drift)});
@@ -1086,7 +1218,9 @@ function managerSummary(items){
     characteristics:has("characteristics"),
     categoryReview:has("category"),
     netLoss:has("net_loss"),
-    lowNet:has("low_net")
+    lowNet:has("low_net"),
+    manualNoMatch:has("manual_no_match"),
+    unresolvedMatch:has("unmatched")
   };
 }
 
@@ -1235,6 +1369,11 @@ app.get("/api/manager/today",requirePromToken,async(req,res)=>{
       },
       supplierOnlyCount:supplierOnly.length,
       supplierOnly,
+      manualMatchState:{
+        matches:manualMatches.size,
+        noMatch:manualNoMatch.size,
+        rejectedProducts:manualRejects.size
+      },
       items:audit.slice(0,250)
     });
   }catch(e){
@@ -1250,13 +1389,37 @@ app.post("/api/manager/snapshot",requirePromToken,(req,res)=>{
 app.get("/api/manager/unmatched",requirePromToken,async(req,res)=>{
   try{
     const data=await getCatalogReport(false);
-    const rows=data.report.filter(x=>!x.matched).map(x=>({
-      productId:x.product.id,
-      name:x.product.name,
-      price:x.promPrice,
-      suggestions:looseMatchSuggestions(x,3)
-    }));
-    res.json({count:rows.length,rows});
+    const productId=req.query?.productId!=null?String(req.query.productId):null;
+    const limit=Math.max(1,Math.min(Number(req.query?.limit)||3,20));
+    const offset=Math.max(0,Number(req.query?.offset)||0);
+
+    let base=data.report.filter(x=>!x.matched && !manualNoMatch.has(String(x.product.id)));
+    if(productId) base=base.filter(x=>String(x.product.id)===productId);
+
+    const rows=base.map(x=>{
+      const sug=looseMatchSuggestions(x,limit,offset);
+      return {
+        productId:x.product.id,
+        name:x.product.name,
+        price:x.promPrice,
+        suggestions:sug.suggestions,
+        suggestionsTotal:sug.total,
+        suggestionsOffset:sug.offset,
+        hasMore:sug.hasMore
+      };
+    });
+
+    res.json({
+      count:data.report.filter(x=>!x.matched).length,
+      unresolved:base.length,
+      manuallySkipped:data.report.filter(x=>!x.matched && manualNoMatch.has(String(x.product.id))).length,
+      rows,
+      manualState:{
+        matches:manualMatches.size,
+        rejectedProducts:manualRejects.size,
+        noMatch:manualNoMatch.size
+      }
+    });
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
   }
@@ -1279,6 +1442,114 @@ app.post("/api/manager/sync-prices",requirePromToken,requireWritePin,async(req,r
     });
   }catch(e){
     res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+
+app.get("/api/manager/manual-state",requirePromToken,(req,res)=>{
+  res.json({
+    ok:true,
+    counts:{
+      matches:manualMatches.size,
+      rejectedProducts:manualRejects.size,
+      noMatch:manualNoMatch.size
+    },
+    state:manualStateExport(),
+    note:"Сервер хранит ручные match в памяти процесса. Браузер v10.2 делает локальную резервную копию."
+  });
+});
+
+app.post("/api/manager/manual-state/restore",requirePromToken,requireWritePin,(req,res)=>{
+  try{
+    manualStateRestore(req.body?.state||{});
+    res.json({ok:true,state:manualStateExport()});
+  }catch(e){
+    res.status(400).json({error:e.message});
+  }
+});
+
+app.post("/api/manager/match/confirm",requirePromToken,requireWritePin,async(req,res)=>{
+  try{
+    const productId=String(req.body?.productId||"");
+    const supplierKey=String(req.body?.supplierKey||"");
+    if(!productId || !supplierKey){
+      return res.status(400).json({error:"productId и supplierKey обязательны"});
+    }
+
+    const supplier=(militarisCache.items||[]).find(x=>supplierManualKey(x)===supplierKey);
+    if(!supplier){
+      return res.status(404).json({error:"Кандидат Militaris не найден после обновления XML"});
+    }
+
+    manualMatches.set(productId,supplierManualRef(supplier));
+    manualNoMatch.delete(productId);
+    catalogCache={loadedAt:null,report:[],summary:null};
+
+    const data=await getCatalogReport(true);
+    const x=data.report.find(r=>String(r.product.id)===productId);
+    if(!x?.matched){
+      return res.status(500).json({error:"Match сохранён, но каталог не смог его применить"});
+    }
+
+    res.json({
+      ok:true,
+      productId,
+      supplier:{
+        key:supplierManualKey(supplier),
+        id:supplier.id,
+        sku:supplier.sku,
+        name:supplier.name,
+        brand:supplier.brand,
+        price:supplier.price
+      },
+      result:{
+        buyPrice:x.buyPrice,
+        targetPrice:x.recommendedMarkup20,
+        currentPrice:x.promPrice,
+        economCommissionPct:x.economCommissionPct,
+        projectedNetProfit:x.recommendedMarkup20
+          ? round2(netProfitAtPrice(x.recommendedMarkup20,x.buyPrice,x.economCommissionPct||ECONOM_FALLBACK_PCT))
+          : null,
+        projectedNetMarginPct:x.recommendedMarkup20
+          ? Math.round(netMarginAtPrice(x.recommendedMarkup20,x.buyPrice,x.economCommissionPct||ECONOM_FALLBACK_PCT)*10)/10
+          : null,
+        discountPct:x.discountPct,
+        discountGroup:x.discountGroup
+      },
+      state:manualStateExport()
+    });
+  }catch(e){
+    res.status(e.status||500).json({error:e.message,details:e.data||null});
+  }
+});
+
+app.post("/api/manager/match/reject",requirePromToken,requireWritePin,(req,res)=>{
+  try{
+    const productId=String(req.body?.productId||"");
+    const supplierKey=String(req.body?.supplierKey||"");
+    if(!productId || !supplierKey){
+      return res.status(400).json({error:"productId и supplierKey обязательны"});
+    }
+
+    if(!manualRejects.has(productId)) manualRejects.set(productId,new Set());
+    manualRejects.get(productId).add(supplierKey);
+
+    res.json({ok:true,state:manualStateExport()});
+  }catch(e){
+    res.status(400).json({error:e.message});
+  }
+});
+
+app.post("/api/manager/match/no-match",requirePromToken,requireWritePin,(req,res)=>{
+  try{
+    const productId=String(req.body?.productId||"");
+    if(!productId) return res.status(400).json({error:"productId обязателен"});
+    manualNoMatch.add(productId);
+    manualMatches.delete(productId);
+    catalogCache={loadedAt:null,report:[],summary:null};
+    res.json({ok:true,state:manualStateExport()});
+  }catch(e){
+    res.status(400).json({error:e.message});
   }
 });
 
@@ -2283,4 +2554,4 @@ setInterval(async()=>{
   }
 }, AUTO_PRICE_SYNC_INTERVAL_MIN*60*1000);
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v10.1 running on ${PORT}`));
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v10.2 running on ${PORT}`));
