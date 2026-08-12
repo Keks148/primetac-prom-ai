@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v10.2</title>
+<title>PrimeTac Prom AI v11</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -68,17 +68,16 @@ summary{cursor:pointer;font-weight:700}
 </head>
 <body>
 <div class="wrap">
-<h1>PrimeTac Prom AI <span class="muted">v10.2</span></h1>
+<h1>PrimeTac Prom AI <span class="muted">v11</span></h1>
 <div class="muted">Панель прибыли: Prom + Militaris + AI + продажи</div>
 
 <div class="bar">
-<button onclick="health()">Проверить подключение</button>
-<button onclick="refreshMilitaris()">Обновить Militaris</button>
-<button onclick="loadAll()">Анализ всего каталога</button>
-<button onclick="showTop()">ТОП для продаж</button>
-<button onclick="showPrices()">Цены</button>
-<button onclick="loadSales()">Продажи</button>
-<button onclick="loadOrders()">Заказы</button><button onclick="openManager()">🧠 МЕНЕДЖЕР</button><button onclick="openEditor()">AI-редактор</button><button onclick="loadAdCandidates()">ТОП-30 для рекламы</button><button onclick="openAutopilot()">⚡ АВТО-РЕДАКТОР</button><button onclick="openMarkup20()">💰 УРАВНЯТЬ +20%</button>
+<button onclick="openManager()">🧠 МЕНЕДЖЕР</button>
+<button onclick="openPriceGuard()">🛡 PRICE GUARD</button>
+<button onclick="loadAll()">Каталог</button>
+<button onclick="loadOrders()">Заказы</button>
+<button onclick="openEditor()">AI-редактор</button>
+<button onclick="openTools()">⋯ Инструменты</button>
 </div>
 
 <div id="status" class="card">Проверяем...</div>
@@ -110,7 +109,7 @@ summary{cursor:pointer;font-weight:700}
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v10.2: ручной match для несопоставленных товаров + резервная копия подтверждений в браузере. Цена остаётся закупка Militaris +20%.
+v11: Price Guard защищает цены Prom от повторной перезаписи XML. Главное правило остаётся закупка Militaris +20%.
 </div>
 </div>
 
@@ -125,7 +124,7 @@ function money(v){return v==null?"—":Math.round(Number(v)).toLocaleString("uk-
 async function health(){
  try{
   const d=await j("/api/health");
-  $("#status").innerHTML=`Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'не загружен'}</b> · Комиссии Econom: <b class="${d.commissions?.count?'good':'warn'}">${d.commissions?.count?d.commissions.count+' категорий':'fallback '+(d.commissions?.fallbackPct||12.5)+'%'}</b> · Цена: <b class="good">закупка +${d.manager?.markupPct||20}%</b> · Автосинхр.: <b class="${d.manager?.autoPriceSync?'good':'muted'}">${d.manager?.autoPriceSync?'ВКЛ':'выкл'}</b>`;
+  $("#status").innerHTML=`Prom: <b class="${d.promConfigured?'good':'bad'}">${d.promConfigured?'подключён':'нет токена'}</b> · AI: <b class="${d.aiConfigured?'good':'bad'}">${d.aiConfigured?'подключён':'нет ключа'}</b> · Militaris: <b class="${d.militaris.count?'good':'warn'}">${d.militaris.count?d.militaris.count+' товаров':'не загружен'}</b> · Комиссии Econom: <b class="${d.commissions?.count?'good':'warn'}">${d.commissions?.count?d.commissions.count+' категорий':'fallback '+(d.commissions?.fallbackPct||12.5)+'%'}</b> · Цена: <b class="good">закупка +${d.manager?.markupPct||20}%</b> · Price Guard: <b class="${d.manager?.priceGuard?'good':'muted'}">${d.manager?.priceGuard?'ВКЛ':'выкл'}</b>`;
  }catch(e){$("#status").textContent=e.message}
 }
 async function refreshMilitaris(){
@@ -906,7 +905,7 @@ async function openManager(force=false){
    const d=await j(`/api/manager/today${force?"?force=1":""}`);
    window.MANAGER_DATA=d;
    const s=d.summary||{};
-   const auto=d.autoPriceSync||{};
+   const auto=d.priceGuard||d.autoPriceSync||{};
    const snap=d.supplierSnapshot||{};
 
    $("#content").innerHTML=`
@@ -936,12 +935,12 @@ async function openManager(force=false){
      </div>
 
      <div class="card" style="margin-top:10px">
-       <b>Автосинхронизация цен</b><br>
-       <span class="muted small">Проверка каждые ${auto.intervalMinutes||60} мин, пока Render-инстанс работает. После перезапуска состояние зависит от AUTO_PRICE_SYNC_DEFAULT.</span>
+       <b>Price Guard — защита цен</b><br>
+       <span class="muted small">Проверяет Prom каждые ${auto.intervalMinutes||10} мин. Если XML перезаписал цены, автоматически возвращает закупка +20%.</span>
        <div class="manager-actions">
          <input id="managerPin" type="password" placeholder="WRITE_PIN" autocomplete="off">
-         <button onclick="managerAutoPrice(true)">Включить + проверить сейчас</button>
-         <button onclick="managerAutoPrice(false)">Выключить</button>
+         <button onclick="managerPriceGuardFromManager(true)">Включить Guard + проверить</button>
+         <button onclick="managerPriceGuardFromManager(false)">Выключить</button>
        </div>
        <div class="small ${auto.enabled?'good':'muted'}">Сейчас: ${auto.enabled?'ВКЛЮЧЕНО':'выключено'}${auto.lastRun?` · последний запуск ${esc(auto.lastRun)}`:""}</div>
      </div>
@@ -1321,6 +1320,26 @@ async function managerAutoPrice(enabled){
    openManager(false);
  }catch(e){alert(e.message)}
 }
+
+async function openPriceGuard(){
+ $("#content").innerHTML='<div class="card">🛡 Проверяю Price Guard…</div>';
+ try{
+   const g=await j("/api/manager/price-guard/status"); const last=g.lastResult||{};
+   $("#content").innerHTML=`<div class="card manager-hero"><h3 style="margin:0">🛡 Price Guard</h3><div class="muted small">Защищает цены Prom от перезаписи XML. Правило: закупка Militaris +${g.markupPct}%.</div>
+   <div class="manager-grid"><div class="manager-stat"><span class="muted">Статус</span><b class="${g.enabled?'good':'bad'}">${g.enabled?'ВКЛ':'ВЫКЛ'}</b></div><div class="manager-stat"><span class="muted">Проверка</span><b>${g.intervalMinutes} мин</b></div><div class="manager-stat"><span class="muted">Всего исправлено</span><b class="good">${g.repairedTotal||0}</b></div><div class="manager-stat"><span class="muted">Осталось drift</span><b class="${Number(last.driftLeft||0)?'bad':'good'}">${last.driftLeft??'—'}</b></div></div>
+   ${g.lastMassOverwriteDetected?`<div class="card issue-high"><b>⚠ Была массовая перезапись цен</b><br><span class="muted small">${esc(g.lastMassOverwriteDetected.at||"")} · ${g.lastMassOverwriteDetected.count||0} товаров</span></div>`:""}
+   <div class="card"><b>Последняя проверка</b><br>${g.lastRun?`<span class="tag">Съехало ${last.driftBefore??'—'}</span><span class="tag good">Исправлено ${last.repaired??0}</span><span class="tag ${Number(last.errors||0)?'bad':'good'}">Ошибок ${last.errors??0}</span><span class="tag ${Number(last.driftLeft||0)?'bad':'good'}">Осталось ${last.driftLeft??0}</span>`:'<span class="muted">Ещё не запускался.</span>'}</div>
+   <div class="manager-actions"><input id="guardPin" type="password" placeholder="WRITE_PIN" autocomplete="off"><button onclick="guardRunNow()">🔄 Проверить и восстановить сейчас</button><button onclick="guardToggle(${g.enabled?'false':'true'})">${g.enabled?'Выключить':'Включить'}</button><button onclick="guardEmergency()">🚨 Восстановить все цены</button></div>
+   <div class="warn small" style="margin-top:10px">Если XML снова сбросит цены, Guard вернёт их к закупка × 1,20. Для автоматической проверки Render должен быть запущен.</div></div>`;
+ }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
+}
+function guardPin(){const v=document.getElementById("guardPin")?.value||window.GUARD_PIN||"";if(v)window.GUARD_PIN=v;return v}
+async function guardRequest(url,body){const pin=guardPin()||prompt("WRITE_PIN")||"";if(!pin)throw new Error("WRITE_PIN не введён");window.GUARD_PIN=pin;const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","x-write-pin":pin},body:JSON.stringify(body||{})});const raw=await r.text();let d={};try{d=raw?JSON.parse(raw):{}}catch{}if(!r.ok)throw new Error(d.error||raw.slice(0,180)||`HTTP ${r.status}`);return d}
+async function guardRunNow(){try{const d=await guardRequest("/api/manager/price-guard",{enabled:true,runNow:true});const r=d.result||{};alert(`Готово: съехало ${r.driftBefore||0}, исправлено ${r.repaired||0}, осталось ${r.driftLeft||0}, ошибок ${r.errors||0}`);openPriceGuard()}catch(e){alert(e.message)}}
+async function guardToggle(enabled){try{await guardRequest("/api/manager/price-guard",{enabled,runNow:false});openPriceGuard()}catch(e){alert(e.message)}}
+async function guardEmergency(){if(!confirm("Вернуть все сопоставленные цены к правилу закупка +20%?"))return;try{const d=await guardRequest("/api/manager/emergency-restore-prices",{});const r=d.result||{};alert(`Исправлено ${r.repaired||0}, осталось ${r.driftLeft||0}, ошибок ${r.errors||0}`);openPriceGuard()}catch(e){alert(e.message)}}
+function openTools(){$("#content").innerHTML=`<div class="card"><h3 style="margin-top:0">⋯ Инструменты</h3><div class="muted small">Старые функции не удалены, только убраны с главного экрана.</div><div class="manager-actions"><button onclick="showTop()">ТОП для продаж</button><button onclick="showPrices()">Цены</button><button onclick="loadAdCandidates()">ТОП-30</button><button onclick="openAutopilot()">Старый авто-редактор</button><button onclick="openMarkup20()">Массовое +20%</button><button onclick="refreshMilitaris()">Обновить Militaris</button><button onclick="health()">Подключение</button></div></div>`}
+async function managerPriceGuardFromManager(enabled){const pin=document.getElementById("managerPin")?.value||prompt("WRITE_PIN")||"";if(!pin)return;try{const r=await fetch("/api/manager/price-guard",{method:"POST",headers:{"Content-Type":"application/json","x-write-pin":pin},body:JSON.stringify({enabled,runNow:enabled})});const raw=await r.text();let d={};try{d=JSON.parse(raw)}catch{}if(!r.ok)throw new Error(d.error||raw.slice(0,160));const x=d.result||{};alert(enabled?`Price Guard включён. Исправлено ${x.repaired||0}, осталось ${x.driftLeft||0}.`:"Price Guard выключен.");openManager(false)}catch(e){alert(e.message)}}
 
 health();
 </script>
