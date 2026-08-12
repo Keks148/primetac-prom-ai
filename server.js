@@ -23,6 +23,10 @@ const ECONOM_FALLBACK_PCT = Number(process.env.ECONOM_FALLBACK_PCT || 12.5);
 const MANAGER_MIN_NET_ALERT_PCT = Number(process.env.MANAGER_MIN_NET_ALERT_PCT || 5);
 const AUTO_PRICE_SYNC_INTERVAL_MIN = Math.max(15, Number(process.env.AUTO_PRICE_SYNC_INTERVAL_MIN || 60));
 const AUTO_PRICE_SYNC_DEFAULT = String(process.env.AUTO_PRICE_SYNC_DEFAULT || "false").toLowerCase() === "true";
+const PRICE_GUARD_DEFAULT = String(process.env.PRICE_GUARD_DEFAULT || "true").toLowerCase() !== "false";
+const PRICE_GUARD_INTERVAL_MIN = Math.max(5, Number(process.env.PRICE_GUARD_INTERVAL_MIN || 10));
+const PRICE_GUARD_BATCH = Math.max(10, Math.min(100, Number(process.env.PRICE_GUARD_BATCH || 50)));
+const PRICE_GUARD_MASS_DRIFT_COUNT = Math.max(10, Number(process.env.PRICE_GUARD_MASS_DRIFT_COUNT || 100));
 
 let militarisCache = {
   loadedAt: null,
@@ -49,10 +53,17 @@ let commissionCache = {
 let supplierSnapshot = new Map();
 let managerState = {
   autoPriceSync: AUTO_PRICE_SYNC_DEFAULT,
+  priceGuard: PRICE_GUARD_DEFAULT,
   lastAutoRun: null,
   lastAutoResult: null,
   lastSupplierChanges: null,
-  running: false
+  lastGuardRun: null,
+  lastGuardResult: null,
+  lastMassOverwriteDetected: null,
+  guardRuns: 0,
+  guardRepairs: 0,
+  running: false,
+  guardRunning: false
 };
 
 let manualMatches = new Map();       // Prom product ID -> supplier reference
@@ -205,7 +216,7 @@ async function refreshCommissionTable(force=false){
 
   try{
     const r=await fetch(PROM_COMMISSION_CSV_URL,{
-      headers:{"User-Agent":"PrimeTacPromAI/10.2"}
+      headers:{"User-Agent":"PrimeTacPromAI/11.0"}
     });
     if(!r.ok) throw new Error(`Prom commission CSV: HTTP ${r.status}`);
 
@@ -399,7 +410,7 @@ function normalizeItem(x){
   };
 }
 async function refreshMilitaris(){
-  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/10.2"}});
+  const r=await fetch(MILITARIS_XML_URL,{headers:{"User-Agent":"PrimeTacPromAI/11.0"}});
   if(!r.ok) throw new Error(`Militaris XML: HTTP ${r.status}`);
   const xml=await r.text();
   const parser=new XMLParser({
@@ -1311,40 +1322,81 @@ async function syncMarkupPriceItems(items){
   return results;
 }
 
-async function runManagerAutoPriceSync(){
-  if(managerState.running) return managerState.lastAutoResult;
-  managerState.running=true;
-  try{
-    if(!process.env.PROM_TOKEN || !WRITE_ENABLED){
-      managerState.lastAutoResult={ok:false,error:"PROM_TOKEN/WRITE_ENABLED не готовы"};
-      return managerState.lastAutoResult;
-    }
-    const before=supplierSnapshot.size?compareSupplierSnapshot():null;
-    await refreshMilitaris();
-    const changes=supplierSnapshot.size?compareSupplierSnapshot():before;
-    const data=await getCatalogReport(true);
-    const drift=data.report.filter(x=>x.matched&&x.buyPrice&&priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT)!==Number(x.promPrice||0));
-    const results=await syncMarkupPriceItems(drift);
-    supplierSnapshot=supplierSnapshotMap();
-    managerState.lastSupplierChanges=changes;
-    managerState.lastAutoRun=new Date().toISOString();
-    managerState.lastAutoResult={
-      ok:true,
-      checked:data.report.length,
-      drift:drift.length,
-      changed:results.filter(x=>x.ok).length,
-      errors:results.filter(x=>!x.ok).length,
-      supplierChanges:changes
-    };
-    return managerState.lastAutoResult;
-  }catch(e){
-    managerState.lastAutoResult={ok:false,error:e.message};
-    managerState.lastAutoRun=new Date().toISOString();
-    return managerState.lastAutoResult;
-  }finally{
-    managerState.running=false;
-  }
+
+function priceDriftRows(report){
+  return (report||[]).filter(x=>{
+    if(!x?.matched || !x?.buyPrice) return false;
+    const target=priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT);
+    const current=Number(x.promPrice||0);
+    return target && current!==target;
+  });
 }
+
+function guardDriftSummary(rows){
+  let raise=0,lower=0;
+  for(const x of rows||[]){
+    const target=priceForMarkup(Number(x.buyPrice),CATALOG_MARKUP_PCT);
+    const current=Number(x.promPrice||0);
+    if(target>current) raise++; else if(target<current) lower++;
+  }
+  return {count:(rows||[]).length,raise,lower};
+}
+
+async function syncMarkupPriceItemsBatched(items,batchSize=PRICE_GUARD_BATCH){
+  const out=[]; const list=[...(items||[])];
+  for(let i=0;i<list.length;i+=batchSize){
+    out.push(...await syncMarkupPriceItems(list.slice(i,i+batchSize)));
+    if(i+batchSize<list.length) await new Promise(r=>setTimeout(r,250));
+  }
+  return out;
+}
+
+async function runPriceGuard(reason="timer"){
+  if(managerState.guardRunning) return managerState.lastGuardResult;
+  if(!managerState.priceGuard) return {ok:false,disabled:true,reason:"Price Guard выключен"};
+  if(!process.env.PROM_TOKEN || !WRITE_ENABLED){
+    const result={ok:false,error:"PROM_TOKEN/WRITE_ENABLED не готовы",reason};
+    managerState.lastGuardResult=result; return result;
+  }
+  managerState.guardRunning=true; managerState.guardRuns++;
+  try{
+    await refreshMilitaris();
+    const data=await getCatalogReport(true);
+    const drift=priceDriftRows(data.report); const before=guardDriftSummary(drift);
+    if(before.count>=PRICE_GUARD_MASS_DRIFT_COUNT){
+      managerState.lastMassOverwriteDetected={at:new Date().toISOString(),count:before.count,raise:before.raise,lower:before.lower,reason};
+    }
+    const results=drift.length?await syncMarkupPriceItemsBatched(drift):[];
+    const verify=await getCatalogReport(true); const left=priceDriftRows(verify.report); const after=guardDriftSummary(left);
+    const changed=results.filter(x=>x.ok).length, errors=results.filter(x=>!x.ok).length;
+    managerState.guardRepairs+=changed; managerState.lastGuardRun=new Date().toISOString();
+    const result={ok:true,reason,checked:verify.report.length,driftBefore:before.count,raiseBefore:before.raise,lowerBefore:before.lower,repaired:changed,errors,driftLeft:after.count,raiseLeft:after.raise,lowerLeft:after.lower,massOverwrite:before.count>=PRICE_GUARD_MASS_DRIFT_COUNT,markupPct:CATALOG_MARKUP_PCT};
+    managerState.lastGuardResult=result; return result;
+  }catch(e){
+    const result={ok:false,reason,error:e.message}; managerState.lastGuardRun=new Date().toISOString(); managerState.lastGuardResult=result; return result;
+  }finally{managerState.guardRunning=false;}
+}
+
+async function runManagerAutoPriceSync(){
+  return runPriceGuard("legacy-auto-sync");
+}
+
+
+app.get("/api/manager/price-guard/status",requirePromToken,(req,res)=>{
+  res.json({ok:true,enabled:managerState.priceGuard,intervalMinutes:PRICE_GUARD_INTERVAL_MIN,batchSize:PRICE_GUARD_BATCH,massDriftThreshold:PRICE_GUARD_MASS_DRIFT_COUNT,lastRun:managerState.lastGuardRun,lastResult:managerState.lastGuardResult,lastMassOverwriteDetected:managerState.lastMassOverwriteDetected,runs:managerState.guardRuns,repairedTotal:managerState.guardRepairs,markupPct:CATALOG_MARKUP_PCT});
+});
+
+app.post("/api/manager/price-guard",requirePromToken,requireWritePin,async(req,res)=>{
+  if(req.body?.enabled!=null) managerState.priceGuard=req.body.enabled!==false;
+  let result=null; if(req.body?.runNow===true && managerState.priceGuard) result=await runPriceGuard("manual");
+  res.json({ok:true,enabled:managerState.priceGuard,intervalMinutes:PRICE_GUARD_INTERVAL_MIN,result,lastRun:managerState.lastGuardRun,lastResult:managerState.lastGuardResult});
+});
+
+app.post("/api/manager/emergency-restore-prices",requirePromToken,requireWritePin,async(req,res)=>{
+  managerState.priceGuard=true;
+  const result=await runPriceGuard("emergency-restore");
+  res.json({ok:true,result});
+});
 
 app.get("/api/manager/today",requirePromToken,async(req,res)=>{
   try{
@@ -1361,12 +1413,8 @@ app.get("/api/manager/today",requirePromToken,async(req,res)=>{
       minNetAlertPct:MANAGER_MIN_NET_ALERT_PCT,
       summary:managerSummary(audit),
       supplierSnapshot:snapshot,
-      autoPriceSync:{
-        enabled:managerState.autoPriceSync,
-        intervalMinutes:AUTO_PRICE_SYNC_INTERVAL_MIN,
-        lastRun:managerState.lastAutoRun,
-        lastResult:managerState.lastAutoResult
-      },
+      priceGuard:{enabled:managerState.priceGuard,intervalMinutes:PRICE_GUARD_INTERVAL_MIN,lastRun:managerState.lastGuardRun,lastResult:managerState.lastGuardResult,massOverwrite:managerState.lastMassOverwriteDetected,runs:managerState.guardRuns,repairedTotal:managerState.guardRepairs},
+      autoPriceSync:{enabled:managerState.autoPriceSync,intervalMinutes:AUTO_PRICE_SYNC_INTERVAL_MIN,lastRun:managerState.lastAutoRun,lastResult:managerState.lastAutoResult},
       supplierOnlyCount:supplierOnly.length,
       supplierOnly,
       manualMatchState:{
@@ -1625,8 +1673,10 @@ app.get("/api/health",(req,res)=>{
       markupPct:CATALOG_MARKUP_PCT,
       minNetAlertPct:MANAGER_MIN_NET_ALERT_PCT,
       autoPriceSync:managerState.autoPriceSync,
+      priceGuard:managerState.priceGuard,
+      guardIntervalMinutes:PRICE_GUARD_INTERVAL_MIN,
       intervalMinutes:AUTO_PRICE_SYNC_INTERVAL_MIN,
-      lastRun:managerState.lastAutoRun
+      lastRun:managerState.lastGuardRun||managerState.lastAutoRun
     }
   });
 });
@@ -2554,4 +2604,8 @@ setInterval(async()=>{
   }
 }, AUTO_PRICE_SYNC_INTERVAL_MIN*60*1000);
 
-app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v10.2 running on ${PORT}`));
+setInterval(async()=>{
+  if(managerState.priceGuard) await runPriceGuard("timer");
+}, PRICE_GUARD_INTERVAL_MIN*60*1000);
+
+app.listen(PORT,"0.0.0.0",()=>console.log(`PrimeTac Prom AI v11 running on ${PORT}`));
