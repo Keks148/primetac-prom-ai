@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Prom AI v10.1</title>
+<title>PrimeTac Prom AI v10.2</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;background:#111;color:#eee}
 .wrap{max-width:1250px;margin:auto;padding:14px}
@@ -58,11 +58,17 @@ pre{white-space:pre-wrap;background:#0a0a0a;padding:12px;border-radius:10px;over
 .manager-log{max-height:360px;overflow:auto;background:#0b0b0b;border:1px solid #333;border-radius:10px;padding:10px}
 details{border-top:1px solid #333;padding-top:7px;margin-top:7px}
 summary{cursor:pointer;font-weight:700}
+
+.match-candidate{border:1px solid #3a3a3a;border-radius:10px;padding:9px;margin:8px 0;background:#121212}
+.match-candidate.best{border-color:#4d7255}
+.match-actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:8px}
+.match-result{border:1px solid #4d7255;background:#122016;border-radius:10px;padding:10px;margin-top:8px}
+.match-skipped{opacity:.65}
 </style>
 </head>
 <body>
 <div class="wrap">
-<h1>PrimeTac Prom AI <span class="muted">v10.1</span></h1>
+<h1>PrimeTac Prom AI <span class="muted">v10.2</span></h1>
 <div class="muted">Панель прибыли: Prom + Militaris + AI + продажи</div>
 
 <div class="bar">
@@ -104,7 +110,7 @@ summary{cursor:pointer;font-weight:700}
 </select>
 </div>
 <div class="muted small" style="margin-top:8px">
-v10.1: основное правило = закупка Militaris +20%. Чистая маржа после Econom — отдельная аналитика, а не команда поднять весь каталог.
+v10.2: ручной match для несопоставленных товаров + резервная копия подтверждений в браузере. Цена остаётся закупка Militaris +20%.
 </div>
 </div>
 
@@ -912,7 +918,7 @@ async function openManager(force=false){
        <div class="manager-stat"><span class="muted">Цена съехала</span><b class="${s.priceDrift?'bad':'good'}">${s.priceDrift||0}</b></div>
        <div class="manager-stat"><span class="muted">Нет у поставщика</span><b class="${s.supplierOut?'bad':'good'}">${s.supplierOut||0}</b></div>
        <div class="manager-stat"><span class="muted">Вернулись в наличие</span><b class="${s.backInStock?'warn':'good'}">${s.backInStock||0}</b></div>
-       <div class="manager-stat"><span class="muted">Без match</span><b class="warn">${s.unmatched||0}</b></div>
+       <div class="manager-stat"><span class="muted">Без match</span><b class="warn">${s.unmatched||0}</b><span class="muted small">разобрать ${s.unresolvedMatch??s.unmatched??0}</span></div>
        <div class="manager-stat"><span class="muted">Описание</span><b>${s.descriptions||0}</b></div>
        <div class="manager-stat"><span class="muted">Название</span><b>${s.names||0}</b></div>
        <div class="manager-stat"><span class="muted">Характеристики</span><b>${s.characteristics||0}</b></div>
@@ -1072,18 +1078,211 @@ async function managerFixCards(){
  if(box) box.innerHTML+=`<div><b>Готово: ${ok} изменено · ${skip} пропущено · ${err} ошибок</b></div>`;
 }
 
+const MANUAL_MATCH_BACKUP_KEY="primetac_manual_match_state_v102";
+
+function matchBackupSave(state){
+ try{
+   if(state) localStorage.setItem(MANUAL_MATCH_BACKUP_KEY,JSON.stringify(state));
+ }catch{}
+}
+
+function matchBackupLoad(){
+ try{
+   const raw=localStorage.getItem(MANUAL_MATCH_BACKUP_KEY);
+   return raw?JSON.parse(raw):null;
+ }catch{return null}
+}
+
+function getMatchPin(){
+ if(window.MATCH_PIN) return window.MATCH_PIN;
+ const p=prompt("WRITE_PIN для подтверждения match");
+ if(p) window.MATCH_PIN=p;
+ return p||"";
+}
+
+function matchCandidateHtml(productId,s,index){
+ return `<div class="match-candidate ${index===0?"best":""}" data-match-key="${esc(s.supplierKey)}">
+   <b>${esc(s.name)}</b><br>
+   <span class="muted small">${esc(s.brand||"")} · ${money(s.price)} · score ${s.score} · SKU ${esc(s.sku||"—")}</span>
+   ${s.available===false?'<br><span class="tag bad">Сейчас нет у поставщика</span>':""}
+   <div class="match-actions">
+     <button onclick="confirmManualMatch('${esc(productId)}','${esc(s.supplierKey)}')">✅ Это тот товар</button>
+     <button onclick="rejectManualMatch('${esc(productId)}','${esc(s.supplierKey)}')">❌ Не этот</button>
+   </div>
+ </div>`;
+}
+
+function unmatchedCardHtml(x){
+ return `<div class="card" id="unmatched-${esc(x.productId)}">
+   <b>${esc(x.name)}</b><br>
+   <span class="muted small">Prom ${money(x.price)} · ID ${esc(x.productId)}</span>
+   <div id="candidates-${esc(x.productId)}">
+     ${(x.suggestions||[]).length
+       ? (x.suggestions||[]).map((s,i)=>matchCandidateHtml(String(x.productId),s,i)).join("")
+       : '<div class="muted" style="margin-top:8px">Подходящих кандидатов пока не найдено.</div>'}
+   </div>
+   <div class="match-actions">
+     ${x.hasMore?`<button id="more-${esc(x.productId)}" onclick="moreManualCandidates('${esc(x.productId)}',${(x.suggestions||[]).length})">🔎 Показать ещё</button>`:""}
+     <button onclick="markManualNoMatch('${esc(x.productId)}')">⏭ В Militaris такого товара нет</button>
+     <button onclick="openEditorFor('${esc(x.productId)}')">Открыть товар</button>
+   </div>
+ </div>`;
+}
+
 async function managerUnmatched(){
  $("#content").innerHTML='<div class="card">Ищу кандидатов для несопоставленных товаров…</div>';
  try{
-   const d=await j("/api/manager/unmatched");
-   $("#content").innerHTML=`<div class="card"><b>Без match: ${d.count}</b><div class="muted small">Это подсказки, а не автоматическое сопоставление. Лучше пропустить товар, чем привязать неправильную закупку.</div></div>`+
-   (d.rows||[]).map(x=>`<div class="card"><b>${esc(x.name)}</b><br><span class="muted small">Prom ${money(x.price)} · ID ${esc(x.productId)}</span>
-     <details><summary>Кандидаты Militaris</summary>
-       ${(x.suggestions||[]).length?(x.suggestions||[]).map(s=>`<div style="padding:7px 0;border-bottom:1px solid #333"><b>${esc(s.name)}</b><br><span class="muted small">${esc(s.brand||"")} · ${money(s.price)} · score ${s.score} · SKU ${esc(s.sku||"—")}</span></div>`).join(""):'<div class="muted">Надёжных кандидатов не найдено.</div>'}
-     </details>
-     <button style="margin-top:8px" onclick="openEditorFor('${esc(x.productId)}')">Открыть товар</button>
-   </div>`).join("");
+   const d=await j("/api/manager/unmatched?limit=3");
+   const backup=matchBackupLoad();
+
+   $("#content").innerHTML=`<div class="card">
+     <b>Без match: ${d.count}</b><br>
+     <span class="tag warn">Осталось разобрать: ${d.unresolved}</span>
+     <span class="tag">Пропущено вручную: ${d.manuallySkipped||0}</span>
+     <span class="tag good">Подтверждено вручную: ${d.manualState?.matches||0}</span>
+     <div class="muted small" style="margin-top:7px">Нажимай «Это тот товар» только когда модель действительно совпадает. После подтверждения сразу увидишь закупку и правильную цену +20%.</div>
+     ${backup?'<button style="margin-top:8px" onclick="restoreManualMatchBackup()">↩ Восстановить сохранённые подтверждения</button>':""}
+   </div>`+
+   ((d.rows||[]).map(unmatchedCardHtml).join("") || '<div class="card good">Все доступные товары разобраны.</div>');
  }catch(e){$("#content").innerHTML=`<div class="card bad">${esc(e.message)}</div>`}
+}
+
+async function matchPost(url,body){
+ const pin=getMatchPin();
+ if(!pin) throw new Error("WRITE_PIN не введён");
+ const r=await fetch(url,{
+   method:"POST",
+   headers:{"Content-Type":"application/json","x-write-pin":pin},
+   body:JSON.stringify(body||{})
+ });
+ const raw=await r.text();let d={};
+ try{d=raw?JSON.parse(raw):{}}catch{}
+ if(!r.ok) throw new Error(d.error||raw.slice(0,180)||`HTTP ${r.status}`);
+ if(d.state) matchBackupSave(d.state);
+ return d;
+}
+
+async function confirmManualMatch(productId,supplierKey){
+ const card=document.getElementById(`unmatched-${productId}`);
+ try{
+   if(card) card.insertAdjacentHTML("afterbegin",'<div class="muted small">Проверяю выбранный match…</div>');
+   const d=await matchPost("/api/manager/match/confirm",{productId,supplierKey});
+   const r=d.result||{};
+
+   if(card){
+     card.innerHTML=`<div class="match-result">
+       <b class="good">✅ Match подтверждён</b><br>
+       <b>${esc(d.supplier?.name||"")}</b>
+       <div class="row" style="margin-top:7px">
+         <span class="tag">Цена поставщика ${money(d.supplier?.price)}</span>
+         <span class="tag">Скидка ${r.discountPct??"—"}%</span>
+         <span class="tag">Закупка ${money(r.buyPrice)}</span>
+         <span class="tag good">Prom +20%: ${money(r.targetPrice)}</span>
+         <span class="tag">Econom ${r.economCommissionPct??"—"}%</span>
+         <span class="tag ${Number(r.projectedNetProfit||0)>0?"good":"bad"}">Чистая прибыль ${money(r.projectedNetProfit)}</span>
+         <span class="tag">Чистая маржа ${r.projectedNetMarginPct??"—"}%</span>
+       </div>
+       <div class="match-actions">
+         <button onclick="applyMatchedPrice('${esc(productId)}')">💰 Применить цену +20% в Prom</button>
+         <button onclick="managerUnmatched()">Следующий товар →</button>
+       </div>
+     </div>`;
+   }
+ }catch(e){
+   alert(e.message);
+   if(card) managerUnmatched();
+ }
+}
+
+async function applyMatchedPrice(productId){
+ const pin=getMatchPin();
+ if(!pin) return;
+ try{
+   const r=await fetch("/api/manager/sync-prices",{
+     method:"POST",
+     headers:{"Content-Type":"application/json","x-write-pin":pin},
+     body:JSON.stringify({productIds:[productId]})
+   });
+   const raw=await r.text();let d={};try{d=JSON.parse(raw)}catch{}
+   if(!r.ok) throw new Error(d.error||raw.slice(0,180));
+   alert(d.changed?`Цена изменена. Товар теперь по правилу +20%.`:`Цена уже была правильной.`);
+   managerUnmatched();
+ }catch(e){alert(e.message)}
+}
+
+async function rejectManualMatch(productId,supplierKey){
+ try{
+   await matchPost("/api/manager/match/reject",{productId,supplierKey});
+   await reloadOneUnmatched(productId,0);
+ }catch(e){alert(e.message)}
+}
+
+async function markManualNoMatch(productId){
+ if(!confirm("Отметить, что соответствующего товара в XML Militaris нет? Его можно будет восстановить из резервной копии/сбросить позже.")) return;
+ try{
+   await matchPost("/api/manager/match/no-match",{productId});
+   const card=document.getElementById(`unmatched-${productId}`);
+   if(card){
+     card.classList.add("match-skipped");
+     card.innerHTML='<b>⏭ Пропущено: соответствия в Militaris нет</b><br><button style="margin-top:8px" onclick="managerUnmatched()">Продолжить →</button>';
+   }
+ }catch(e){alert(e.message)}
+}
+
+async function reloadOneUnmatched(productId,offset=0){
+ try{
+   const d=await j(`/api/manager/unmatched?productId=${encodeURIComponent(productId)}&limit=3&offset=${offset}`);
+   const x=d.rows?.[0];
+   const card=document.getElementById(`unmatched-${productId}`);
+   if(card){
+     if(x) card.outerHTML=unmatchedCardHtml(x);
+     else card.remove();
+   }
+ }catch(e){alert(e.message)}
+}
+
+async function moreManualCandidates(productId,offset){
+ const box=document.getElementById(`candidates-${productId}`);
+ const btn=document.getElementById(`more-${productId}`);
+ try{
+   if(btn) btn.disabled=true;
+   const d=await j(`/api/manager/unmatched?productId=${encodeURIComponent(productId)}&limit=5&offset=${offset}`);
+   const x=d.rows?.[0];
+   if(!x) return;
+   if(box){
+     box.insertAdjacentHTML("beforeend",(x.suggestions||[]).map((s,i)=>matchCandidateHtml(productId,s,offset+i)).join(""));
+   }
+   if(btn){
+     if(x.hasMore){
+       btn.disabled=false;
+       btn.setAttribute("onclick",`moreManualCandidates('${productId}',${offset+(x.suggestions||[]).length})`);
+     }else{
+       btn.remove();
+     }
+   }
+ }catch(e){
+   if(btn) btn.disabled=false;
+   alert(e.message);
+ }
+}
+
+async function restoreManualMatchBackup(){
+ const state=matchBackupLoad();
+ if(!state){alert("Локальной резервной копии нет.");return;}
+ const pin=getMatchPin();
+ if(!pin) return;
+ try{
+   const r=await fetch("/api/manager/manual-state/restore",{
+     method:"POST",
+     headers:{"Content-Type":"application/json","x-write-pin":pin},
+     body:JSON.stringify({state})
+   });
+   const raw=await r.text();let d={};try{d=JSON.parse(raw)}catch{}
+   if(!r.ok) throw new Error(d.error||raw.slice(0,180));
+   matchBackupSave(d.state);
+   alert("Подтверждённые match восстановлены на сервере.");
+   managerUnmatched();
+ }catch(e){alert(e.message)}
 }
 
 async function managerAvailability(){
