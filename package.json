@@ -1,6 +1,6 @@
 {
-  "name": "primetac-seo-auto-v13",
-  "version": "1.3.0",
+  "name": "primetac-ua-keywords-test-v14",
+  "version": "1.4.0",
   "private": true,
   "main": "server.js",
   "scripts": {
