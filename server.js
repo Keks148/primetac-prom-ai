@@ -14,6 +14,8 @@ const MAX_PRODUCTS = Math.max(100, Number(process.env.MAX_PRODUCTS || 5000));
 const KEYWORD_MIN = Math.max(3, Math.min(7, Number(process.env.KEYWORD_MIN || 5)));
 const SCAN_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.SCAN_CONCURRENCY || 5)));
 const BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.BATCH_SIZE || 25)));
+const FIX_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.FIX_CONCURRENCY || 2)));
+const VERIFY_DELAY_MS = Math.max(300, Number(process.env.VERIFY_DELAY_MS || 700));
 
 const API_HOST = 'my.prom.ua';
 const API_PREFIX = '/api/v1';
@@ -37,7 +39,9 @@ let fixState = {
   processed: 0,
   verified: 0,
   failed: 0,
-  errors: []
+  errors: [],
+  mode: null,
+  stop_requested: false
 };
 
 function norm(v){ return String(v || '').replace(/\s+/g, ' ').trim(); }
@@ -584,7 +588,7 @@ async function fixUaKeywordsForProduct(id){
   if(typeof before.description === 'string') payload.description = before.description;
 
   await promRequest('PUT', '/products/translation', payload);
-  await new Promise(r => setTimeout(r, 700));
+  await new Promise(r => setTimeout(r, VERIFY_DELAY_MS));
 
   const after = await getTranslation(id, 'uk');
   const afterKeywords = parseKeywords(after.keywords);
@@ -603,12 +607,15 @@ async function fixUaKeywordsForProduct(id){
   };
 }
 
-async function startBatchFix(limit=BATCH_SIZE){
+async function startBatchFix(limit=BATCH_SIZE, mode='batch'){
   if(fixState.running) return;
 
-  const candidates = (scanState.rows || [])
-    .filter(r => r && !r.__error && r.safe?.can_fix_ua_keywords)
-    .slice(0, limit);
+  const allCandidates = (scanState.rows || [])
+    .filter(r => r && !r.__error && r.safe?.can_fix_ua_keywords);
+
+  const candidates = limit === 'all'
+    ? allCandidates
+    : allCandidates.slice(0, Math.max(1, Number(limit || BATCH_SIZE)));
 
   fixState = {
     running: true,
@@ -618,39 +625,65 @@ async function startBatchFix(limit=BATCH_SIZE){
     processed: 0,
     verified: 0,
     failed: 0,
-    errors: []
+    errors: [],
+    mode,
+    stop_requested: false
   };
 
   try{
-    for(const row of candidates){
-      try{
-        const result = await fixUaKeywordsForProduct(row.id);
-        fixState.processed++;
+    let cursor = 0;
 
-        if(result.verified) fixState.verified++;
-        else if(!result.skipped){
+    async function worker(){
+      while(true){
+        if(fixState.stop_requested) break;
+
+        const i = cursor++;
+        if(i >= candidates.length) break;
+
+        const row = candidates[i];
+
+        try{
+          const result = await fixUaKeywordsForProduct(row.id);
+          fixState.processed++;
+
+          if(result.verified || result.skipped){
+            fixState.verified++;
+          }else{
+            fixState.failed++;
+            fixState.errors.push({
+              id: row.id,
+              name: row.name,
+              error: 'Prom не подтвердил новые UA keywords'
+            });
+          }
+
+          // Обновляем строку сразу после каждого товара
+          const idx = scanState.rows.findIndex(r => r && String(r.id) === String(row.id));
+          if(idx >= 0){
+            try{
+              const p = await getProduct(row.id) || { id: row.id, name: row.name };
+              const ua = await getTranslation(row.id, 'uk');
+              scanState.rows[idx] = buildAudit(p, ua && !ua.__error ? ua : null);
+            }catch(_){}
+          }
+        }catch(e){
+          fixState.processed++;
           fixState.failed++;
-          fixState.errors.push({ id: row.id, name: row.name, error: 'Prom не подтвердил новые UA keywords' });
+          fixState.errors.push({
+            id: row.id,
+            name: row.name,
+            error: e.message || String(e)
+          });
         }
-      }catch(e){
-        fixState.processed++;
-        fixState.failed++;
-        fixState.errors.push({ id: row.id, name: row.name, error: e.message || String(e) });
       }
     }
 
-    // Обновляем только обработанные строки в кеше
-    const ids = new Set(candidates.map(x => String(x.id)));
-    for(let i=0;i<scanState.rows.length;i++){
-      const row = scanState.rows[i];
-      if(!row || !ids.has(String(row.id))) continue;
-
-      try{
-        const p = await getProduct(row.id) || { id: row.id, name: row.name };
-        const ua = await getTranslation(row.id, 'uk');
-        scanState.rows[i] = buildAudit(p, ua && !ua.__error ? ua : null);
-      }catch(_){}
-    }
+    await Promise.all(
+      Array.from(
+        { length: Math.min(FIX_CONCURRENCY, Math.max(1, candidates.length)) },
+        worker
+      )
+    );
 
     scanState.summary = summarize(scanState.rows);
   }finally{
@@ -664,14 +697,14 @@ const html = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Card Manager v1.6</title>
+<title>PrimeTac Card Manager v1.7 MASS</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.6</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.7 MASS</span></h2>
 <div class="m">Рабочая запись UA keywords встроена. Остальные поля пока только проверяются и рекомендуются, чтобы не испортить категорийные характеристики Prom.</div>
 
 <div class="c">
@@ -836,8 +869,11 @@ async function refresh(){
       document.getElementById('statusText').textContent='Готово. Проверено '+DATA.summary.valid+' товаров.';
     }
 
-    document.getElementById('fix25').disabled=
-      !DATA.summary || !DATA.summary.need_safe_fix || d.scan.running || d.fix.running;
+    const disabled = !DATA.summary || !DATA.summary.need_safe_fix || d.scan.running || d.fix.running;
+    document.getElementById('fix25').disabled=disabled;
+    document.getElementById('fix100').disabled=disabled;
+    document.getElementById('fixAll').disabled=disabled;
+    document.getElementById('stopFix').disabled=!d.fix.running;
 
     if(d.fix.started_at){
       document.getElementById('fixLog').textContent=
@@ -859,13 +895,46 @@ async function poll(){
   if(scanRunning || fixRunning) setTimeout(poll,1500);
 }
 
-async function fixBatch(){
-  if(!confirm('Безопасно дополнить украинские поисковые запросы у следующих ${BATCH_SIZE} товаров? Остальные поля не изменяются.'))return;
+async function fixBatch(limit){
+  if(!confirm('Безопасно дополнить украинские поисковые запросы у '+limit+' товаров? Другие поля не меняются.'))return;
   try{
-    await api('/api/fix/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:${BATCH_SIZE}})});
-    document.getElementById('statusText').textContent='Запущена безопасная обработка...';
+    await api('/api/fix/start',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({limit:limit,mode:'batch-'+limit})
+    });
+    document.getElementById('statusText').textContent='Запущена безопасная обработка '+limit+' товаров...';
     poll();
-  }catch(e){document.getElementById('statusText').textContent='Ошибка: '+e.message}
+  }catch(e){
+    document.getElementById('statusText').textContent='Ошибка: '+e.message;
+  }
+}
+
+async function fixAll(){
+  const n=DATA.summary?.need_safe_fix||0;
+  if(!n)return;
+  if(!confirm('Исправить ВСЕ '+n+' товаров, где нужно дополнить только UA поисковые запросы? Цены, названия, описания и характеристики НЕ меняются.'))return;
+  try{
+    await api('/api/fix/start',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({limit:'all',mode:'all-safe'})
+    });
+    document.getElementById('statusText').textContent='🚀 Запущена массовая безопасная обработка '+n+' товаров...';
+    poll();
+  }catch(e){
+    document.getElementById('statusText').textContent='Ошибка: '+e.message;
+  }
+}
+
+async function stopFix(){
+  try{
+    await api('/api/fix/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    document.getElementById('statusText').textContent='Запрошена остановка после текущих товаров...';
+    poll();
+  }catch(e){
+    document.getElementById('statusText').textContent='Ошибка остановки: '+e.message;
+  }
 }
 
 async function fixOne(id){
@@ -887,7 +956,7 @@ app.get('/', (_req,res) => res.type('html').send(html));
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.6',
+    app: 'PrimeTac Card Manager v1.7 MASS',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -907,9 +976,23 @@ app.post('/api/fix/start', (req,res) => {
   if(!WRITE_ENABLED) return res.status(400).json({ error:'WRITE_ENABLED=false' });
   if(fixState.running) return res.json({ ok:true, already_running:true });
 
-  const limit = Math.max(1, Math.min(50, Number(req.body?.limit || BATCH_SIZE)));
-  startBatchFix(limit).catch(()=>{});
-  res.json({ ok:true, started:true, limit });
+  const rawLimit = req.body?.limit;
+  const mode = String(req.body?.mode || 'batch');
+  let limit = rawLimit === 'all'
+    ? 'all'
+    : Math.max(1, Math.min(5000, Number(rawLimit || BATCH_SIZE)));
+
+  startBatchFix(limit, mode).catch(()=>{});
+  res.json({ ok:true, started:true, limit, mode });
+});
+
+app.post('/api/fix/stop', (_req,res) => {
+  if(!fixState.running){
+    return res.json({ ok:true, running:false, message:'Обработка уже остановлена' });
+  }
+
+  fixState.stop_requested = true;
+  res.json({ ok:true, running:true, stop_requested:true });
 });
 
 app.post('/api/fix/:id', async (req,res) => {
@@ -943,5 +1026,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.6 started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.7 MASS started on ${PORT}`);
 });
