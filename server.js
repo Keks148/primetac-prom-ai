@@ -1,22 +1,13 @@
 /**
- * PrimeTac Group — SEO AUTO ONLY
- * Полная замена старого PrimeTac Prom AI.
+ * PrimeTac Group — SEO AUTO ONLY v1.1 FIX
  *
- * ОСТАВЛЕНО ТОЛЬКО:
- * - подключение к Prom.ua
- * - проверка товаров
- * - автоматическое заполнение поисковых фраз
- * - ручной запуск из панели
+ * Исправлено:
+ * 1) Не считает [object Object] как заполненные ключевые слова.
+ * 2) Проверяет keywords / search_keywords / searchKeywords только если там реально строка/массив.
+ * 3) Проверяет errors и processed_ids в ответе Prom после /products/edit.
+ * 4) После записи делает повторную проверку каталога.
  *
- * УДАЛЕНО:
- * - +20% к цене
- * - Price Guard
- * - Militaris price logic
- * - BEZET price logic
- * - любые изменения цены/остатков/описаний/фото
- *
- * Важно: товары могут быть из BEZET, Militaris или любого другого импорта.
- * Модуль работает по уже существующим товарам в Prom.ua.
+ * Эта версия НЕ меняет цены, остатки, описания, фото, названия и поставщика.
  */
 
 'use strict';
@@ -42,167 +33,124 @@ let lastRun = null;
 let lastScan = null;
 
 // ------------------------------
-// Классификация товаров
+// Keyword parsing FIX
+// ------------------------------
+
+function parseKeywordValue(value) {
+  if (Array.isArray(value)) {
+    return value.flatMap(parseKeywordValue).filter(Boolean);
+  }
+
+  if (typeof value !== 'string') {
+    // КРИТИЧЕСКИЙ FIX:
+    // объект {}, null, number и т.п. НЕ считаем ключевыми словами.
+    return [];
+  }
+
+  return value
+    .split(/[,;\n]/u)
+    .map(x => x.trim())
+    .filter(Boolean);
+}
+
+function extractProductKeywords(product) {
+  // Проверяем все известные варианты поля. Не используем ??,
+  // потому что keywords может быть объектом и тогда ошибочно перекрывает search_keywords.
+  const candidates = [
+    product?.keywords,
+    product?.search_keywords,
+    product?.searchKeywords
+  ];
+
+  for (const candidate of candidates) {
+    const parsed = parseKeywordValue(candidate);
+    if (parsed.length) return parsed;
+  }
+
+  return [];
+}
+
+function keywordSource(product) {
+  const fields = [
+    ['keywords', product?.keywords],
+    ['search_keywords', product?.search_keywords],
+    ['searchKeywords', product?.searchKeywords]
+  ];
+
+  for (const [name, value] of fields) {
+    const parsed = parseKeywordValue(value);
+    if (parsed.length) return { field: name, type: Array.isArray(value) ? 'array' : typeof value, count: parsed.length };
+  }
+
+  const rawTypes = fields
+    .filter(([,v]) => v !== undefined)
+    .map(([name,v]) => `${name}:${Array.isArray(v) ? 'array' : typeof v}`)
+    .join(', ');
+
+  return { field: '', type: rawTypes || 'absent', count: 0 };
+}
+
+// ------------------------------
+// Rules
 // ------------------------------
 
 const TYPE_RULES = [
-  {
-    re: /\b(куртка|куртки|ветровка|вітровка|парка|анорак)\b/i,
-    generic: ['тактична куртка', 'чоловіча тактична куртка', 'військова куртка']
-  },
-  {
-    re: /\b(штани|брюки|pants|джогери|джоггеры)\b/i,
-    generic: ['тактичні штани', 'чоловічі тактичні штани', 'військові штани']
-  },
-  {
-    re: /\b(футболка|футболки|t-shirt|tshirt)\b/i,
-    generic: ['тактична футболка', 'чоловіча футболка', 'військова футболка']
-  },
-  {
-    re: /\b(поло|polo)\b/i,
-    generic: ['тактичне поло', 'чоловіче поло', 'військове поло']
-  },
-  {
-    re: /\b(худі|худи|hoodie)\b/i,
-    generic: ['тактичне худі', 'чоловіче худі', 'військове худі']
-  },
-  {
-    re: /\b(фліс|флис|фліска|флиска|fleece)\b/i,
-    generic: ['тактична фліска', 'флісова кофта', 'військова фліска']
-  },
-  {
-    re: /\b(кофта|світшот|свитшот|светр|свитер)\b/i,
-    generic: ['тактична кофта', 'чоловіча кофта', 'військова кофта']
-  },
-  {
-    re: /\b(сорочка|рубашка|ubacs|combat shirt)\b/i,
-    generic: ['тактична сорочка', 'військова сорочка', 'сорочка UBACS']
-  },
-  {
-    re: /\b(шорти|шорты|shorts)\b/i,
-    generic: ['тактичні шорти', 'чоловічі шорти', 'військові шорти']
-  },
-  {
-    re: /\b(термобілизна|термобелье|термокомплект)\b/i,
-    generic: ['тактична термобілизна', 'чоловіча термобілизна', 'військова термобілизна']
-  },
-  {
-    re: /\b(шкарпетки|носки|термошкарпетки)\b/i,
-    generic: ['тактичні шкарпетки', 'військові шкарпетки', 'термошкарпетки']
-  },
-  {
-    re: /\b(кепка|бейсболка|cap)\b/i,
-    generic: ['тактична кепка', 'військова кепка', 'чоловіча кепка']
-  },
-  {
-    re: /\b(панама|boonie)\b/i,
-    generic: ['тактична панама', 'військова панама', 'панама тактична']
-  },
-  {
-    re: /\b(шапка|beanie)\b/i,
-    generic: ['тактична шапка', 'військова шапка', 'чоловіча шапка']
-  },
-  {
-    re: /\b(балаклава|підшоломник|подшлемник)\b/i,
-    generic: ['тактична балаклава', 'військова балаклава', 'підшоломник тактичний']
-  },
-  {
-    re: /\b(рукавички|перчатки|gloves)\b/i,
-    generic: ['тактичні рукавички', 'військові рукавички', 'рукавички для військових']
-  },
-  {
-    re: /\b(кросівки|кроссовки|sneakers)\b/i,
-    generic: ['тактичні кросівки', 'військові кросівки', 'чоловічі тактичні кросівки']
-  },
-  {
-    re: /\b(черевики|ботинки|берці|берцы|boots)\b/i,
-    generic: ['тактичні черевики', 'військові черевики', 'берці тактичні']
-  },
-  {
-    re: /\b(рюкзак|backpack)\b/i,
-    generic: ['тактичний рюкзак', 'військовий рюкзак', 'рюкзак MOLLE']
-  },
-  {
-    re: /\b(сумка|баул|сумка-баул)\b/i,
-    generic: ['тактична сумка', 'військова сумка', 'сумка для спорядження']
-  },
-  {
-    re: /\b(пончо|дощовик|дождевик)\b/i,
-    generic: ['тактичне пончо', 'пончо дощовик', 'військовий дощовик']
-  },
-  {
-    re: /\b(ремінь|ремень|belt)\b/i,
-    generic: ['тактичний ремінь', 'військовий ремінь', 'чоловічий тактичний ремінь']
-  },
-  {
-    re: /\b(підсумок|подсумок|pouch)\b/i,
-    generic: ['тактичний підсумок', 'військовий підсумок', 'підсумок MOLLE']
-  },
-  {
-    re: /\b(плитоноска|plate carrier|плейт керріер|плейт керриер)\b/i,
-    generic: ['тактична плитоноска', 'військова плитоноска', 'плитоноска MOLLE']
-  },
-  {
-    re: /\b(бронежилет|бронежилети)\b/i,
-    generic: ['тактичний бронежилет', 'військовий бронежилет', 'бронежилет з MOLLE']
-  },
-  {
-    re: /\b(бронеплита|бронеплити|бронепластина)\b/i,
-    generic: ['бронеплита', 'бронеплита для бронежилета', 'військова бронеплита']
-  },
-  {
-    re: /\b(розвантаження|разгрузка|рпс|РПС)\b/i,
-    generic: ['тактична РПС', 'військова розвантажувальна система', 'тактичне розвантаження']
-  },
-  {
-    re: /\b(шолом|шлем|helmet)\b/i,
-    generic: ['тактичний шолом', 'військовий шолом', 'шолом для військових']
-  },
-  {
-    re: /\b(окуляри|очки|goggles)\b/i,
-    generic: ['тактичні окуляри', 'захисні окуляри', 'військові окуляри']
-  },
-  {
-    re: /\b(ліхтар|фонарь|фонарик|flashlight)\b/i,
-    generic: ['тактичний ліхтар', 'військовий ліхтар', 'ліхтар для спорядження']
-  },
-  {
-    re: /\b(спальник|спальний мішок|спальный мешок)\b/i,
-    generic: ['тактичний спальний мішок', 'військовий спальник', 'спальний мішок']
-  },
-  {
-    re: /\b(каремат|килимок|коврик)\b/i,
-    generic: ['тактичний каремат', 'військовий каремат', 'туристичний каремат']
-  },
-  {
-    re: /\b(намет|палатка)\b/i,
-    generic: ['тактичний намет', 'військовий намет', 'туристичний намет']
-  },
+  { re: /\b(куртка|куртки|ветровка|вітровка|парка|анорак)\b/i, generic: ['тактична куртка','чоловіча тактична куртка','військова куртка'] },
+  { re: /\b(штани|брюки|pants|джогери|джоггеры)\b/i, generic: ['тактичні штани','чоловічі тактичні штани','військові штани'] },
+  { re: /\b(футболка|футболки|t-shirt|tshirt)\b/i, generic: ['тактична футболка','чоловіча футболка','військова футболка'] },
+  { re: /\b(поло|polo)\b/i, generic: ['тактичне поло','чоловіче поло','військове поло'] },
+  { re: /\b(худі|худи|hoodie)\b/i, generic: ['тактичне худі','чоловіче худі','військове худі'] },
+  { re: /\b(фліс|флис|фліска|флиска|fleece)\b/i, generic: ['тактична фліска','флісова кофта','військова фліска'] },
+  { re: /\b(кофта|світшот|свитшот|светр|свитер)\b/i, generic: ['тактична кофта','чоловіча кофта','військова кофта'] },
+  { re: /\b(сорочка|рубашка|ubacs|combat shirt)\b/i, generic: ['тактична сорочка','військова сорочка','сорочка UBACS'] },
+  { re: /\b(шорти|шорты|shorts)\b/i, generic: ['тактичні шорти','чоловічі шорти','військові шорти'] },
+  { re: /\b(термобілизна|термобелье|термокомплект)\b/i, generic: ['тактична термобілизна','чоловіча термобілизна','військова термобілизна'] },
+  { re: /\b(шкарпетки|носки|термошкарпетки)\b/i, generic: ['тактичні шкарпетки','військові шкарпетки','термошкарпетки'] },
+  { re: /\b(кепка|бейсболка|cap)\b/i, generic: ['тактична кепка','військова кепка','чоловіча кепка'] },
+  { re: /\b(панама|boonie)\b/i, generic: ['тактична панама','військова панама','панама тактична'] },
+  { re: /\b(шапка|beanie)\b/i, generic: ['тактична шапка','військова шапка','чоловіча шапка'] },
+  { re: /\b(балаклава|підшоломник|подшлемник)\b/i, generic: ['тактична балаклава','військова балаклава','підшоломник тактичний'] },
+  { re: /\b(рукавички|перчатки|gloves)\b/i, generic: ['тактичні рукавички','військові рукавички','рукавички для військових'] },
+  { re: /\b(кросівки|кроссовки|sneakers)\b/i, generic: ['тактичні кросівки','військові кросівки','чоловічі тактичні кросівки'] },
+  { re: /\b(черевики|ботинки|берці|берцы|boots)\b/i, generic: ['тактичні черевики','військові черевики','берці тактичні'] },
+  { re: /\b(рюкзак|backpack)\b/i, generic: ['тактичний рюкзак','військовий рюкзак','рюкзак MOLLE'] },
+  { re: /\b(сумка|баул|сумка-баул)\b/i, generic: ['тактична сумка','військова сумка','сумка для спорядження'] },
+  { re: /\b(пончо|дощовик|дождевик)\b/i, generic: ['тактичне пончо','пончо дощовик','військовий дощовик'] },
+  { re: /\b(ремінь|ремень|belt)\b/i, generic: ['тактичний ремінь','військовий ремінь','чоловічий тактичний ремінь'] },
+  { re: /\b(підсумок|подсумок|pouch)\b/i, generic: ['тактичний підсумок','військовий підсумок','підсумок MOLLE'] },
+  { re: /\b(плитоноска|plate carrier|плейт керріер|плейт керриер)\b/i, generic: ['тактична плитоноска','військова плитоноска','плитоноска MOLLE'] },
+  { re: /\b(бронежилет|бронежилети)\b/i, generic: ['тактичний бронежилет','військовий бронежилет','бронежилет з MOLLE'] },
+  { re: /\b(бронеплита|бронеплити|бронепластина)\b/i, generic: ['бронеплита','бронеплита для бронежилета','військова бронеплита'] },
+  { re: /\b(розвантаження|разгрузка|рпс|РПС)\b/i, generic: ['тактична РПС','військова розвантажувальна система','тактичне розвантаження'] },
+  { re: /\b(шолом|шлем|helmet)\b/i, generic: ['тактичний шолом','військовий шолом','шолом для військових'] },
+  { re: /\b(окуляри|очки|goggles)\b/i, generic: ['тактичні окуляри','захисні окуляри','військові окуляри'] },
+  { re: /\b(ліхтар|фонарь|фонарик|flashlight)\b/i, generic: ['тактичний ліхтар','військовий ліхтар','ліхтар для спорядження'] },
+  { re: /\b(спальник|спальний мішок|спальный мешок)\b/i, generic: ['тактичний спальний мішок','військовий спальник','спальний мішок'] },
+  { re: /\b(каремат|килимок|коврик)\b/i, generic: ['тактичний каремат','військовий каремат','туристичний каремат'] },
+  { re: /\b(намет|палатка)\b/i, generic: ['тактичний намет','військовий намет','туристичний намет'] },
 ];
 
 const BRANDS = [
-  'BEZET', 'YINREN', 'Kiborg', 'KIBORG', 'Helikon-Tex', 'Helikon',
-  'Salomon', 'LOWA', 'Belleville', 'M-Tac', 'M-TAC', 'Mil-Tec',
-  'Pentagon', 'Defcon 5', 'ESDY', 'Walker', 'Tarkus', 'Ranger'
+  'BEZET','YINREN','Kiborg','KIBORG','Helikon-Tex','Helikon','Salomon','LOWA',
+  'Belleville','M-Tac','M-TAC','Mil-Tec','Pentagon','Defcon 5','ESDY','Walker','Tarkus','Ranger'
 ];
 
 const COLORS = [
-  ['чорн', 'чорний'], ['черн', 'чорний'], ['black', 'чорний'],
-  ['хакі', 'хакі'], ['хаки', 'хакі'], ['khaki', 'хакі'],
-  ['койот', 'койот'], ['coyote', 'койот'], ['tan', 'койот'],
-  ['олив', 'олива'], ['olive', 'олива'],
-  ['сір', 'сірий'], ['сер', 'сірий'], ['gray', 'сірий'], ['grey', 'сірий'],
-  ['піксел', 'піксель'], ['пиксел', 'піксель'],
-  ['мультикам', 'мультикам'], ['multicam', 'мультикам'],
-  ['помаранч', 'помаранчевий'], ['оранж', 'помаранчевий'],
-  ['беж', 'бежевий'],
-  ['син', 'синій'], ['navy', 'темно-синій'],
-  ['зел', 'зелений'], ['green', 'зелений']
+  ['чорн','чорний'],['черн','чорний'],['black','чорний'],
+  ['хакі','хакі'],['хаки','хакі'],['khaki','хакі'],
+  ['койот','койот'],['coyote','койот'],['tan','койот'],
+  ['олив','олива'],['olive','олива'],
+  ['сір','сірий'],['сер','сірий'],['gray','сірий'],['grey','сірий'],
+  ['піксел','піксель'],['пиксел','піксель'],
+  ['мультикам','мультикам'],['multicam','мультикам'],
+  ['помаранч','помаранчевий'],['оранж','помаранчевий'],
+  ['беж','бежевий'],['син','синій'],['navy','темно-синій'],
+  ['зел','зелений'],['green','зелений']
 ];
 
 const BANNED = new Set([
-  'купити', 'купить', 'замовити', 'заказать', 'доставка', 'україна', 'украина',
-  'акція', 'акция', 'дешево', 'кращий', 'лучший', 'новинка', 'топ'
+  'купити','купить','замовити','заказать','доставка','україна','украина',
+  'акція','акция','дешево','кращий','лучший','новинка','топ'
 ]);
 
 function norm(v) {
@@ -267,43 +215,21 @@ function generateKeywords(product) {
   const color = findColor(name);
   const result = [];
 
-  if (type) {
-    result.push(...type.generic);
-  }
+  if (type) result.push(...type.generic);
 
-  // Модель / название товара. Держим не длиннее 6 слов.
   const core = titleCore(name);
   const words = core.split(/\s+/).filter(Boolean);
-  if (words.length >= 2) {
-    result.push(words.slice(0, 6).join(' '));
-  }
+  if (words.length >= 2) result.push(words.slice(0, 6).join(' '));
 
-  if (type && brand) {
-    result.push(`${type.generic[0]} ${brand}`);
-  }
+  if (type && brand) result.push(`${type.generic[0]} ${brand}`);
+  if (type && color) result.push(`${type.generic[0]} ${color}`);
 
-  if (type && color) {
-    result.push(`${type.generic[0]} ${color}`);
-  }
+  if (/дем[іи]сезон/i.test(name) && /куртк/i.test(name)) result.push('демісезонна тактична куртка');
+  if (/зим/i.test(name) && /куртк/i.test(name)) result.push('зимова тактична куртка');
+  if (/літн|летн/i.test(name) && /(штани|брюк)/i.test(name)) result.push('літні тактичні штани');
+  if (/soft\s?shell|софтшел/i.test(name)) result.push('тактичний софтшел');
+  if (/rip[\s-]?stop|ріп[\s-]?стоп|рип[\s-]?стоп/i.test(name)) result.push('тактичний одяг rip stop');
 
-  // Уточнения, только если они реально есть в названии.
-  if (/дем[іи]сезон/i.test(name) && /куртк/i.test(name)) {
-    result.push('демісезонна тактична куртка');
-  }
-  if (/зим/i.test(name) && /куртк/i.test(name)) {
-    result.push('зимова тактична куртка');
-  }
-  if (/літн|летн/i.test(name) && /(штани|брюк)/i.test(name)) {
-    result.push('літні тактичні штани');
-  }
-  if (/soft\s?shell|софтшел/i.test(name)) {
-    result.push('тактичний софтшел');
-  }
-  if (/rip[\s-]?stop|ріп[\s-]?стоп|рип[\s-]?стоп/i.test(name)) {
-    result.push('тактичний одяг rip stop');
-  }
-
-  // Неизвестный тип: не оставляем товар совсем без ключей.
   if (!type) {
     if (words.length) result.push(words.slice(0, 5).join(' '));
     if (brand && words.length) result.push(`${words[0]} ${brand}`);
@@ -312,7 +238,6 @@ function generateKeywords(product) {
 
   let final = uniq(result).slice(0, 7);
 
-  // Prom лучше заполнять несколькими фразами.
   if (final.length < 3) {
     if (brand) final.push(`${brand} тактичний одяг`);
     final.push('тактичний одяг');
@@ -320,14 +245,6 @@ function generateKeywords(product) {
   }
 
   return final;
-}
-
-function keywordCount(value) {
-  if (Array.isArray(value)) return value.filter(Boolean).length;
-  return String(value || '')
-    .split(',')
-    .map(x => x.trim())
-    .filter(Boolean).length;
 }
 
 // ------------------------------
@@ -349,9 +266,7 @@ function promRequest(method, path, body = null) {
       'X-LANGUAGE': 'uk'
     };
 
-    if (payload) {
-      headers['Content-Length'] = Buffer.byteLength(payload);
-    }
+    if (payload) headers['Content-Length'] = Buffer.byteLength(payload);
 
     const request = https.request({
       hostname: PROM_HOST,
@@ -365,6 +280,7 @@ function promRequest(method, path, body = null) {
       response.setEncoding('utf8');
 
       response.on('data', chunk => raw += chunk);
+
       response.on('end', () => {
         let data = {};
 
@@ -378,9 +294,7 @@ function promRequest(method, path, body = null) {
           return resolve(data);
         }
 
-        const error = new Error(
-          `Prom API ${response.statusCode}: ${raw.slice(0, 1000)}`
-        );
+        const error = new Error(`Prom API ${response.statusCode}: ${raw.slice(0, 1000)}`);
         error.statusCode = response.statusCode;
         error.data = data;
         reject(error);
@@ -440,20 +354,27 @@ async function loadAllProducts() {
   return products;
 }
 
+function hasPromEditErrors(errors) {
+  if (!errors) return false;
+  if (typeof errors === 'string') return errors.trim().length > 0;
+  if (Array.isArray(errors)) return errors.length > 0;
+  if (typeof errors === 'object') return Object.keys(errors).length > 0;
+  return Boolean(errors);
+}
+
 async function editBatch(items) {
-  if (!items.length) return {};
+  if (!items.length) return { processed_ids: [] };
 
-  // Основной формат Prom API.
-  try {
-    return await promRequest('POST', '/products/edit', items);
-  } catch (firstError) {
-    // Совместимость: некоторые реализации принимают обёртку.
-    if (![400, 422].includes(firstError.statusCode)) {
-      throw firstError;
-    }
+  const result = await promRequest('POST', '/products/edit', items);
 
-    return await promRequest('POST', '/products/edit', { products: items });
+  if (hasPromEditErrors(result?.errors)) {
+    const error = new Error('Prom вернул ошибки при редактировании');
+    error.statusCode = 400;
+    error.data = result;
+    throw error;
   }
+
+  return result;
 }
 
 async function applyInBatches(edits) {
@@ -469,19 +390,48 @@ async function applyInBatches(edits) {
     const batch = edits.slice(i, i + batchSize);
 
     try {
-      await editBatch(batch);
-      result.changed += batch.length;
+      const response = await editBatch(batch);
+      const processed = Array.isArray(response?.processed_ids)
+        ? response.processed_ids.map(String)
+        : [];
+
+      // Если processed_ids есть — считаем только реально обработанные.
+      if (processed.length) {
+        const processedSet = new Set(processed);
+        for (const item of batch) {
+          if (processedSet.has(String(item.id))) {
+            result.changed++;
+          } else {
+            result.failed++;
+            result.errors.push({ id: item.id, error: 'Prom не подтвердил id в processed_ids' });
+          }
+        }
+      } else {
+        // Некоторые ответы Prom не содержат processed_ids.
+        // Тогда 2xx без errors считаем успешным, но ниже будет повторный scan.
+        result.changed += batch.length;
+      }
     } catch (batchError) {
-      // Если один товар сломал пакет, пробуем по одному.
+      // При ошибке пакета пробуем по одному, чтобы увидеть конкретные проблемные товары.
       for (const item of batch) {
         try {
-          await editBatch([item]);
-          result.changed++;
+          const response = await editBatch([item]);
+          const processed = Array.isArray(response?.processed_ids)
+            ? response.processed_ids.map(String)
+            : [];
+
+          if (!processed.length || processed.includes(String(item.id))) {
+            result.changed++;
+          } else {
+            result.failed++;
+            result.errors.push({ id: item.id, error: 'Prom не подтвердил обработку товара' });
+          }
         } catch (error) {
           result.failed++;
           result.errors.push({
             id: item.id,
-            error: String(error.message || error).slice(0, 400)
+            error: String(error.message || error).slice(0, 400),
+            prom: error.data || null
           });
         }
       }
@@ -492,38 +442,37 @@ async function applyInBatches(edits) {
 }
 
 // ------------------------------
-// SEO scan / auto apply
+// SEO scan
 // ------------------------------
 
 async function scanProducts() {
   const products = await loadAllProducts();
 
   const missing = [];
-  const weak = [];
   let withKeywords = 0;
+  let weirdKeywordField = 0;
 
   for (const product of products) {
-    const count = keywordCount(product.keywords);
+    const currentKeywords = extractProductKeywords(product);
+    const src = keywordSource(product);
 
-    if (count === 0) {
+    if (src.count === 0 && src.type !== 'absent') {
+      // Поле существует, но это был object/null/пустой массив и т.п.
+      weirdKeywordField++;
+    }
+
+    if (currentKeywords.length === 0) {
       const keywords = generateKeywords(product);
 
       missing.push({
         id: product.id,
         name: product.name,
         keywords,
-        keywords_string: keywords.join(', ')
+        keywords_string: keywords.join(', '),
+        raw_keyword_type: src.type
       });
     } else {
       withKeywords++;
-      if (count < 3) {
-        weak.push({
-          id: product.id,
-          name: product.name,
-          current_keywords: product.keywords,
-          count
-        });
-      }
     }
   }
 
@@ -532,7 +481,7 @@ async function scanProducts() {
     total: products.length,
     with_keywords: withKeywords,
     missing: missing.length,
-    weak: weak.length
+    weird_keyword_field: weirdKeywordField
   };
 
   return {
@@ -551,35 +500,41 @@ async function runSeoAuto(source = 'manual') {
   }
 
   if (!WRITE_ENABLED) {
-    throw new Error(
-      'WRITE_ENABLED=false. В Render Environment поставь WRITE_ENABLED=true'
-    );
+    throw new Error('WRITE_ENABLED=false. В Render Environment поставь WRITE_ENABLED=true');
   }
 
   running = true;
 
   try {
-    const scan = await scanProducts();
+    const before = await scanProducts();
 
-    // Меняем ТОЛЬКО товары без ключей.
-    const edits = scan.rows.map(row => ({
-      id: row.id,
-      keywords: row.keywords_string
+    const edits = before.rows.map(row => ({
+      id: Number(row.id),
+      keywords: row.keywords_string.slice(0, 1024)
     }));
 
     const applied = await applyInBatches(edits);
 
+    // Короткая пауза и повторная проверка данных API.
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    const after = await scanProducts();
+
+    const verifiedAdded = Math.max(0, before.missing - after.missing);
+
     lastRun = {
       at: new Date().toISOString(),
       source,
-      scanned: scan.total,
+      scanned: before.total,
+      before_missing: before.missing,
       planned: edits.length,
-      changed: applied.changed,
+      api_reported_changed: applied.changed,
+      verified_added: verifiedAdded,
+      after_missing: after.missing,
       failed: applied.failed,
       errors: applied.errors
     };
 
-    console.log('[SEO AUTO]', lastRun);
+    console.log('[SEO AUTO v1.1]', lastRun);
     return lastRun;
   } finally {
     running = false;
@@ -595,58 +550,37 @@ const dashboardHtml = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac SEO Auto</title>
+<title>PrimeTac SEO Auto v1.1</title>
 <style>
 :root{
   color-scheme:dark;
-  --bg:#0d100e;
-  --card:#151b17;
-  --line:#29332d;
-  --text:#eff5ef;
-  --muted:#95a098;
-  --green:#8fcf77;
-  --amber:#e2bb68;
-  --red:#ff8d83;
+  --bg:#0d100e;--card:#151b17;--line:#29332d;--text:#eff5ef;
+  --muted:#95a098;--green:#8fcf77;--amber:#e2bb68;--red:#ff8d83
 }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 .wrap{max-width:980px;margin:auto;padding:18px}
-h1{font-size:25px;margin:2px 0 5px}
-.subtitle{color:var(--muted);margin-bottom:18px;line-height:1.4}
+h1{font-size:25px;margin:2px 0 5px}.subtitle{color:var(--muted);margin-bottom:18px;line-height:1.4}
 .card{background:var(--card);border:1px solid var(--line);border-radius:15px;padding:16px;margin:12px 0}
 .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
 .stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:13px}
-.big{font-size:27px;font-weight:800;margin-top:4px}
-.muted{color:var(--muted);font-size:13px}
-.good{color:var(--green)}
-.warn{color:var(--amber)}
-.bad{color:var(--red)}
+.big{font-size:27px;font-weight:800;margin-top:4px}.muted{color:var(--muted);font-size:13px}
+.good{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}
 .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-button{
-  border:1px solid #425443;background:#2e472d;color:#fff;
-  border-radius:11px;padding:12px 15px;font:inherit;font-weight:750;cursor:pointer
-}
-button.secondary{background:#1e2922}
-button:disabled{opacity:.5}
+button{border:1px solid #425443;background:#2e472d;color:#fff;border-radius:11px;padding:12px 15px;font:inherit;font-weight:750;cursor:pointer}
+button.secondary{background:#1e2922}button:disabled{opacity:.5}
 .pill{padding:6px 10px;border:1px solid var(--line);border-radius:999px;font-size:12px}
 pre{white-space:pre-wrap;word-break:break-word;font-size:12px;color:#cbd3cc}
 table{width:100%;border-collapse:collapse;font-size:13px}
-th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
-.kw{color:#c9dcae}
-.notice{line-height:1.5}
-@media(max-width:700px){
-  .grid{grid-template-columns:repeat(2,1fr)}
-  th:first-child,td:first-child{display:none}
-  table{font-size:12px}
-}
+th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.kw{color:#c9dcae}
+@media(max-width:700px){.grid{grid-template-columns:repeat(2,1fr)}th:first-child,td:first-child{display:none}table{font-size:12px}}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>🔎 PrimeTac SEO Auto</h1>
+  <h1>🔎 PrimeTac SEO Auto <span class="muted">v1.1 FIX</span></h1>
   <div class="subtitle">
-    Только автоматическое заполнение поисковых фраз Prom.ua.<br>
-    Цены, остатки, фото, описания и поставщиков сайт не меняет.
+    Исправлена проверка поля ключевых слов. Объект/пустое значение больше не считается «ключами».
   </div>
 
   <div class="card">
@@ -659,22 +593,10 @@ th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-a
   </div>
 
   <div class="grid">
-    <div class="stat">
-      <div class="muted">Всего товаров</div>
-      <div id="total" class="big">—</div>
-    </div>
-    <div class="stat">
-      <div class="muted">Уже с ключами</div>
-      <div id="have" class="big good">—</div>
-    </div>
-    <div class="stat">
-      <div class="muted">Без ключей</div>
-      <div id="missing" class="big warn">—</div>
-    </div>
-    <div class="stat">
-      <div class="muted">Ошибок последнего запуска</div>
-      <div id="failed" class="big bad">—</div>
-    </div>
+    <div class="stat"><div class="muted">Всего товаров</div><div id="total" class="big">—</div></div>
+    <div class="stat"><div class="muted">Реально с ключами</div><div id="have" class="big good">—</div></div>
+    <div class="stat"><div class="muted">Без ключей</div><div id="missing" class="big warn">—</div></div>
+    <div class="stat"><div class="muted">Странное поле API</div><div id="weird" class="big bad">—</div></div>
   </div>
 
   <div class="card">
@@ -682,9 +604,8 @@ th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-a
       <button id="scanBtn" class="secondary" onclick="scan()">Проверить сейчас</button>
       <button id="runBtn" onclick="runNow()">Заполнить недостающие ключи</button>
     </div>
-    <p class="muted notice">
-      Автоматический режим заполняет только товары, где поисковые фразы пустые.
-      Уже заполненные ключи не переписываются.
+    <p class="muted">
+      После записи программа повторно читает каталог Prom и показывает, сколько ключей реально появилось через API.
     </p>
     <pre id="log">Загрузка статуса...</pre>
   </div>
@@ -692,9 +613,7 @@ th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-a
   <div class="card" style="overflow:auto">
     <div style="font-weight:750;margin-bottom:9px">Предпросмотр товаров без ключей</div>
     <table>
-      <thead>
-        <tr><th>ID</th><th>Товар</th><th>Будут добавлены фразы</th></tr>
-      </thead>
+      <thead><tr><th>ID</th><th>Товар</th><th>Будут добавлены фразы</th><th>Тип поля API</th></tr></thead>
       <tbody id="preview"></tbody>
     </table>
   </div>
@@ -703,16 +622,17 @@ th,td{padding:9px;border-bottom:1px solid var(--line);text-align:left;vertical-a
 <script>
 const el=id=>document.getElementById(id);
 
-async function jsonFetch(url, options){
-  const r=await fetch(url, options);
+async function jsonFetch(url,options){
+  const r=await fetch(url,options);
   const d=await r.json();
-  if(!r.ok) throw new Error(d.error || JSON.stringify(d));
+  if(!r.ok)throw new Error(d.error||JSON.stringify(d));
   return d;
 }
 
 async function status(){
   try{
     const d=await jsonFetch('/api/status');
+
     el('prom').textContent='Prom: '+(d.prom_connected?'подключен':'нет токена');
     el('prom').className='pill '+(d.prom_connected?'good':'bad');
 
@@ -728,19 +648,20 @@ async function status(){
       el('total').textContent=d.last_scan.total ?? '—';
       el('have').textContent=d.last_scan.with_keywords ?? '—';
       el('missing').textContent=d.last_scan.missing ?? '—';
+      el('weird').textContent=d.last_scan.weird_keyword_field ?? '—';
     }
-
-    el('failed').textContent=d.last_run?.failed ?? '0';
 
     if(d.last_run){
       el('log').textContent=
         'Последний запуск: '+d.last_run.at+
         '\\nИсточник: '+d.last_run.source+
-        '\\nПроверено: '+d.last_run.scanned+
-        '\\nПланировалось: '+d.last_run.planned+
-        '\\nИзменено: '+d.last_run.changed+
+        '\\nДо запуска без ключей: '+d.last_run.before_missing+
+        '\\nОтправлено на Prom: '+d.last_run.planned+
+        '\\nAPI сообщил обработано: '+d.last_run.api_reported_changed+
+        '\\nПодтверждено повторным чтением: '+d.last_run.verified_added+
+        '\\nПосле запуска без ключей: '+d.last_run.after_missing+
         '\\nОшибок: '+d.last_run.failed;
-    } else {
+    }else{
       el('log').textContent='Ещё не запускалось.';
     }
   }catch(e){
@@ -755,24 +676,28 @@ async function scan(){
 
   try{
     const d=await jsonFetch('/api/scan');
+
     el('total').textContent=d.total;
     el('have').textContent=d.with_keywords;
     el('missing').textContent=d.missing;
+    el('weird').textContent=d.weird_keyword_field;
 
     const tb=el('preview');
     tb.innerHTML='';
 
     d.rows.slice(0,200).forEach(x=>{
       const tr=document.createElement('tr');
-      tr.innerHTML='<td></td><td></td><td class="kw"></td>';
+      tr.innerHTML='<td></td><td></td><td class="kw"></td><td></td>';
       tr.children[0].textContent=x.id;
-      tr.children[1].textContent=x.name || '';
-      tr.children[2].textContent=(x.keywords || []).join(', ');
+      tr.children[1].textContent=x.name||'';
+      tr.children[2].textContent=(x.keywords||[]).join(', ');
+      tr.children[3].textContent=x.raw_keyword_type||'—';
       tb.appendChild(tr);
     });
 
     el('log').textContent=
-      'Готово. Без ключей: '+d.missing+
+      'Готово. Реально без ключей: '+d.missing+
+      '.\\nСтранное/пустое поле API: '+d.weird_keyword_field+
       '.\\nНа Prom пока ничего не изменено.';
   }catch(e){
     el('log').textContent='Ошибка: '+e.message;
@@ -784,24 +709,28 @@ async function scan(){
 }
 
 async function runNow(){
-  if(!confirm('Заполнить ключевые фразы у всех товаров, где они сейчас пустые?')) return;
+  if(!confirm('Заполнить ключевые фразы у всех товаров, где они реально пустые?'))return;
 
   el('scanBtn').disabled=true;
   el('runBtn').disabled=true;
-  el('log').textContent='Заполняю ключевые фразы...';
+  el('log').textContent='Отправляю ключевые фразы на Prom и затем перепроверю...';
 
   try{
-    const d=await jsonFetch('/api/run', {
+    const d=await jsonFetch('/api/run',{
       method:'POST',
       headers:{'Content-Type':'application/json'},
       body:'{}'
     });
 
     el('log').textContent=
-      'Готово.\\nПроверено: '+d.scanned+
-      '\\nИзменено: '+d.changed+
+      'Готово.'+
+      '\\nДо запуска без ключей: '+d.before_missing+
+      '\\nОтправлено: '+d.planned+
+      '\\nAPI сообщил обработано: '+d.api_reported_changed+
+      '\\nПодтверждено повторным чтением: '+d.verified_added+
+      '\\nПосле запуска без ключей: '+d.after_missing+
       '\\nОшибок: '+d.failed+
-      (d.errors?.length ? '\\n\\n'+JSON.stringify(d.errors.slice(0,10),null,2) : '');
+      (d.errors?.length?'\\n\\n'+JSON.stringify(d.errors.slice(0,10),null,2):'');
 
     await scan();
   }catch(e){
@@ -814,7 +743,7 @@ async function runNow(){
 }
 
 status();
-setInterval(status, 15000);
+setInterval(status,15000);
 </script>
 </body>
 </html>`;
@@ -823,84 +752,66 @@ setInterval(status, 15000);
 // Routes
 // ------------------------------
 
-app.get('/', (req, res) => {
-  res.type('html').send(dashboardHtml);
+app.get('/', (req,res) => res.type('html').send(dashboardHtml));
+
+app.get('/health', (req,res) => {
+  res.json({ ok:true, app:'PrimeTac SEO Auto v1.1', time:new Date().toISOString() });
 });
 
-app.get('/health', (req, res) => {
+app.get('/api/status', (req,res) => {
   res.json({
-    ok: true,
-    app: 'PrimeTac SEO Auto',
-    time: new Date().toISOString()
-  });
-});
-
-app.get('/api/status', (req, res) => {
-  res.json({
-    ok: true,
-    prom_connected: Boolean(PROM_TOKEN),
-    write_enabled: WRITE_ENABLED,
-    autorun: SEO_AUTORUN,
-    interval_hours: SEO_INTERVAL_HOURS,
+    ok:true,
+    prom_connected:Boolean(PROM_TOKEN),
+    write_enabled:WRITE_ENABLED,
+    autorun:SEO_AUTORUN,
+    interval_hours:SEO_INTERVAL_HOURS,
     running,
-    last_scan: lastScan,
-    last_run: lastRun
+    last_scan:lastScan,
+    last_run:lastRun
   });
 });
 
-app.get('/api/scan', async (req, res) => {
+app.get('/api/scan', async (req,res) => {
   try {
-    const scan = await scanProducts();
-    res.json(scan);
-  } catch (error) {
+    res.json(await scanProducts());
+  } catch(error) {
     console.error('[SCAN]', error);
-    res.status(error.statusCode || 500).json({
-      error: error.message || String(error)
-    });
+    res.status(error.statusCode || 500).json({ error:error.message || String(error) });
   }
 });
 
-app.post('/api/run', async (req, res) => {
+app.post('/api/run', async (req,res) => {
   try {
-    const result = await runSeoAuto('manual');
-    res.json(result);
-  } catch (error) {
-    console.error('[MANUAL RUN]', error);
+    res.json(await runSeoAuto('manual'));
+  } catch(error) {
+    console.error('[RUN]', error);
     res.status(error.statusCode || 500).json({
-      error: error.message || String(error)
+      error:error.message || String(error),
+      prom:error.data || null
     });
   }
 });
-
-// ------------------------------
-// Auto scheduler
-// ------------------------------
 
 if (SEO_AUTORUN) {
   const intervalMs = SEO_INTERVAL_HOURS * 60 * 60 * 1000;
 
   const autoTask = async () => {
     if (!WRITE_ENABLED) {
-      console.warn('[SEO AUTO] WRITE_ENABLED=false, запуск пропущен');
+      console.warn('[SEO AUTO] WRITE_ENABLED=false, skip');
       return;
     }
 
     try {
       await runSeoAuto('auto');
-    } catch (error) {
+    } catch(error) {
       console.error('[SEO AUTO ERROR]', error);
     }
   };
 
-  // Первый авто-запуск через 60 секунд после старта Render.
   setTimeout(autoTask, 60 * 1000);
-
-  // Затем каждые N часов.
   setInterval(autoTask, intervalMs);
-
-  console.log(`[SEO AUTO] включено, интервал ${SEO_INTERVAL_HOURS} ч`);
 }
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac SEO Auto started on port ${PORT}`);
+  console.log(`PrimeTac SEO Auto v1.1 FIX started on port ${PORT}`);
 });
