@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v17-mass",
-  "version": "1.7.0",
+  "name": "primetac-card-manager-v171-mass-fix",
+  "version": "1.7.1",
   "private": true,
   "main": "server.js",
   "scripts": {

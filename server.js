@@ -697,21 +697,24 @@ const html = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Card Manager v1.7 MASS</title>
+<title>PrimeTac Card Manager v1.7.1 MASS FIX</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.7 MASS</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.7.1 MASS FIX</span></h2>
 <div class="m">Рабочая запись UA keywords встроена. Остальные поля пока только проверяются и рекомендуются, чтобы не испортить категорийные характеристики Prom.</div>
 
 <div class="c">
   <div class="row">
     <button onclick="startScan()">🔎 Сканировать весь каталог</button>
     <button class="secondary" onclick="refresh()">Обновить статус</button>
-    <button id="fix25" onclick="fixBatch()" disabled>✅ Исправить безопасно ${BATCH_SIZE} товаров</button>
+    <button id="fix25" onclick="fixBatch(25)" disabled>✅ Исправить 25</button>
+    <button id="fix100" onclick="fixBatch(100)" disabled>✅ Исправить 100</button>
+    <button id="fixAll" onclick="fixAll()" disabled>🚀 Исправить ВСЕ</button>
+    <button id="stopFix" class="secondary" onclick="stopFix()" disabled>⏹ Стоп</button>
   </div>
   <div class="m" id="statusText" style="margin-top:9px">Готово.</div>
   <div class="bar" style="margin-top:9px"><div id="progressBar"></div></div>
@@ -870,10 +873,14 @@ async function refresh(){
     }
 
     const disabled = !DATA.summary || !DATA.summary.need_safe_fix || d.scan.running || d.fix.running;
-    document.getElementById('fix25').disabled=disabled;
-    document.getElementById('fix100').disabled=disabled;
-    document.getElementById('fixAll').disabled=disabled;
-    document.getElementById('stopFix').disabled=!d.fix.running;
+    const b25=document.getElementById('fix25');
+    const b100=document.getElementById('fix100');
+    const bAll=document.getElementById('fixAll');
+    const bStop=document.getElementById('stopFix');
+    if(b25) b25.disabled=disabled;
+    if(b100) b100.disabled=disabled;
+    if(bAll) bAll.disabled=disabled;
+    if(bStop) bStop.disabled=!d.fix.running;
 
     if(d.fix.started_at){
       document.getElementById('fixLog').textContent=
@@ -956,7 +963,7 @@ app.get('/', (_req,res) => res.type('html').send(html));
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.7 MASS',
+    app: 'PrimeTac Card Manager v1.7.1 MASS FIX',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -1026,5 +1033,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.7 MASS started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.7.1 MASS FIX started on ${PORT}`);
 });
