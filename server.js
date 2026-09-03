@@ -1435,14 +1435,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac Card Manager v1.9.3 SERVER MODE</title>
+<title>PrimeTac Card Manager v1.9.4 SERVER PROGRESS</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.3 SERVER MODE</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.4 SERVER PROGRESS</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -1509,7 +1509,7 @@ __SSR_META_REFRESH__
     <thead>
       <tr><th>Товар</th><th>Заполнение</th><th>Ключи UA</th><th class="hide-mobile">Произв.</th><th class="hide-mobile">Тип</th><th class="hide-mobile">Цвет</th><th class="hide-mobile">Размер</th><th>Действие</th></tr>
     </thead>
-    <tbody id="rows"></tbody>
+    <tbody id="rows">__SSR_ROWS__</tbody>
   </table>
 </div>
 
@@ -1517,12 +1517,12 @@ __SSR_META_REFRESH__
 
 <div class="c">
   <b>Автозаполнение из поставщика</b>
-  <pre id="enrichLog" class="m">Ещё не запускалось.</pre>
+  <pre id="enrichLog" class="m">__SSR_ENRICH__</pre>
 </div>
 
 <div class="c">
   <b>Последняя обработка UA-ключей</b>
-  <pre id="fixLog" class="m">Ещё не запускалась.</pre>
+  <pre id="fixLog" class="m">__SSR_FIX__</pre>
 </div>
 </div>
 
@@ -2067,7 +2067,7 @@ app.post('/action/probe-attribute', async (req,res) => {
 });
 
 app.post('/action/mass-attributes', (req,res) => {
-  serverActionNotice='Запущено массовое заполнение подтверждённых характеристик.';
+  serverActionNotice='Запущено заполнение характеристик. Если сверху указано 0 полей через API, изменений не будет.';
   if(!enrichState.running){
     enrichAttributesMass('all').catch(e=>{
       enrichState.running=false;
@@ -2078,7 +2078,7 @@ app.post('/action/mass-attributes', (req,res) => {
 });
 
 app.post('/action/mass-descriptions', (req,res) => {
-  serverActionNotice='Запущено дополнение пустых/коротких описаний.';
+  serverActionNotice='Запущено дополнение пустых/коротких описаний. Прогресс смотри в блоке «Автозаполнение из поставщика».';
   if(!enrichState.running){
     enrichDescriptionsMass('all').catch(e=>{
       enrichState.running=false;
@@ -2120,11 +2120,73 @@ function supplierStatusText(){
   if(st.matching) parts.push('⏳ сопоставление '+(st.match_processed||0)+'/'+(st.match_total||0));
   else if(st.match_updated_at){
     parts.push('Совпало с Prom: '+(st.matched_products||0)+' / '+((st.matched_products||0)+(st.unmatched_products||0)));
-    parts.push('Можно заполнить: '+(st.fillable_products||0)+' товаров / '+(st.fillable_fields||0)+' полей');
+    parts.push('Можно заполнить характеристик через API: '+(st.fillable_products||0)+' товаров / '+(st.fillable_fields||0)+' полей');
+    if((st.matched_products||0)>0 && (st.fillable_fields||0)===0){
+      parts.push('⚠ Prom API не отдал пустые category attributes для записи; данные поставщика при этом найдены');
+    }
   }
 
   if((st.errors||[]).length) parts.push('Ошибок: '+st.errors.length);
   return parts.length ? parts.join(' • ') : 'Поставщики ещё не загружены.';
+}
+
+function renderAuditRowsServer(){
+  const rows=(scanState.rows||[]).slice(0,120);
+  if(!rows.length) return '<tr><td colspan="8" class="m">Нет данных для таблицы.</td></tr>';
+  return rows.map(r=>{
+    const f=r.fields||{};
+    const kw=f.keywords||{};
+    const prod=f.producer||{};
+    const typ=f.type||{};
+    const col=f.color||{};
+    const sz=f.size||{};
+    function okCell(x){ return x && x.ok ? '✅ '+escHtmlServer(x.value||'') : '❌ '+escHtmlServer(x?.value||'Пусто'); }
+    return '<tr>'+
+      '<td>'+escHtmlServer(r.name||r.id)+'</td>'+
+      '<td><b>'+escHtmlServer((r.score??0)+'%')+'</b></td>'+
+      '<td>'+okCell(kw)+'</td>'+
+      '<td class="hide-mobile">'+okCell(prod)+'</td>'+
+      '<td class="hide-mobile">'+okCell(typ)+'</td>'+
+      '<td class="hide-mobile">'+okCell(col)+'</td>'+
+      '<td class="hide-mobile">'+okCell(sz)+'</td>'+
+      '<td><span class="m">ID '+escHtmlServer(r.id)+'</span></td>'+
+    '</tr>';
+  }).join('');
+}
+
+function renderEnrichStatusServer(){
+  const e=enrichState||{};
+  if(!e.started_at && !e.running) return 'Ещё не запускалось.';
+  const lines=[];
+  lines.push('Режим: '+(e.mode==='descriptions'?'описания':e.mode==='attributes'?'характеристики':(e.mode||'—')));
+  lines.push('Статус: '+(e.running?'🔄 выполняется':'✅ завершено'));
+  lines.push('Запланировано: '+(e.planned||0));
+  lines.push('Обработано: '+(e.processed||0));
+  lines.push('Подтверждено Prom: '+(e.verified||0));
+  lines.push('Изменено полей: '+(e.changed_fields||0));
+  lines.push('Ошибок: '+(e.failed||0));
+  if(e.started_at) lines.push('Старт: '+e.started_at);
+  if(e.finished_at) lines.push('Финиш: '+e.finished_at);
+  if((e.errors||[]).length){
+    lines.push(''); lines.push('Первые ошибки:');
+    for(const x of e.errors.slice(0,5)) lines.push('- '+(x.id?('ID '+x.id+': '):'')+(x.error||JSON.stringify(x)));
+  }
+  return lines.join('\\n');
+}
+
+function renderFixStatusServer(){
+  const f=fixState||{};
+  if(!f.started_at && !f.running) return 'Ещё не запускалась.';
+  const lines=[];
+  lines.push('Статус: '+(f.running?'🔄 выполняется':'✅ завершено'));
+  lines.push('Режим: '+(f.mode||'—'));
+  lines.push('Запланировано: '+(f.planned||0));
+  lines.push('Обработано: '+(f.processed||0));
+  lines.push('Подтверждено Prom: '+(f.verified||0));
+  lines.push('Ошибок: '+(f.failed||0));
+  if(f.started_at) lines.push('Старт: '+f.started_at);
+  if(f.finished_at) lines.push('Финиш: '+f.finished_at);
+  return lines.join('\\n');
 }
 
 function renderServerHtml(){
@@ -2174,7 +2236,10 @@ function renderServerHtml(){
     '__SSR_NEED__': escHtmlServer(need),
     '__SSR_ERRS__': String(errs),
     '__SSR_SUPPLIER__': escHtmlServer(supplierStatusText()),
-    '__SSR_NOTICE__': escHtmlServer(serverActionNotice||'')
+    '__SSR_NOTICE__': escHtmlServer(serverActionNotice||''),
+    '__SSR_ROWS__': renderAuditRowsServer(),
+    '__SSR_ENRICH__': escHtmlServer(renderEnrichStatusServer()),
+    '__SSR_FIX__': escHtmlServer(renderFixStatusServer())
   };
 
   for(const k of Object.keys(replacements)){
@@ -2197,7 +2262,7 @@ app.get('/', (_req,res) => {
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.9.3 SERVER MODE',
+    app: 'PrimeTac Card Manager v1.9.4 SERVER PROGRESS',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2272,5 +2337,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.9.3 SERVER MODE started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.9.4 SERVER PROGRESS started on ${PORT}`);
 });
