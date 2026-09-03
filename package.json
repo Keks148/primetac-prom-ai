@@ -1,8 +1,8 @@
 {
-  "name": "primetac-seo-auto-fixed",
-  "version": "1.1.0",
+  "name": "primetac-prom-keywords-diagnostic",
+  "version": "1.2.0",
   "private": true,
-  "description": "PrimeTac Prom.ua automatic search keywords manager - fixed keyword detection",
+  "description": "Read-only Prom.ua keyword field diagnostic for PrimeTac Group",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
