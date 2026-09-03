@@ -1432,14 +1432,14 @@ const html = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Card Manager v1.9.1 SCAN FIX</title>
+<title>PrimeTac Card Manager v1.9.2 MOBILE FIX</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.1 SCAN FIX</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.2 MOBILE FIX</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -1518,6 +1518,8 @@ const html = `<!doctype html>
 </div>
 
 <script>
+try{var __st=document.getElementById('statusText');if(__st)__st.textContent='✅ JS запущен. Проверяю API...';}catch(__e){}
+
 let DATA={rows:[],summary:null};
 let scanRunning=false, fixRunning=false;
 
@@ -1528,14 +1530,25 @@ const LABELS={
 };
 
 async function api(u,o){
-  const r=await fetch(u,o);
-  const d=await r.json();
-  if(!r.ok) throw new Error(d.error||JSON.stringify(d));
-  return d;
+  var controller=(typeof AbortController!=='undefined')?new AbortController():null;
+  var timer=controller?setTimeout(function(){controller.abort();},12000):null;
+  var opts=o||{};
+  if(controller){opts=Object.assign({},opts,{signal:controller.signal});}
+  try{
+    var r=await fetch(u,opts);
+    var text=await r.text();
+    var d={};
+    try{d=text?JSON.parse(text):{};}catch(_e){throw new Error('API вернул не JSON: '+text.slice(0,180));}
+    if(!r.ok) throw new Error(d.error||JSON.stringify(d));
+    return d;
+  }catch(e){
+    if(e && e.name==='AbortError') throw new Error('API не ответил за 12 секунд: '+u);
+    throw e;
+  }finally{
+    if(timer) clearTimeout(timer);
+  }
 }
-function esc(v){
-  return String(v??'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;');
-}
+function esc(v){ return String(v==null?'':v).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\"/g,'&quot;'); }
 function okIcon(v){return v?'✅':'❌'}
 
 function rowMatches(r){
@@ -1625,10 +1638,10 @@ async function refresh(){
     fixRunning=d.fix.running;
 
     const total=d.scan.total||0, processed=d.scan.processed||0;
-    document.getElementById('total').textContent=DATA.summary?.total ?? total ?? '—';
+    document.getElementById('total').textContent=(DATA.summary && DATA.summary.total!=null ? DATA.summary.total : (total!=null ? total : '—'));
     document.getElementById('avg').textContent=DATA.summary ? DATA.summary.average_score+'%' : '—';
-    document.getElementById('need').textContent=DATA.summary?.need_safe_fix ?? '—';
-    document.getElementById('errs').textContent=DATA.summary?.errors ?? d.scan.errors ?? 0;
+    document.getElementById('need').textContent=(DATA.summary && DATA.summary.need_safe_fix!=null ? DATA.summary.need_safe_fix : '—');
+    document.getElementById('errs').textContent=(DATA.summary && DATA.summary.errors!=null ? DATA.summary.errors : (d.scan && d.scan.errors!=null ? d.scan.errors : 0));
 
     const pct=total?Math.round(processed/total*100):0;
     document.getElementById('progressBar').style.width=pct+'%';
@@ -1664,7 +1677,7 @@ async function refresh(){
         '\\nОбработано: '+d.fix.processed+
         '\\nПодтверждено Prom: '+d.fix.verified+
         '\\nОшибок: '+d.fix.failed+
-        (d.fix.errors?.length?'\\n\\n'+JSON.stringify(d.fix.errors.slice(0,10),null,2):'');
+        ((d.fix.errors && d.fix.errors.length)?'\\n\\n'+JSON.stringify(d.fix.errors.slice(0,10),null,2):'');
     }
 
     if(eState.started_at || eState.attribute_probe){
@@ -1672,16 +1685,16 @@ async function refresh(){
       let txt='Тест характеристики: '+(eState.attribute_probe ? (eState.attribute_probe.verified?'✅ подтвержден':'❌ не подтвержден') : 'не запускался');
       if(eState.attribute_probe) txt+='\n'+(eState.attribute_probe.name||'')+' → '+(eState.attribute_probe.field||'')+': '+(eState.attribute_probe.value||'');
       if(eState.started_at) txt+='\nРежим: '+(eState.mode||'—')+'\nОбработано: '+eState.processed+'/'+eState.planned+' ('+ep+'%)\nПодтверждено: '+eState.verified+'\nИзменено полей: '+eState.changed_fields+'\nОшибок: '+eState.failed;
-      if(eState.errors?.length) txt+='\n\nПоследние ошибки:\n'+JSON.stringify(eState.errors.slice(-8),null,2);
+      if((eState.errors && eState.errors.length)) txt+='\n\nПоследние ошибки:\n'+JSON.stringify(eState.errors.slice(-8),null,2);
       const el=document.getElementById('enrichLog'); if(el) el.textContent=txt;
-      const mb=document.getElementById('massAttrBtn'); if(mb) mb.disabled=!eState.attribute_probe?.verified || eState.running;
+      const mb=document.getElementById('massAttrBtn'); if(mb) mb.disabled=!(eState.attribute_probe && eState.attribute_probe.verified) || eState.running;
       const pb=document.getElementById('probeAttrBtn'); if(pb) pb.disabled=Boolean(eState.running);
       const db=document.getElementById('massDescBtn'); if(db) db.disabled=Boolean(eState.running);
     }
 
     renderTable();
   }catch(e){
-    document.getElementById('statusText').textContent='Ошибка статуса: '+e.message;
+    var st2=document.getElementById('statusText'); if(st2) st2.textContent='❌ Ошибка статуса'; var dg2=document.getElementById('scanDiag'); if(dg2) dg2.textContent=e.message;
   }
 }
 
@@ -1712,7 +1725,7 @@ async function fixBatch(limit){
 }
 
 async function fixAll(){
-  const n=DATA.summary?.need_safe_fix||0;
+  const n=(DATA.summary && DATA.summary.need_safe_fix)||0;
   if(!n)return;
   if(!confirm('Исправить ВСЕ '+n+' товаров, где нужно дополнить только UA поисковые запросы? Цены, названия, описания и характеристики НЕ меняются.'))return;
   try{
@@ -1753,7 +1766,7 @@ async function refreshSupplierState(){
   try{
     const d=await api('/api/suppliers/state');
     const s=d.state||{};
-    const bz=s.sources?.bezet, mi=s.sources?.militaris;
+    const bz=(s.sources && s.sources.bezet), mi=(s.sources && s.sources.militaris);
     let parts=[];
     if(bz) parts.push('BEZET: '+(bz.ok?('✅ '+bz.count+' товаров'):('❌ '+bz.error)));
     if(mi) parts.push('Militaris: '+(mi.ok?('✅ '+mi.count+' товаров'):('❌ '+mi.error)));
@@ -1815,7 +1828,7 @@ async function probeAttribute(){
   if(!confirm('Тест изменит только ОДНУ пустую характеристику у одного товара и сразу проверит Prom. Продолжить?')) return;
   try{
     const d=await api('/api/enrich/test-attribute',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
-    alert(d.probe?.verified ? ('✅ Prom подтвердил: '+d.probe.field+' = '+d.probe.value) : '❌ Prom не подтвердил запись характеристики');
+    alert((d.probe && d.probe.verified) ? ('✅ Prom подтвердил: '+d.probe.field+' = '+d.probe.value) : '❌ Prom не подтвердил запись характеристики');
     await refresh();
   }catch(e){alert('Ошибка теста: '+e.message);}
 }
@@ -1839,7 +1852,7 @@ async function massDescriptions(){
 async function pollEnrich(){
   await refresh();
   const d=await api('/api/enrich/state');
-  if(d.state?.running) setTimeout(pollEnrich,1200);
+  if((d.state && d.state.running)) setTimeout(pollEnrich,1200);
   else { await refreshSupplierState(); await refresh(); }
 }
 
@@ -1878,18 +1891,26 @@ async function loadSupplierOne(id,loadPage){
 }
 
 async function initialBoot(){
-  await refreshSupplierState();
-  await refresh();
+  var st=document.getElementById('statusText');
+  var dg=document.getElementById('scanDiag');
+  if(st) st.textContent='✅ Интерфейс работает. Запускаю сканирование...';
   try{
-    const d=await api('/api/state');
-    const empty=!d.scan.running && !d.scan.summary && !(d.scan.rows||[]).length;
+    var state=await api('/api/state');
+    var empty=!state.scan.running && !state.scan.summary && !(state.scan.rows||[]).length;
     if(empty){
-      setTimeout(()=>startScan(),700);
+      try{
+        await api('/api/scan/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+      }catch(e){
+        if(dg) dg.textContent='Ошибка запуска: '+e.message;
+      }
     }
   }catch(e){
-    const dg=document.getElementById('scanDiag');
-    if(dg) dg.textContent='Ошибка первичной проверки: '+e.message;
+    if(st) st.textContent='❌ API панели недоступен';
+    if(dg) dg.textContent=e.message;
   }
+  pollTicks=0;
+  poll();
+  refreshSupplierState();
 }
 initialBoot();
 </script>
@@ -1981,12 +2002,21 @@ app.get('/api/suppliers/product/:id', async (req,res) => {
   }
 });
 
-app.get('/', (_req,res) => res.type('html').send(html));
+app.get('/', (_req,res) => {
+  if(PROM_TOKEN && !scanState.running && !scanState.summary && !(scanState.rows||[]).length){
+    setTimeout(() => startScan().catch(e => {
+      scanState.last_error = e && e.message ? e.message : String(e);
+      scanState.running = false;
+      console.error('[AUTO SCAN ERROR]', scanState.last_error);
+    }), 300);
+  }
+  res.type('html').send(html);
+});
 
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.9.1 SCAN FIX',
+    app: 'PrimeTac Card Manager v1.9.2 MOBILE FIX',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2061,5 +2091,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.9.1 SCAN FIX started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.9.2 MOBILE FIX started on ${PORT}`);
 });

@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v191-scan-fix",
-  "version": "1.9.1",
+  "name": "primetac-card-manager-v192-mobile-fix",
+  "version": "1.9.2",
   "private": true,
   "main": "server.js",
   "scripts": {
