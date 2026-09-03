@@ -1,7 +1,0 @@
-В server.js после app.use(express.json()) добавь две строки:
-
-const installPrimeTacSeo = require('./primetac-seo-keywords');
-installPrimeTacSeo(app);
-
-После деплоя открой:
-https://твой-домен.onrender.com/seo-keywords
