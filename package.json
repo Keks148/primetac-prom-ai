@@ -1,7 +1,8 @@
 {
-  "name": "primetac-card-manager-v19-supplier-autofill",
-  "version": "1.9.0",
+  "name": "primetac-prom-keywords-diagnostic",
+  "version": "1.2.0",
   "private": true,
+  "description": "Read-only Prom.ua keyword field diagnostic for PrimeTac Group",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -11,8 +12,6 @@
     "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.21.2",
-    "fast-xml-parser": "^4.5.0",
-    "cheerio": "^1.0.0"
+    "express": "^4.21.2"
   }
 }
