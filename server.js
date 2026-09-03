@@ -42,6 +42,8 @@ let supplierState = {
   sources: {},
   matched_products: 0,
   unmatched_products: 0,
+  match_total: 0,
+  match_processed: 0,
   errors: []
 };
 
@@ -49,6 +51,7 @@ let supplierRecords = { bezet: [], militaris: [] };
 let supplierIndexes = { bezet: null, militaris: null };
 let supplierMatches = new Map();
 let promRawCache = new Map();
+let rejectedKeywordIds = new Set();
 
 
 const API_HOST = 'my.prom.ua';
@@ -177,6 +180,8 @@ function findType(text){
 function detectSizes(text){
   const src = String(text || '').toUpperCase();
   const out = [];
+
+  if(/\b(ONE\s*SIZE|ONESIZE|UNISIZE|УНІВЕРСАЛЬНИЙ|УНИВЕРСАЛЬНЫЙ)\b/i.test(src)) out.push('One size');
 
   for(const s of ['XS','S','M','L','XL','2XL','3XL','4XL','5XL','6XL']){
     const esc = s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -342,15 +347,28 @@ function findOfferArrays(obj, out=[], depth=0){
 
 function paramMapFromNode(n){
   const map={};
-  const candidates=[];
-  for(const key of ['param','params','parameter','parameters','property','properties','characteristic','characteristics']){
-    if(n && n[key]!==undefined) candidates.push(...arr(n[key]));
+  const seen=new Set();
+
+  function walk(x, depth=0){
+    if(!x || depth>6) return;
+    if(Array.isArray(x)){ x.forEach(v=>walk(v,depth+1)); return; }
+    if(typeof x!=='object') return;
+
+    const name=norm(x['@_name'] || x['@_key'] || x.name || x.key || x.title || '');
+    const value=norm(primitive(x));
+    if(name && value && name.length<120 && value.length<1000){
+      const k=normalizeLabel(name);
+      if(k && !seen.has(k)){ map[name]=value; seen.add(k); }
+    }
+
+    for(const [k,v] of Object.entries(x)){
+      if(['description','desc','annotation','picture','pictures','image','images'].includes(String(k).toLowerCase())) continue;
+      if(v && typeof v==='object') walk(v,depth+1);
+    }
   }
-  for(const p of candidates){
-    if(!p || typeof p!=='object') continue;
-    const name=norm(p['@_name'] || p['@_key'] || p.name || p.key || p.title || '');
-    const value=norm(primitive(p));
-    if(name && value) map[name]=value;
+
+  for(const key of ['param','params','parameter','parameters','property','properties','characteristic','characteristics','attributes','attribute']){
+    if(n && n[key]!==undefined) walk(n[key],0);
   }
   return map;
 }
@@ -390,7 +408,9 @@ function parseSupplierFeed(xml, supplier){
 }
 
 function buildSupplierIndex(records){
-  const sku=new Map(), name=new Map();
+  const sku=new Map(), name=new Map(), token=new Map();
+  const tokensByRecord=new Map();
+
   for(const r of records){
     if(r.sku){
       const k=cleanSku(r.sku);
@@ -399,9 +419,16 @@ function buildSupplierIndex(records){
     if(r.name){
       const k=normalizeNameForMatch(r.name);
       if(k){ if(!name.has(k)) name.set(k,[]); name.get(k).push(r); }
+
+      const toks=[...nameTokens(r.name)];
+      tokensByRecord.set(r,toks);
+      for(const t of toks){
+        if(!token.has(t)) token.set(t,[]);
+        token.get(t).push(r);
+      }
     }
   }
-  return {sku,name};
+  return {sku,name,token,tokensByRecord};
 }
 
 function promSkuCandidates(p){
@@ -429,34 +456,47 @@ function supplierScore(p,r){
 
 function bestSupplierMatch(p){
   let best=null;
+
   for(const key of ['bezet','militaris']){
-    const records=supplierRecords[key]||[];
     const idx=supplierIndexes[key];
     if(!idx) continue;
+
     let candidates=[];
+
+    // 1. SKU / артикул
     for(const sku of promSkuCandidates(p)){
       if(idx.sku.has(sku)) candidates.push(...idx.sku.get(sku));
     }
+
+    // 2. Точное нормализованное название
     const nk=normalizeNameForMatch(p.name);
     if(idx.name.has(nk)) candidates.push(...idx.name.get(nk));
+
+    // 3. Быстрый индекс по словам, без полного перебора всего фида
     if(!candidates.length){
       const toks=[...nameTokens(p.name)];
-      if(toks.length>=2){
-        candidates=records.filter(r=>{
-          const rt=nameTokens(r.name);
-          let hit=0; for(const t of toks) if(rt.has(t)) hit++;
-          return hit>=Math.min(3,toks.length);
-        }).slice(0,200);
+      const hits=new Map();
+      for(const t of toks){
+        for(const r of (idx.token.get(t)||[])) hits.set(r,(hits.get(r)||0)+1);
       }
+      const minHit=Math.min(3,Math.max(2,toks.length));
+      candidates=[...hits.entries()]
+        .filter(([_r,n])=>n>=minHit)
+        .sort((a,b)=>b[1]-a[1])
+        .slice(0,120)
+        .map(([r])=>r);
     }
+
     const uniqCandidates=[...new Map(candidates.map(r=>[(r.id||r.sku||r.name),r])).values()];
+
     for(const r of uniqCandidates){
       const sc=supplierScore(p,r);
-      if(sc.score<58) continue;
+      if(sc.score<62) continue;
       const m={supplier:key,supplier_name:SUPPLIER_CONFIG[key].name,score:sc.score,reason:sc.reason,record:r};
       if(!best || m.score>best.score) best=m;
     }
   }
+
   return best;
 }
 
@@ -593,6 +633,7 @@ async function refreshSupplierFeeds(){
       try{
         const xml=await fetchText(cfg.feedUrl,60000);
         const records=parseSupplierFeed(xml,key);
+        if(!records.length) throw new Error('Фид загрузился, но товары не распознаны. Проверьте формат фида.');
         supplierRecords[key]=records;
         supplierIndexes[key]=buildSupplierIndex(records);
         supplierState.sources[key]={ok:true,name:cfg.name,count:records.length,feed_url:cfg.feedUrl,site_url:cfg.siteUrl,error:null};
@@ -610,24 +651,42 @@ async function refreshSupplierFeeds(){
 async function matchSupplierCatalog(){
   if(supplierState.matching) return;
   supplierState.matching=true;
+  supplierState.match_processed=0;
+  supplierState.match_total=0;
   try{
     let products=[...promRawCache.values()];
     if(!products.length){
       products=await listAllProducts();
       promRawCache=new Map(products.map(p=>[String(p.id),p]));
     }
+
+    supplierState.match_total=products.length;
     supplierMatches.clear();
     let matched=0;
-    for(const p of products){
+
+    for(let i=0;i<products.length;i++){
+      const p=products[i];
       const m=bestSupplierMatch(p);
       if(m){ supplierMatches.set(String(p.id),m); matched++; }
+      supplierState.match_processed=i+1;
+
+      // Отдаём управление event loop, чтобы интерфейс и /state не зависали.
+      if((i+1)%25===0) await new Promise(r=>setTimeout(r,0));
     }
+
     supplierState.matched_products=matched;
     supplierState.unmatched_products=Math.max(0,products.length-matched);
     supplierState.match_updated_at=new Date().toISOString();
   }finally{
     supplierState.matching=false;
   }
+}
+
+async function syncSuppliers(){
+  await refreshSupplierFeeds();
+  const okAny=Object.values(supplierState.sources||{}).some(x=>x && x.ok);
+  if(!okAny) throw new Error('Ни один фид поставщика не загрузился');
+  await matchSupplierCatalog();
 }
 
 async function getSupplierEnrichmentForProm(id, loadPage=false){
@@ -1041,7 +1100,7 @@ async function startBatchFix(limit=BATCH_SIZE, mode='batch'){
   if(fixState.running) return;
 
   const allCandidates = (scanState.rows || [])
-    .filter(r => r && !r.__error && r.safe?.can_fix_ua_keywords);
+    .filter(r => r && !r.__error && r.safe?.can_fix_ua_keywords && !rejectedKeywordIds.has(String(r.id)));
 
   const candidates = limit === 'all'
     ? allCandidates
@@ -1079,6 +1138,7 @@ async function startBatchFix(limit=BATCH_SIZE, mode='batch'){
           if(result.verified || result.skipped){
             fixState.verified++;
           }else{
+            rejectedKeywordIds.add(String(row.id));
             fixState.failed++;
             fixState.errors.push({
               id: row.id,
@@ -1127,14 +1187,14 @@ const html = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Card Manager v1.8 SUPPLIER ENRICH</title>
+<title>PrimeTac Card Manager v1.8.1 SUPPLIER FIX</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.8 SUPPLIER ENRICH</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.8.1 SUPPLIER FIX</span></h2>
 <div class="m">Рабочая запись UA keywords встроена. Остальные поля пока только проверяются и рекомендуются, чтобы не испортить категорийные характеристики Prom.</div>
 
 <div class="c">
@@ -1161,8 +1221,9 @@ const html = `<!doctype html>
   <b>🔗 Поставщики: BEZET + Militaris</b>
   <div class="m" style="margin-top:5px">XML используется для массового сопоставления. Страница товара загружается только по кнопке, чтобы не бомбить сайты поставщиков тысячами запросов.</div>
   <div class="row" style="margin-top:10px">
-    <button id="supplierRefreshBtn" class="secondary" onclick="supplierRefresh()">Обновить фиды</button>
-    <button id="supplierMatchBtn" class="secondary" onclick="supplierMatch()">Сопоставить с Prom</button>
+    <button id="supplierSyncBtn" onclick="supplierSync()">⚡ Загрузить + сопоставить</button>
+    <button id="supplierRefreshBtn" class="secondary" onclick="supplierRefresh()">Только обновить фиды</button>
+    <button id="supplierMatchBtn" class="secondary" onclick="supplierMatch()">Только сопоставить</button>
   </div>
   <div id="supplierStatus" class="m" style="margin-top:8px">Поставщики ещё не загружены.</div>
 </div>
@@ -1406,15 +1467,32 @@ async function refreshSupplierState(){
     let parts=[];
     if(bz) parts.push('BEZET: '+(bz.ok?('✅ '+bz.count+' товаров'):('❌ '+bz.error)));
     if(mi) parts.push('Militaris: '+(mi.ok?('✅ '+mi.count+' товаров'):('❌ '+mi.error)));
-    if(s.match_updated_at) parts.push('Совпало с Prom: '+s.matched_products+' / '+(s.matched_products+s.unmatched_products));
+    if(s.matching) parts.push('Сопоставление: '+(s.match_processed||0)+' / '+(s.match_total||0));
+    else if(s.match_updated_at) parts.push('Совпало с Prom: '+s.matched_products+' / '+(s.matched_products+s.unmatched_products));
+    if((s.errors||[]).length) parts.push('Ошибок: '+s.errors.length);
     document.getElementById('supplierStatus').textContent=parts.length?parts.join(' • '):'Поставщики ещё не загружены.';
+    const sb=document.getElementById('supplierSyncBtn');
     const rb=document.getElementById('supplierRefreshBtn');
     const mb=document.getElementById('supplierMatchBtn');
-    if(rb) rb.disabled=Boolean(s.loading);
+    if(sb) sb.disabled=Boolean(s.loading||s.matching);
+    if(rb) rb.disabled=Boolean(s.loading||s.matching);
     if(mb) mb.disabled=Boolean(s.loading||s.matching||!Object.values(s.sources||{}).some(x=>x.ok));
   }catch(e){
     const el=document.getElementById('supplierStatus'); if(el) el.textContent='Ошибка поставщиков: '+e.message;
   }
+}
+
+async function supplierSync(){
+  const el=document.getElementById('supplierStatus');
+  if(el) el.textContent='Загружаю фиды и сопоставляю с Prom...';
+  try{
+    await api('/api/suppliers/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const timer=setInterval(async()=>{
+      const d=await api('/api/suppliers/state');
+      await refreshSupplierState();
+      if(!d.state.loading && !d.state.matching) clearInterval(timer);
+    },900);
+  }catch(e){ if(el) el.textContent='Ошибка: '+e.message; }
 }
 
 async function supplierRefresh(){
@@ -1481,6 +1559,16 @@ refresh();
 </body></html>`;
 
 
+app.post('/api/suppliers/sync', (_req,res) => {
+  if(supplierState.loading || supplierState.matching) return res.json({ok:true,already_running:true});
+  syncSuppliers().catch(e=>{
+    supplierState.errors.push({supplier:'sync',error:e.message||String(e)});
+    supplierState.loading=false;
+    supplierState.matching=false;
+  });
+  res.json({ok:true,started:true});
+});
+
 app.get('/api/suppliers/state', (_req,res) => {
   const safeState=JSON.parse(JSON.stringify(supplierState));
   res.json({ok:true,state:safeState});
@@ -1499,6 +1587,20 @@ app.post('/api/suppliers/match', (_req,res) => {
   res.json({ok:true,started:true});
 });
 
+app.get('/api/suppliers/diagnostics', (_req,res) => {
+  res.json({
+    ok:true,
+    config:{
+      bezet:{feed:SUPPLIER_CONFIG.bezet.feedUrl,site:SUPPLIER_CONFIG.bezet.siteUrl},
+      militaris:{feed:SUPPLIER_CONFIG.militaris.feedUrl,site:SUPPLIER_CONFIG.militaris.siteUrl}
+    },
+    state:supplierState,
+    records:{bezet:supplierRecords.bezet.length,militaris:supplierRecords.militaris.length},
+    indexes:{bezet:Boolean(supplierIndexes.bezet),militaris:Boolean(supplierIndexes.militaris)},
+    matches:supplierMatches.size
+  });
+});
+
 app.get('/api/suppliers/product/:id', async (req,res) => {
   try{
     const loadPage=String(req.query.page||'')==='1';
@@ -1513,7 +1615,7 @@ app.get('/', (_req,res) => res.type('html').send(html));
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.8 SUPPLIER ENRICH',
+    app: 'PrimeTac Card Manager v1.8.1 SUPPLIER FIX',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -1583,5 +1685,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.8 SUPPLIER ENRICH started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.8.1 SUPPLIER FIX started on ${PORT}`);
 });

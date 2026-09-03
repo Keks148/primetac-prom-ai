@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v18-supplier-enrich",
-  "version": "1.8.0",
+  "name": "primetac-card-manager-v181-supplier-fix",
+  "version": "1.8.1",
   "private": true,
   "main": "server.js",
   "scripts": {
