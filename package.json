@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v181-supplier-fix",
-  "version": "1.8.1",
+  "name": "primetac-card-manager-v19-supplier-autofill",
+  "version": "1.9.0",
   "private": true,
   "main": "server.js",
   "scripts": {

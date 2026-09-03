@@ -18,6 +18,8 @@ const SCAN_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.SCAN_CONCUR
 const BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.BATCH_SIZE || 25)));
 const FIX_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.FIX_CONCURRENCY || 2)));
 const VERIFY_DELAY_MS = Math.max(300, Number(process.env.VERIFY_DELAY_MS || 700));
+const KEYWORD_ACCEPT_MIN = Math.max(3, Math.min(7, Number(process.env.KEYWORD_ACCEPT_MIN || 4)));
+const ENRICH_CONCURRENCY = Math.max(1, Math.min(2, Number(process.env.ENRICH_CONCURRENCY || 1)));
 
 const SUPPLIER_CONFIG = {
   bezet: {
@@ -44,7 +46,10 @@ let supplierState = {
   unmatched_products: 0,
   match_total: 0,
   match_processed: 0,
-  errors: []
+  errors: [],
+  fillable_products: 0,
+  fillable_fields: 0,
+  fillable_by_field: {}
 };
 
 let supplierRecords = { bezet: [], militaris: [] };
@@ -79,6 +84,10 @@ let fixState = {
   errors: [],
   mode: null,
   stop_requested: false
+};
+
+let enrichState = {
+  running:false, mode:null, started_at:null, finished_at:null, planned:0, processed:0, verified:0, failed:0, changed_fields:0, errors:[], stop_requested:false, attribute_probe:null
 };
 
 function norm(v){ return String(v || '').replace(/\s+/g, ' ').trim(); }
@@ -230,6 +239,107 @@ function getWeight(p){
 }
 function getStatus(p){
   return norm(p.status || p.presence || p.available || '');
+}
+
+
+function attrString(v){
+  if(Array.isArray(v)) return v.map(attrString).filter(Boolean).join(', ');
+  if(v && typeof v==='object'){
+    return attrString(v.value ?? v.name ?? v.caption ?? v.title ?? v.text ?? '');
+  }
+  return v===undefined || v===null ? '' : norm(v);
+}
+
+function promAttributes(p){
+  return Array.isArray(p?.attributes) ? p.attributes.filter(x=>x && typeof x==='object') : [];
+}
+
+function attrName(a){ return attrString(a?.name ?? a?.caption ?? a?.title ?? a?.label ?? ''); }
+function attrValue(a){ return attrString(a?.value ?? a?.values ?? a?.value_list ?? a?.options ?? a?.text ?? ''); }
+
+const ATTR_LABELS={
+  producer:['виробник','производитель','бренд'],
+  type:['вид виробу','вид товара','вид товару','тип виробу','тип товара','тип товару','вид куртки','тип куртки'],
+  color:['колір','цвет'],
+  size:['розмір','размер','міжнародний розмір','международный размер','size'],
+  material:['матеріал','материал','склад','состав'],
+  season:['сезон'],
+  country:['країна виробник','країна-виробник','страна производитель','країна','страна'],
+  purpose:['призначення','назначение'],
+  features:['особливості товару','особливості','особенности товара','особенности'],
+  membrane:['мембрана'],
+  insulation:['утеплювач','утеплитель'],
+  zipper:['блискавка','молния','застібка','застежка'],
+  weight:['вага','вес']
+};
+
+function findPromAttribute(p, labels){
+  const normalized=(labels||[]).map(normalizeLabel);
+  for(const a of promAttributes(p)){
+    const n=normalizeLabel(attrName(a));
+    if(n && normalized.some(x=>n===x || n.includes(x) || x.includes(n))) return a;
+  }
+  return null;
+}
+
+function actualAttrValue(p, key){
+  const a=findPromAttribute(p,ATTR_LABELS[key]||[]);
+  return a ? attrValue(a) : '';
+}
+
+function setAttributeValue(a, value){
+  const out=JSON.parse(JSON.stringify(a));
+  if(Object.prototype.hasOwnProperty.call(out,'value')) out.value=value;
+  else if(Object.prototype.hasOwnProperty.call(out,'values')) out.values=Array.isArray(out.values)?[value]:value;
+  else if(Object.prototype.hasOwnProperty.call(out,'value_list')) out.value_list=Array.isArray(out.value_list)?[value]:value;
+  else if(Object.prototype.hasOwnProperty.call(out,'options')) out.options=Array.isArray(out.options)?[value]:value;
+  else if(Object.prototype.hasOwnProperty.call(out,'text')) out.text=value;
+  else out.value=value;
+  return out;
+}
+
+function supplierValueForKey(details,key){
+  if(!details) return '';
+  if(key==='size'){
+    const xs=uniq(details.sizes||[]);
+    return xs.length===1 ? xs[0] : '';
+  }
+  return norm(details[key]||'');
+}
+
+function buildAttributePatch(p, details){
+  const attrs=promAttributes(p);
+  if(!attrs.length) return {attributes:null, changes:[], reason:'Prom API не вернул attributes для этого товара'};
+  const next=attrs.map(x=>JSON.parse(JSON.stringify(x)));
+  const changes=[];
+  const keys=['producer','type','color','size','material','season','country','purpose','features','membrane','insulation','zipper','weight'];
+  for(const key of keys){
+    const target=findPromAttribute(p,ATTR_LABELS[key]);
+    if(!target) continue; // не создаём неизвестные характеристики
+    const before=attrValue(target);
+    if(before) continue;
+    const value=supplierValueForKey(details,key);
+    if(!value) continue;
+    const idx=attrs.indexOf(target);
+    if(idx<0) continue;
+    next[idx]=setAttributeValue(target,value);
+    changes.push({key,name:attrName(target),before:'',after:value});
+  }
+  return {attributes:next,changes,reason:changes.length?'':'Нет пустых существующих характеристик Prom, подтверждённых поставщиком'};
+}
+
+function getActualProducer(p){ return getProducer(p) || actualAttrValue(p,'producer'); }
+function getActualType(p){ return getProductType(p) || actualAttrValue(p,'type'); }
+function getActualColor(p){ return getColor(p) || actualAttrValue(p,'color'); }
+function getActualWeight(p){ return getWeight(p) || actualAttrValue(p,'weight'); }
+function getActualSizes(p){
+  const out=[];
+  const av=actualAttrValue(p,'size');
+  if(av) out.push(...detectSizes(av),...av.split(/[,;\/]/).map(norm).filter(Boolean));
+  for(const key of ['variants','modifications','modification','sizes']){
+    if(Array.isArray(p?.[key])) out.push(...detectSizes(JSON.stringify(p[key])));
+  }
+  return uniq(out);
 }
 
 function keywordSuggestions(p, uaName){
@@ -623,6 +733,30 @@ function mergeSupplierDetails(feed, page){
   return out;
 }
 
+
+function supplierPlanForRawProduct(p, match){
+  if(!p || !match) return {changes:[],details:null};
+  const details=feedDetails(match.record);
+  const patch=buildAttributePatch(p,details);
+  return {changes:patch.changes||[],details,patch};
+}
+
+function recalcSupplierFillable(){
+  const by={}; let products=0, fields=0;
+  for(const [id,match] of supplierMatches.entries()){
+    const p=promRawCache.get(String(id));
+    if(!p) continue;
+    const plan=supplierPlanForRawProduct(p,match);
+    if(plan.changes.length){
+      products++; fields+=plan.changes.length;
+      for(const c of plan.changes) by[c.key]=(by[c.key]||0)+1;
+    }
+  }
+  supplierState.fillable_products=products;
+  supplierState.fillable_fields=fields;
+  supplierState.fillable_by_field=by;
+}
+
 async function refreshSupplierFeeds(){
   if(supplierState.loading) return;
   supplierState.loading=true;
@@ -676,6 +810,7 @@ async function matchSupplierCatalog(){
 
     supplierState.matched_products=matched;
     supplierState.unmatched_products=Math.max(0,products.length-matched);
+    recalcSupplierFillable();
     supplierState.match_updated_at=new Date().toISOString();
   }finally{
     supplierState.matching=false;
@@ -854,27 +989,20 @@ function buildAudit(p, ua){
 
   const combined = `${name} ${description}`;
 
-  const existingProducer = getProducer(p);
+  const existingProducer = getActualProducer(p);
   const detectedProducer = findBrand(combined);
 
-  const existingType = getProductType(p);
+  const existingType = getActualType(p);
   const detectedType = findType(combined);
 
-  const existingColor = getColor(p);
+  const existingColor = getActualColor(p);
   const detectedColor = findColor(combined);
 
-  let sizes = [];
-  sizes.push(...detectSizes(combined));
-
-  for(const key of ['variants','modifications','modification','sizes']){
-    if(Array.isArray(p[key])){
-      sizes.push(...detectSizes(JSON.stringify(p[key])));
-    }
-  }
-  sizes = uniq(sizes);
+  const sizes = getActualSizes(p);
+  const suggestedSizes = detectSizes(combined);
 
   const category = getCategory(p);
-  const weight = getWeight(p);
+  const weight = getActualWeight(p);
   const photos = countPhotos(p);
 
   const fields = {
@@ -889,29 +1017,29 @@ function buildAudit(p, ua){
       suggestion: description.length >= 250 ? '' : 'Дополнить только подтверждёнными данными'
     },
     keywords: {
-      ok: existingKeywords.length >= KEYWORD_MIN,
+      ok: existingKeywords.length >= KEYWORD_ACCEPT_MIN,
       value: existingKeywords.length ? existingKeywords.join(', ') : 'Пусто',
       suggestion: mergedKeywords.join(', ')
     },
     producer: {
-      ok: Boolean(existingProducer || detectedProducer),
-      value: existingProducer || detectedProducer || 'Пусто',
+      ok: Boolean(existingProducer),
+      value: existingProducer || 'Пусто',
       suggestion: !existingProducer && detectedProducer ? `Можно поставить: ${detectedProducer}` : ''
     },
     type: {
-      ok: Boolean(existingType || detectedType),
-      value: existingType || detectedType || 'Пусто',
+      ok: Boolean(existingType),
+      value: existingType || 'Пусто',
       suggestion: !existingType && detectedType ? `Можно поставить: ${detectedType}` : ''
     },
     color: {
-      ok: Boolean(existingColor || detectedColor),
-      value: existingColor || detectedColor || 'Пусто',
+      ok: Boolean(existingColor),
+      value: existingColor || 'Пусто',
       suggestion: !existingColor && detectedColor ? `Можно поставить: ${detectedColor}` : ''
     },
     size: {
       ok: sizes.length > 0,
       value: sizes.length ? sizes.join(', ') : 'Пусто',
-      suggestion: sizes.length ? '' : 'Нет подтверждённых размеров в данных'
+      suggestion: sizes.length ? '' : (suggestedSizes.length ? ('Можно предположить из названия: '+suggestedSizes.join(', ')) : 'Нет подтверждённых размеров в Prom')
     },
     category: {
       ok: Boolean(category),
@@ -940,7 +1068,7 @@ function buildAudit(p, ua){
     fields,
     status: getStatus(p),
     safe: {
-      can_fix_ua_keywords: mergedKeywords.length > existingKeywords.length,
+      can_fix_ua_keywords: existingKeywords.length < KEYWORD_ACCEPT_MIN && mergedKeywords.length > existingKeywords.length,
       ua_keywords_before: existingKeywords,
       ua_keywords_after: mergedKeywords
     }
@@ -989,6 +1117,7 @@ function summarize(rows){
       ? Math.round(valid.reduce((s,r)=>s+r.score,0)/valid.length)
       : 0,
     need_safe_fix: valid.filter(r => r.safe.can_fix_ua_keywords).length,
+    missing_fields_total: Object.values(missing).reduce((a,b)=>a+b,0),
     missing
   };
 }
@@ -1061,7 +1190,7 @@ async function fixUaKeywordsForProduct(id){
     return {
       ok: true,
       skipped: true,
-      verified: oldKeywords.length >= KEYWORD_MIN,
+      verified: oldKeywords.length >= KEYWORD_ACCEPT_MIN,
       before: oldKeywords,
       after: oldKeywords
     };
@@ -1182,20 +1311,131 @@ async function startBatchFix(limit=BATCH_SIZE, mode='batch'){
   }
 }
 
+
+async function editPromAttributes(id, details){
+  if(!WRITE_ENABLED) throw new Error('WRITE_ENABLED=false');
+  let p=await getProduct(id);
+  if(!p) throw new Error('Prom товар не найден');
+  const patch=buildAttributePatch(p,details);
+  if(!patch.changes.length) return {ok:true,skipped:true,verified:false,reason:patch.reason,changes:[]};
+  const payload={id:Number(id),attributes:patch.attributes};
+  if(p.presence) payload.presence=p.presence;
+  else if(p.status && ['available','not_available','preorder'].includes(String(p.status))) payload.presence=p.status;
+  const result=await promRequest('POST','/products/edit',[payload]);
+  await new Promise(r=>setTimeout(r,VERIFY_DELAY_MS));
+  const after=await getProduct(id);
+  const verified=[];
+  for(const c of patch.changes){
+    const a=findPromAttribute(after,ATTR_LABELS[c.key]||[]);
+    if(a && norm(attrValue(a)).toLowerCase()===norm(c.after).toLowerCase()) verified.push(c);
+  }
+  if(after) promRawCache.set(String(id),after);
+  return {ok:true,skipped:false,verified:verified.length>0,verified_changes:verified,planned_changes:patch.changes,result};
+}
+
+async function testOneAttributeWrite(id=null){
+  if(!supplierMatches.size) throw new Error('Сначала загрузите и сопоставьте поставщиков');
+  const candidates=id ? [String(id)] : [...supplierMatches.keys()];
+  for(const pid of candidates){
+    const match=supplierMatches.get(String(pid));
+    if(!match) continue;
+    let p=await getProduct(pid);
+    if(!p) continue;
+    const details=feedDetails(match.record);
+    const patch=buildAttributePatch(p,details);
+    if(!patch.changes.length) continue;
+    // На тесте меняем только ОДНУ характеристику.
+    const one=patch.changes[0];
+    const attrs=promAttributes(p).map(x=>JSON.parse(JSON.stringify(x)));
+    const target=findPromAttribute(p,ATTR_LABELS[one.key]||[]);
+    const idx=promAttributes(p).indexOf(target);
+    if(idx<0) continue;
+    attrs[idx]=setAttributeValue(target,one.after);
+    const payload={id:Number(pid),attributes:attrs};
+    if(p.presence) payload.presence=p.presence;
+    else if(p.status && ['available','not_available','preorder'].includes(String(p.status))) payload.presence=p.status;
+    const result=await promRequest('POST','/products/edit',[payload]);
+    await new Promise(r=>setTimeout(r,VERIFY_DELAY_MS));
+    const after=await getProduct(pid);
+    const aa=findPromAttribute(after,ATTR_LABELS[one.key]||[]);
+    const verified=Boolean(aa && norm(attrValue(aa)).toLowerCase()===norm(one.after).toLowerCase());
+    enrichState.attribute_probe={at:new Date().toISOString(),id:pid,name:p.name,field:one.name,value:one.after,verified,result};
+    if(after) promRawCache.set(String(pid),after);
+    return enrichState.attribute_probe;
+  }
+  throw new Error('Не найден товар, где Prom уже отдаёт пустую характеристику и поставщик даёт точное значение');
+}
+
+async function enrichAttributesMass(limit='all'){
+  if(enrichState.running) return;
+  if(!enrichState.attribute_probe?.verified) throw new Error('Сначала нужен успешный тест записи 1 характеристики');
+  let ids=[...supplierMatches.keys()];
+  if(limit!=='all') ids=ids.slice(0,Math.max(1,Number(limit)||25));
+  enrichState={...enrichState,running:true,mode:'attributes',started_at:new Date().toISOString(),finished_at:null,planned:ids.length,processed:0,verified:0,failed:0,changed_fields:0,errors:[],stop_requested:false};
+  try{
+    let cursor=0;
+    async function worker(){
+      while(true){
+        if(enrichState.stop_requested) break;
+        const i=cursor++; if(i>=ids.length) break;
+        const id=ids[i], match=supplierMatches.get(String(id));
+        try{
+          const details=feedDetails(match.record);
+          const r=await editPromAttributes(id,details);
+          enrichState.processed++;
+          if(r.skipped) continue;
+          if(r.verified){ enrichState.verified++; enrichState.changed_fields+=(r.verified_changes||[]).length; }
+          else { enrichState.failed++; enrichState.errors.push({id,error:'Prom не подтвердил запись характеристик',planned:r.planned_changes}); }
+        }catch(e){ enrichState.processed++; enrichState.failed++; enrichState.errors.push({id,error:e.message||String(e)}); }
+      }
+    }
+    await Promise.all(Array.from({length:Math.min(ENRICH_CONCURRENCY,Math.max(1,ids.length))},worker));
+    recalcSupplierFillable();
+  }finally{ enrichState.running=false; enrichState.finished_at=new Date().toISOString(); }
+}
+
+async function enrichDescriptionsMass(limit='all'){
+  if(enrichState.running) return;
+  let ids=[...supplierMatches.keys()];
+  if(limit!=='all') ids=ids.slice(0,Math.max(1,Number(limit)||25));
+  enrichState={...enrichState,running:true,mode:'descriptions',started_at:new Date().toISOString(),finished_at:null,planned:ids.length,processed:0,verified:0,failed:0,changed_fields:0,errors:[],stop_requested:false};
+  try{
+    for(const id of ids){
+      if(enrichState.stop_requested) break;
+      const match=supplierMatches.get(String(id));
+      try{
+        const before=await getTranslation(id,'uk');
+        const src=stripHtml(match?.record?.description||'');
+        const old=stripHtml(before?.description||'');
+        if(src.length<220 || old.length>=220 || src.length<=old.length+80){ enrichState.processed++; continue; }
+        const payload={product_id:Number(id),lang:'uk',description:match.record.description};
+        if(before?.name) payload.name=before.name;
+        if(before?.keywords!==undefined) payload.keywords=before.keywords;
+        await promRequest('PUT','/products/translation',payload);
+        await new Promise(r=>setTimeout(r,VERIFY_DELAY_MS));
+        const after=await getTranslation(id,'uk');
+        const ok=stripHtml(after?.description||'').length>=Math.min(220,src.length);
+        enrichState.processed++;
+        if(ok){enrichState.verified++;enrichState.changed_fields++;} else {enrichState.failed++;enrichState.errors.push({id,error:'Prom не подтвердил новое описание'});}
+      }catch(e){enrichState.processed++;enrichState.failed++;enrichState.errors.push({id,error:e.message||String(e)});}
+    }
+  }finally{ enrichState.running=false; enrichState.finished_at=new Date().toISOString(); }
+}
+
 const html = `<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Card Manager v1.8.1 SUPPLIER FIX</title>
+<title>PrimeTac Card Manager v1.9 SUPPLIER AUTOFILL</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.8.1 SUPPLIER FIX</span></h2>
-<div class="m">Рабочая запись UA keywords встроена. Остальные поля пока только проверяются и рекомендуются, чтобы не испортить категорийные характеристики Prom.</div>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.9 SUPPLIER AUTOFILL</span></h2>
+<div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
   <div class="row">
@@ -1213,7 +1453,7 @@ const html = `<!doctype html>
 <div class="grid">
   <div class="stat"><div class="m">Всего</div><div id="total" class="n">—</div></div>
   <div class="stat"><div class="m">Среднее заполнение</div><div id="avg" class="n">—</div></div>
-  <div class="stat"><div class="m">Нужно безопасно исправить</div><div id="need" class="n warn">—</div></div>
+  <div class="stat"><div class="m">Ключи нужно дописать</div><div id="need" class="n warn">—</div></div>
   <div class="stat"><div class="m">Ошибок сканирования</div><div id="errs" class="n bad">—</div></div>
 </div>
 
@@ -1224,6 +1464,9 @@ const html = `<!doctype html>
     <button id="supplierSyncBtn" onclick="supplierSync()">⚡ Загрузить + сопоставить</button>
     <button id="supplierRefreshBtn" class="secondary" onclick="supplierRefresh()">Только обновить фиды</button>
     <button id="supplierMatchBtn" class="secondary" onclick="supplierMatch()">Только сопоставить</button>
+    <button id="probeAttrBtn" class="secondary" onclick="probeAttribute()">🧪 ТЕСТ 1 характеристики</button>
+    <button id="massAttrBtn" onclick="massAttributes()" disabled>🚀 Заполнить характеристики</button>
+    <button id="massDescBtn" class="secondary" onclick="massDescriptions()">📝 Дополнить пустые описания</button>
   </div>
   <div id="supplierStatus" class="m" style="margin-top:8px">Поставщики ещё не загружены.</div>
 </div>
@@ -1258,7 +1501,12 @@ const html = `<!doctype html>
 <div id="detail" class="c detail"></div>
 
 <div class="c">
-  <b>Последняя безопасная обработка</b>
+  <b>Автозаполнение из поставщика</b>
+  <pre id="enrichLog" class="m">Ещё не запускалось.</pre>
+</div>
+
+<div class="c">
+  <b>Последняя обработка UA-ключей</b>
   <pre id="fixLog" class="m">Ещё не запускалась.</pre>
 </div>
 </div>
@@ -1355,7 +1603,8 @@ async function startScan(){
 
 async function refresh(){
   try{
-    const d=await api('/api/state');
+    const pair=await Promise.all([api('/api/state'),api('/api/enrich/state')]);
+    const d=pair[0], eState=pair[1].state||{};
     DATA.rows=d.scan.rows||[];
     DATA.summary=d.scan.summary||null;
     scanRunning=d.scan.running;
@@ -1393,6 +1642,18 @@ async function refresh(){
         '\\nПодтверждено Prom: '+d.fix.verified+
         '\\nОшибок: '+d.fix.failed+
         (d.fix.errors?.length?'\\n\\n'+JSON.stringify(d.fix.errors.slice(0,10),null,2):'');
+    }
+
+    if(eState.started_at || eState.attribute_probe){
+      const ep=eState.planned?Math.round((eState.processed||0)/eState.planned*100):0;
+      let txt='Тест характеристики: '+(eState.attribute_probe ? (eState.attribute_probe.verified?'✅ подтвержден':'❌ не подтвержден') : 'не запускался');
+      if(eState.attribute_probe) txt+='\n'+(eState.attribute_probe.name||'')+' → '+(eState.attribute_probe.field||'')+': '+(eState.attribute_probe.value||'');
+      if(eState.started_at) txt+='\nРежим: '+(eState.mode||'—')+'\nОбработано: '+eState.processed+'/'+eState.planned+' ('+ep+'%)\nПодтверждено: '+eState.verified+'\nИзменено полей: '+eState.changed_fields+'\nОшибок: '+eState.failed;
+      if(eState.errors?.length) txt+='\n\nПоследние ошибки:\n'+JSON.stringify(eState.errors.slice(-8),null,2);
+      const el=document.getElementById('enrichLog'); if(el) el.textContent=txt;
+      const mb=document.getElementById('massAttrBtn'); if(mb) mb.disabled=!eState.attribute_probe?.verified || eState.running;
+      const pb=document.getElementById('probeAttrBtn'); if(pb) pb.disabled=Boolean(eState.running);
+      const db=document.getElementById('massDescBtn'); if(db) db.disabled=Boolean(eState.running);
     }
 
     renderTable();
@@ -1469,6 +1730,7 @@ async function refreshSupplierState(){
     if(mi) parts.push('Militaris: '+(mi.ok?('✅ '+mi.count+' товаров'):('❌ '+mi.error)));
     if(s.matching) parts.push('Сопоставление: '+(s.match_processed||0)+' / '+(s.match_total||0));
     else if(s.match_updated_at) parts.push('Совпало с Prom: '+s.matched_products+' / '+(s.matched_products+s.unmatched_products));
+    if(s.match_updated_at) parts.push('Можно заполнить: '+(s.fillable_products||0)+' товаров / '+(s.fillable_fields||0)+' полей');
     if((s.errors||[]).length) parts.push('Ошибок: '+s.errors.length);
     document.getElementById('supplierStatus').textContent=parts.length?parts.join(' • '):'Поставщики ещё не загружены.';
     const sb=document.getElementById('supplierSyncBtn');
@@ -1519,6 +1781,39 @@ async function supplierMatch(){
   }catch(e){ if(el) el.textContent='Ошибка: '+e.message; }
 }
 
+
+async function probeAttribute(){
+  if(!confirm('Тест изменит только ОДНУ пустую характеристику у одного товара и сразу проверит Prom. Продолжить?')) return;
+  try{
+    const d=await api('/api/enrich/test-attribute',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    alert(d.probe?.verified ? ('✅ Prom подтвердил: '+d.probe.field+' = '+d.probe.value) : '❌ Prom не подтвердил запись характеристики');
+    await refresh();
+  }catch(e){alert('Ошибка теста: '+e.message);}
+}
+
+async function massAttributes(){
+  if(!confirm('Заполнить массово ТОЛЬКО существующие пустые характеристики Prom, для которых поставщик дал точное значение? Цены и остатки не меняются.')) return;
+  try{
+    await api('/api/enrich/attributes/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:'all'})});
+    pollEnrich();
+  }catch(e){alert('Ошибка: '+e.message);}
+}
+
+async function massDescriptions(){
+  if(!confirm('Дополнить только короткие/пустые украинские описания описанием из фида поставщика? Названия, цены и остатки не меняются.')) return;
+  try{
+    await api('/api/enrich/descriptions/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({limit:'all'})});
+    pollEnrich();
+  }catch(e){alert('Ошибка: '+e.message);}
+}
+
+async function pollEnrich(){
+  await refresh();
+  const d=await api('/api/enrich/state');
+  if(d.state?.running) setTimeout(pollEnrich,1200);
+  else { await refreshSupplierState(); await refresh(); }
+}
+
 function supplierField(label,value){
   if(Array.isArray(value)) value=value.join(', ');
   return '<div class="fbox"><b>'+esc(label)+'</b><div>'+(value?esc(value):'<span class="bad">нет данных</span>')+'</div></div>';
@@ -1558,6 +1853,40 @@ refresh();
 </script>
 </body></html>`;
 
+
+
+app.get('/api/enrich/state', (_req,res) => {
+  res.json({ok:true,state:enrichState});
+});
+
+app.post('/api/enrich/test-attribute', async (req,res) => {
+  try{
+    const probe=await testOneAttributeWrite(req.body?.id || null);
+    recalcSupplierFillable();
+    res.json({ok:true,probe});
+  }catch(e){ res.status(400).json({error:e.message||String(e),prom:e.data||null}); }
+});
+
+app.post('/api/enrich/attributes/start', (req,res) => {
+  if(!WRITE_ENABLED) return res.status(400).json({error:'WRITE_ENABLED=false'});
+  if(enrichState.running) return res.json({ok:true,already_running:true});
+  const limit=req.body?.limit==='all'?'all':Math.max(1,Math.min(5000,Number(req.body?.limit||25)));
+  enrichAttributesMass(limit).catch(e=>{enrichState.running=false;enrichState.errors.push({error:e.message||String(e)});});
+  res.json({ok:true,started:true,limit});
+});
+
+app.post('/api/enrich/descriptions/start', (req,res) => {
+  if(!WRITE_ENABLED) return res.status(400).json({error:'WRITE_ENABLED=false'});
+  if(enrichState.running) return res.json({ok:true,already_running:true});
+  const limit=req.body?.limit==='all'?'all':Math.max(1,Math.min(5000,Number(req.body?.limit||25)));
+  enrichDescriptionsMass(limit).catch(e=>{enrichState.running=false;enrichState.errors.push({error:e.message||String(e)});});
+  res.json({ok:true,started:true,limit});
+});
+
+app.post('/api/enrich/stop', (_req,res) => {
+  enrichState.stop_requested=true;
+  res.json({ok:true});
+});
 
 app.post('/api/suppliers/sync', (_req,res) => {
   if(supplierState.loading || supplierState.matching) return res.json({ok:true,already_running:true});
@@ -1615,14 +1944,14 @@ app.get('/', (_req,res) => res.type('html').send(html));
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.8.1 SUPPLIER FIX',
+    app: 'PrimeTac Card Manager v1.9 SUPPLIER AUTOFILL',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
 });
 
 app.get('/api/state', (_req,res) => {
-  res.json({ scan: scanState, fix: fixState });
+  res.json({ scan: scanState, fix: fixState, enrich: enrichState });
 });
 
 app.post('/api/scan/start', (_req,res) => {
@@ -1685,5 +2014,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.8.1 SUPPLIER FIX started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.9 SUPPLIER AUTOFILL started on ${PORT}`);
 });
