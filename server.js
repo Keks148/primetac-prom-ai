@@ -1427,54 +1427,63 @@ async function enrichDescriptionsMass(limit='all'){
   }finally{ enrichState.running=false; enrichState.finished_at=new Date().toISOString(); }
 }
 
+let serverActionNotice = '';
+
 const html = `<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Card Manager v1.9.2 MOBILE FIX</title>
+__SSR_META_REFRESH__
+<title>PrimeTac Card Manager v1.9.3 SERVER MODE</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.2 MOBILE FIX</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.3 SERVER MODE</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
   <div class="row">
-    <button onclick="startScan()">🔎 Сканировать весь каталог</button>
-    <button class="secondary" onclick="refresh()">Обновить статус</button>
+    <form method="post" action="/action/scan" style="display:inline">
+      <button type="submit">🔎 Сканировать весь каталог</button>
+    </form>
+    <form method="get" action="/" style="display:inline">
+      <button type="submit" class="secondary">Обновить статус</button>
+    </form>
     <button id="fix25" onclick="fixBatch(25)" disabled>✅ Исправить 25</button>
     <button id="fix100" onclick="fixBatch(100)" disabled>✅ Исправить 100</button>
     <button id="fixAll" onclick="fixAll()" disabled>🚀 Исправить ВСЕ</button>
     <button id="stopFix" class="secondary" onclick="stopFix()" disabled>⏹ Стоп</button>
   </div>
-  <div class="m" id="statusText" style="margin-top:9px">Проверяю состояние...</div>
-  <div class="m" id="scanDiag" style="margin-top:5px"></div>
-  <div class="bar" style="margin-top:9px"><div id="progressBar"></div></div>
+  <div class="m good" style="margin-top:9px">SERVER MODE: сканирование и поставщики работают даже без JavaScript.</div>
+  <div class="m" id="statusText" style="margin-top:6px">__SSR_STATUS__</div>
+  <div class="m" id="scanDiag" style="margin-top:5px">__SSR_DIAG__</div>
+  <div class="bar" style="margin-top:9px"><div id="progressBar" style="width:__SSR_PROGRESS__%"></div></div>
 </div>
 
 <div class="grid">
-  <div class="stat"><div class="m">Всего</div><div id="total" class="n">—</div></div>
-  <div class="stat"><div class="m">Среднее заполнение</div><div id="avg" class="n">—</div></div>
-  <div class="stat"><div class="m">Ключи нужно дописать</div><div id="need" class="n warn">—</div></div>
-  <div class="stat"><div class="m">Ошибок сканирования</div><div id="errs" class="n bad">—</div></div>
+  <div class="stat"><div class="m">Всего</div><div id="total" class="n">__SSR_TOTAL__</div></div>
+  <div class="stat"><div class="m">Среднее заполнение</div><div id="avg" class="n">__SSR_AVG__</div></div>
+  <div class="stat"><div class="m">Ключи нужно дописать</div><div id="need" class="n warn">__SSR_NEED__</div></div>
+  <div class="stat"><div class="m">Ошибок сканирования</div><div id="errs" class="n bad">__SSR_ERRS__</div></div>
 </div>
 
 <div class="c">
   <b>🔗 Поставщики: BEZET + Militaris</b>
   <div class="m" style="margin-top:5px">XML используется для массового сопоставления. Страница товара загружается только по кнопке, чтобы не бомбить сайты поставщиков тысячами запросов.</div>
   <div class="row" style="margin-top:10px">
-    <button id="supplierSyncBtn" onclick="supplierSync()">⚡ Загрузить + сопоставить</button>
-    <button id="supplierRefreshBtn" class="secondary" onclick="supplierRefresh()">Только обновить фиды</button>
-    <button id="supplierMatchBtn" class="secondary" onclick="supplierMatch()">Только сопоставить</button>
-    <button id="probeAttrBtn" class="secondary" onclick="probeAttribute()">🧪 ТЕСТ 1 характеристики</button>
-    <button id="massAttrBtn" onclick="massAttributes()" disabled>🚀 Заполнить характеристики</button>
-    <button id="massDescBtn" class="secondary" onclick="massDescriptions()">📝 Дополнить пустые описания</button>
+    <form method="post" action="/action/suppliers-sync" style="display:inline"><button type="submit">⚡ Загрузить + сопоставить</button></form>
+    <form method="post" action="/action/suppliers-refresh" style="display:inline"><button type="submit" class="secondary">Только обновить фиды</button></form>
+    <form method="post" action="/action/suppliers-match" style="display:inline"><button type="submit" class="secondary">Только сопоставить</button></form>
+    <form method="post" action="/action/probe-attribute" style="display:inline"><button type="submit" class="secondary">🧪 ТЕСТ 1 характеристики</button></form>
+    <form method="post" action="/action/mass-attributes" style="display:inline"><button type="submit">🚀 Заполнить характеристики</button></form>
+    <form method="post" action="/action/mass-descriptions" style="display:inline"><button type="submit" class="secondary">📝 Дополнить пустые описания</button></form>
   </div>
-  <div id="supplierStatus" class="m" style="margin-top:8px">Поставщики ещё не загружены.</div>
+  <div id="supplierStatus" class="m" style="margin-top:8px">__SSR_SUPPLIER__</div>
+  <div class="m warn" style="margin-top:6px">__SSR_NOTICE__</div>
 </div>
 
 <div class="c">
@@ -1993,6 +2002,92 @@ app.get('/api/suppliers/diagnostics', (_req,res) => {
   });
 });
 
+
+app.post('/action/scan', (req,res) => {
+  serverActionNotice='';
+  if(!PROM_TOKEN){
+    serverActionNotice='PROM_TOKEN не задан в Render Environment.';
+    return res.redirect('/');
+  }
+  if(!scanState.running){
+    scanState.last_error=null;
+    startScan().catch(e=>{
+      scanState.last_error=e && e.message ? e.message : String(e);
+      scanState.running=false;
+    });
+  }
+  res.redirect('/');
+});
+
+app.post('/action/suppliers-sync', (req,res) => {
+  serverActionNotice='Запущена загрузка и сопоставление поставщиков.';
+  if(!supplierState.loading && !supplierState.matching){
+    syncSuppliers().catch(e=>{
+      supplierState.loading=false;
+      supplierState.matching=false;
+      supplierState.errors.push({supplier:'all',error:e.message||String(e)});
+    });
+  }
+  res.redirect('/');
+});
+
+app.post('/action/suppliers-refresh', (req,res) => {
+  serverActionNotice='Запущено обновление фидов.';
+  if(!supplierState.loading){
+    refreshSupplierFeeds().catch(e=>{
+      supplierState.loading=false;
+      supplierState.errors.push({supplier:'all',error:e.message||String(e)});
+    });
+  }
+  res.redirect('/');
+});
+
+app.post('/action/suppliers-match', (req,res) => {
+  serverActionNotice='Запущено сопоставление товаров.';
+  if(!supplierState.matching){
+    matchSupplierCatalog().catch(e=>{
+      supplierState.matching=false;
+      supplierState.errors.push({supplier:'all',error:e.message||String(e)});
+    });
+  }
+  res.redirect('/');
+});
+
+app.post('/action/probe-attribute', async (req,res) => {
+  try{
+    const probe=await testOneAttributeWrite(null);
+    serverActionNotice=probe && probe.verified
+      ? ('✅ Prom подтвердил тест: '+(probe.field||'поле')+' = '+(probe.value||''))
+      : '❌ Prom не подтвердил тест характеристики.';
+    recalcSupplierFillable();
+  }catch(e){
+    serverActionNotice='Ошибка теста характеристики: '+(e.message||String(e));
+  }
+  res.redirect('/');
+});
+
+app.post('/action/mass-attributes', (req,res) => {
+  serverActionNotice='Запущено массовое заполнение подтверждённых характеристик.';
+  if(!enrichState.running){
+    enrichAttributesMass('all').catch(e=>{
+      enrichState.running=false;
+      enrichState.errors.push({error:e.message||String(e)});
+    });
+  }
+  res.redirect('/');
+});
+
+app.post('/action/mass-descriptions', (req,res) => {
+  serverActionNotice='Запущено дополнение пустых/коротких описаний.';
+  if(!enrichState.running){
+    enrichDescriptionsMass('all').catch(e=>{
+      enrichState.running=false;
+      enrichState.errors.push({error:e.message||String(e)});
+    });
+  }
+  res.redirect('/');
+});
+
 app.get('/api/suppliers/product/:id', async (req,res) => {
   try{
     const loadPage=String(req.query.page||'')==='1';
@@ -2002,21 +2097,107 @@ app.get('/api/suppliers/product/:id', async (req,res) => {
   }
 });
 
+
+function escHtmlServer(v){
+  return String(v == null ? '' : v)
+    .replace(/&/g,'&amp;')
+    .replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;')
+    .replace(/'/g,'&#39;');
+}
+
+function supplierStatusText(){
+  const st=supplierState||{};
+  const parts=[];
+  const bz=st.sources && st.sources.bezet;
+  const mi=st.sources && st.sources.militaris;
+
+  if(bz) parts.push('BEZET: '+(bz.ok ? ('✅ '+bz.count+' товаров') : ('❌ '+(bz.error||'ошибка'))));
+  if(mi) parts.push('Militaris: '+(mi.ok ? ('✅ '+mi.count+' товаров') : ('❌ '+(mi.error||'ошибка'))));
+
+  if(st.loading) parts.push('⏳ загружаю фиды');
+  if(st.matching) parts.push('⏳ сопоставление '+(st.match_processed||0)+'/'+(st.match_total||0));
+  else if(st.match_updated_at){
+    parts.push('Совпало с Prom: '+(st.matched_products||0)+' / '+((st.matched_products||0)+(st.unmatched_products||0)));
+    parts.push('Можно заполнить: '+(st.fillable_products||0)+' товаров / '+(st.fillable_fields||0)+' полей');
+  }
+
+  if((st.errors||[]).length) parts.push('Ошибок: '+st.errors.length);
+  return parts.length ? parts.join(' • ') : 'Поставщики ещё не загружены.';
+}
+
+function renderServerHtml(){
+  const summary=scanState.summary;
+  const total=summary && summary.total!=null ? summary.total : (scanState.total||0);
+  const avg=summary ? (summary.average_score+'%') : '—';
+  const need=summary && summary.need_safe_fix!=null ? summary.need_safe_fix : '—';
+  const errs=summary && summary.errors!=null ? summary.errors : (scanState.errors||0);
+  const progress=scanState.total ? Math.round((scanState.processed||0)/scanState.total*100) : 0;
+
+  let status='';
+  let diag='';
+
+  if(scanState.running){
+    status='🔄 Сканирую: '+(scanState.processed||0)+' / '+(scanState.total||0)+' ('+progress+'%)';
+    diag='Страница обновится автоматически.';
+  }else if(scanState.last_error){
+    status='❌ Сканирование завершилось ошибкой';
+    diag='Prom/API: '+scanState.last_error;
+  }else if(summary){
+    status='✅ Готово. Проверено '+(summary.valid||0)+' товаров.';
+    diag='Сканирование завершено.';
+  }else if(!PROM_TOKEN){
+    status='❌ PROM_TOKEN не найден';
+    diag='Добавь PROM_TOKEN в Render → Environment.';
+  }else{
+    status='⏳ Каталог ещё не просканирован';
+    diag='Нажми «Сканировать весь каталог».';
+  }
+
+  const shouldRefresh=Boolean(
+    scanState.running ||
+    supplierState.loading ||
+    supplierState.matching ||
+    enrichState.running ||
+    fixState.running
+  );
+
+  let out=html;
+  const replacements={
+    '__SSR_META_REFRESH__': shouldRefresh ? '<meta http-equiv="refresh" content="3">' : '',
+    '__SSR_STATUS__': escHtmlServer(status),
+    '__SSR_DIAG__': escHtmlServer(diag),
+    '__SSR_PROGRESS__': String(progress),
+    '__SSR_TOTAL__': total ? String(total) : '—',
+    '__SSR_AVG__': escHtmlServer(avg),
+    '__SSR_NEED__': escHtmlServer(need),
+    '__SSR_ERRS__': String(errs),
+    '__SSR_SUPPLIER__': escHtmlServer(supplierStatusText()),
+    '__SSR_NOTICE__': escHtmlServer(serverActionNotice||'')
+  };
+
+  for(const k of Object.keys(replacements)){
+    out=out.split(k).join(replacements[k]);
+  }
+  return out;
+}
+
 app.get('/', (_req,res) => {
-  if(PROM_TOKEN && !scanState.running && !scanState.summary && !(scanState.rows||[]).length){
+  if(PROM_TOKEN && !scanState.running && !scanState.summary && !(scanState.rows||[]).length && !scanState.last_error){
     setTimeout(() => startScan().catch(e => {
       scanState.last_error = e && e.message ? e.message : String(e);
       scanState.running = false;
       console.error('[AUTO SCAN ERROR]', scanState.last_error);
-    }), 300);
+    }), 250);
   }
-  res.type('html').send(html);
+  res.type('html').send(renderServerHtml());
 });
 
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.9.2 MOBILE FIX',
+    app: 'PrimeTac Card Manager v1.9.3 SERVER MODE',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2091,5 +2272,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.9.2 MOBILE FIX started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.9.3 SERVER MODE started on ${PORT}`);
 });

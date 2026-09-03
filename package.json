@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v192-mobile-fix",
-  "version": "1.9.2",
+  "name": "primetac-card-manager-v193-server-mode",
+  "version": "1.9.3",
   "private": true,
   "main": "server.js",
   "scripts": {
