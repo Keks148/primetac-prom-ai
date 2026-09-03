@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v171-mass-fix",
-  "version": "1.7.1",
+  "name": "primetac-card-manager-v18-supplier-enrich",
+  "version": "1.8.0",
   "private": true,
   "main": "server.js",
   "scripts": {
@@ -11,6 +11,8 @@
     "node": ">=18"
   },
   "dependencies": {
-    "express": "^4.21.2"
+    "express": "^4.21.2",
+    "fast-xml-parser": "^4.5.0",
+    "cheerio": "^1.0.0"
   }
 }

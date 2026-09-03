@@ -3,6 +3,8 @@
 
 const express = require('express');
 const https = require('https');
+const { XMLParser } = require('fast-xml-parser');
+const cheerio = require('cheerio');
 
 const app = express();
 app.use(express.json({ limit: '2mb' }));
@@ -16,6 +18,38 @@ const SCAN_CONCURRENCY = Math.max(1, Math.min(10, Number(process.env.SCAN_CONCUR
 const BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.BATCH_SIZE || 25)));
 const FIX_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.FIX_CONCURRENCY || 2)));
 const VERIFY_DELAY_MS = Math.max(300, Number(process.env.VERIFY_DELAY_MS || 700));
+
+const SUPPLIER_CONFIG = {
+  bezet: {
+    key: 'bezet',
+    name: 'BEZET',
+    feedUrl: String(process.env.BEZET_FEED_URL || 'https://www.bezet.com.ua/sync/prom-second').trim(),
+    siteUrl: String(process.env.BEZET_SITE_URL || 'https://www.bezet.com.ua').trim()
+  },
+  militaris: {
+    key: 'militaris',
+    name: 'Militaris',
+    feedUrl: String(process.env.MILITARIS_FEED_URL || 'https://militaris.com.ua/content/export/04658108dda3987543769e4a63b496ca.xml').trim(),
+    siteUrl: String(process.env.MILITARIS_SITE_URL || 'https://militaris.com.ua').trim()
+  }
+};
+
+let supplierState = {
+  loading: false,
+  matching: false,
+  updated_at: null,
+  match_updated_at: null,
+  sources: {},
+  matched_products: 0,
+  unmatched_products: 0,
+  errors: []
+};
+
+let supplierRecords = { bezet: [], militaris: [] };
+let supplierIndexes = { bezet: null, militaris: null };
+let supplierMatches = new Map();
+let promRawCache = new Map();
+
 
 const API_HOST = 'my.prom.ua';
 const API_PREFIX = '/api/v1';
@@ -231,6 +265,401 @@ function keywordSuggestions(p, uaName){
   if(!type) out.push('тактичне спорядження');
 
   return uniq(out).slice(0,7);
+}
+
+
+function cleanSku(v){
+  return norm(v).toUpperCase().replace(/[^A-ZА-ЯІЇЄҐ0-9_-]+/giu,'');
+}
+
+function normalizeNameForMatch(v){
+  return norm(v)
+    .toLowerCase()
+    .replace(/\b(чорний|черный|black|сірий|серый|grey|gray|хакі|хаки|khaki|койот|coyote|tan|олива|olive|зелений|зеленый|green|помаранчевий|оранжевый|orange|білий|белый|white|синій|синий|blue|multicam|мультикам|піксель|пиксель|foliage)\b/giu,' ')
+    .replace(/[^a-zа-яіїєґ0-9]+/giu,' ')
+    .replace(/\s+/g,' ')
+    .trim();
+}
+
+function nameTokens(v){
+  return new Set(normalizeNameForMatch(v).split(' ').filter(x=>x.length>=2));
+}
+
+function jaccardName(a,b){
+  const A=nameTokens(a), B=nameTokens(b);
+  if(!A.size || !B.size) return 0;
+  let inter=0;
+  for(const x of A) if(B.has(x)) inter++;
+  const union=new Set([...A,...B]).size;
+  return union ? inter/union : 0;
+}
+
+async function fetchText(url, timeoutMs=45000){
+  if(!/^https?:\/\//i.test(url)) throw new Error('Некорректный URL');
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(), timeoutMs);
+  try{
+    const r=await fetch(url,{
+      redirect:'follow',
+      signal:controller.signal,
+      headers:{
+        'User-Agent':'Mozilla/5.0 (PrimeTac Card Manager Supplier Enrichment)',
+        'Accept':'text/html,application/xml,text/xml,application/xhtml+xml,*/*'
+      }
+    });
+    if(!r.ok) throw new Error('HTTP '+r.status+' '+r.statusText);
+    return await r.text();
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+function arr(v){ return v===undefined || v===null ? [] : (Array.isArray(v)?v:[v]); }
+function primitive(v){
+  if(v===undefined || v===null) return '';
+  if(typeof v==='string' || typeof v==='number' || typeof v==='boolean') return String(v);
+  if(typeof v==='object') return primitive(v['#text'] ?? v['@_value'] ?? v.value ?? v.name ?? '');
+  return '';
+}
+
+function findOfferArrays(obj, out=[], depth=0){
+  if(!obj || depth>12) return out;
+  if(Array.isArray(obj)){
+    for(const x of obj) findOfferArrays(x,out,depth+1);
+    return out;
+  }
+  if(typeof obj!=='object') return out;
+  for(const [k,v] of Object.entries(obj)){
+    const low=k.toLowerCase();
+    if(['offer','product','item'].includes(low)){
+      const xs=arr(v).filter(x=>x && typeof x==='object');
+      if(xs.length) out.push(xs);
+    }
+    findOfferArrays(v,out,depth+1);
+  }
+  return out;
+}
+
+function paramMapFromNode(n){
+  const map={};
+  const candidates=[];
+  for(const key of ['param','params','parameter','parameters','property','properties','characteristic','characteristics']){
+    if(n && n[key]!==undefined) candidates.push(...arr(n[key]));
+  }
+  for(const p of candidates){
+    if(!p || typeof p!=='object') continue;
+    const name=norm(p['@_name'] || p['@_key'] || p.name || p.key || p.title || '');
+    const value=norm(primitive(p));
+    if(name && value) map[name]=value;
+  }
+  return map;
+}
+
+function supplierRecordFromNode(n, supplier){
+  const params=paramMapFromNode(n);
+  const name=norm(primitive(n.name || n.title || n.model || n.productName));
+  const sku=norm(primitive(n.vendorCode || n.vendor_code || n.sku || n.article || n.code || n['@_id'] || n.id));
+  const brand=norm(primitive(n.vendor || n.brand || n.manufacturer || params['Бренд'] || params['Виробник'] || params['Производитель']));
+  const url=norm(primitive(n.url || n.link || n.product_url || n['@_url']));
+  const description=stripHtml(primitive(n.description || n.desc || n.annotation));
+  const pictures=uniq(arr(n.picture || n.pictures || n.image || n.images).flatMap(x=>arr(x)).map(primitive).filter(Boolean));
+  const price=norm(primitive(n.price || n.priceRUAH || n.cost));
+  const category=norm(primitive(n.categoryId || n.category || n.category_id));
+  const available=norm(primitive(n['@_available'] ?? n.available ?? n.stock ?? n.quantity));
+  const id=norm(primitive(n['@_id'] || n.id || sku || name));
+  return {supplier,id,sku,name,brand,url,description,pictures,price,category,available,params,raw_hint:Object.keys(n).slice(0,30)};
+}
+
+function parseSupplierFeed(xml, supplier){
+  const parser=new XMLParser({ignoreAttributes:false,attributeNamePrefix:'@_',textNodeName:'#text',trimValues:true,parseTagValue:false});
+  const parsed=parser.parse(xml);
+  const arrays=findOfferArrays(parsed);
+  if(!arrays.length) return [];
+  arrays.sort((a,b)=>b.length-a.length);
+  const best=arrays[0];
+  const records=[];
+  const seen=new Set();
+  for(const n of best){
+    const r=supplierRecordFromNode(n,supplier);
+    if(!r.name && !r.sku) continue;
+    const k=(r.sku?cleanSku(r.sku):'')+'|'+normalizeNameForMatch(r.name);
+    if(seen.has(k)) continue;
+    seen.add(k); records.push(r);
+  }
+  return records;
+}
+
+function buildSupplierIndex(records){
+  const sku=new Map(), name=new Map();
+  for(const r of records){
+    if(r.sku){
+      const k=cleanSku(r.sku);
+      if(k){ if(!sku.has(k)) sku.set(k,[]); sku.get(k).push(r); }
+    }
+    if(r.name){
+      const k=normalizeNameForMatch(r.name);
+      if(k){ if(!name.has(k)) name.set(k,[]); name.get(k).push(r); }
+    }
+  }
+  return {sku,name};
+}
+
+function promSkuCandidates(p){
+  const vals=[];
+  for(const k of ['sku','article','vendor_code','vendorCode','code','external_id','externalId','presence_sku']){
+    if(p && p[k]!==undefined && p[k]!==null) vals.push(primitive(p[k]));
+  }
+  return uniq(vals.map(cleanSku).filter(Boolean));
+}
+
+function supplierScore(p,r){
+  const pSkus=promSkuCandidates(p);
+  const rSku=cleanSku(r.sku);
+  if(rSku && pSkus.includes(rSku)) return {score:100,reason:'SKU/артикул'};
+  const pn=normalizeNameForMatch(p.name), rn=normalizeNameForMatch(r.name);
+  if(pn && rn && pn===rn) return {score:96,reason:'точное название'};
+  const jac=jaccardName(p.name,r.name);
+  let score=Math.round(jac*90);
+  const pb=findBrand(p.name), rb=findBrand(r.name+' '+r.brand);
+  if(pb && rb && pb.toLowerCase()===rb.toLowerCase()) score+=5;
+  const pc=findColor(p.name), rc=findColor(r.name);
+  if(pc && rc && pc===rc) score+=3;
+  return {score:Math.min(94,score),reason:'сходство названия'};
+}
+
+function bestSupplierMatch(p){
+  let best=null;
+  for(const key of ['bezet','militaris']){
+    const records=supplierRecords[key]||[];
+    const idx=supplierIndexes[key];
+    if(!idx) continue;
+    let candidates=[];
+    for(const sku of promSkuCandidates(p)){
+      if(idx.sku.has(sku)) candidates.push(...idx.sku.get(sku));
+    }
+    const nk=normalizeNameForMatch(p.name);
+    if(idx.name.has(nk)) candidates.push(...idx.name.get(nk));
+    if(!candidates.length){
+      const toks=[...nameTokens(p.name)];
+      if(toks.length>=2){
+        candidates=records.filter(r=>{
+          const rt=nameTokens(r.name);
+          let hit=0; for(const t of toks) if(rt.has(t)) hit++;
+          return hit>=Math.min(3,toks.length);
+        }).slice(0,200);
+      }
+    }
+    const uniqCandidates=[...new Map(candidates.map(r=>[(r.id||r.sku||r.name),r])).values()];
+    for(const r of uniqCandidates){
+      const sc=supplierScore(p,r);
+      if(sc.score<58) continue;
+      const m={supplier:key,supplier_name:SUPPLIER_CONFIG[key].name,score:sc.score,reason:sc.reason,record:r};
+      if(!best || m.score>best.score) best=m;
+    }
+  }
+  return best;
+}
+
+function normalizeLabel(v){
+  return norm(v).toLowerCase().replace(/[.:]/g,'').replace(/\s+/g,' ');
+}
+
+function fieldFromLabels(map, labels){
+  for(const [k,v] of Object.entries(map||{})){
+    const nk=normalizeLabel(k);
+    if(labels.some(x=>nk.includes(x))) return norm(v);
+  }
+  return '';
+}
+
+function parseSupplierPage(html, url){
+  const $=cheerio.load(html);
+  $('script,style,noscript,svg').not('script[type="application/ld+json"]').remove();
+  const characteristics={};
+  let jsonProduct=null;
+
+  $('script[type="application/ld+json"]').each((_i,el)=>{
+    try{
+      const data=JSON.parse($(el).text());
+      const items=Array.isArray(data)?data:[data];
+      const walk=(x)=>{
+        if(!x || typeof x!=='object') return;
+        if(String(x['@type']||'').toLowerCase()==='product' && !jsonProduct) jsonProduct=x;
+        for(const v of Object.values(x)){
+          if(Array.isArray(v)) v.forEach(walk); else if(v && typeof v==='object') walk(v);
+        }
+      };
+      items.forEach(walk);
+    }catch(_){ }
+  });
+
+  $('tr').each((_i,tr)=>{
+    const cells=$(tr).find('th,td').map((_j,c)=>norm($(c).text())).get().filter(Boolean);
+    if(cells.length>=2 && cells[0].length<80) characteristics[cells[0]]=cells.slice(1).join(' ');
+  });
+  $('dt').each((_i,dt)=>{
+    const k=norm($(dt).text()); const v=norm($(dt).next('dd').text());
+    if(k&&v) characteristics[k]=v;
+  });
+
+  // Пары "лейбл — значение" в блоках характеристик, как на BEZET.
+  $('[class*=character], [class*=spec], [class*=property], [class*=attr]').each((_i,el)=>{
+    const txt=norm($(el).text());
+    const m=txt.match(/^(Бренд|Артикул|Країна виробник|Страна производитель|Колір|Цвет|Матеріал|Материал|Сезон|Особливості товару|Особенности товара|Призначення|Назначение|Догляд за речами|Уход|Мембрана|Утеплювач|Утеплитель|Блискавка|Молния|Склад|Состав|Вага|Вес)\s*[:\-]?\s*(.+)$/i);
+    if(m && m[2] && m[2].length<300) characteristics[m[1]]=m[2];
+  });
+
+  const bodyText=norm($('body').text());
+  const known=['Бренд','Артикул','Країна виробник','Колір','Матеріал','Сезон','Особливості товару','Призначення','Догляд за речами','Мембрана','Утеплювач','Блискавка','Склад','Вага'];
+  for(const label of known){
+    if(fieldFromLabels(characteristics,[normalizeLabel(label)])) continue;
+    const re=new RegExp(label+'\\s*[:\\-]?\\s*([^\\n|]{1,120})','i');
+    const m=bodyText.match(re); if(m) characteristics[label]=norm(m[1]);
+  }
+
+  const sizes=uniq(
+    $('button,input,label,option').map((_i,el)=>norm($(el).attr('value')||$(el).text())).get()
+      .flatMap(x=>detectSizes(x))
+  );
+
+  const title=norm(jsonProduct?.name || $('h1').first().text() || $('title').text());
+  const description=stripHtml(jsonProduct?.description || $('meta[name="description"]').attr('content') || '');
+  const sku=norm(jsonProduct?.sku || fieldFromLabels(characteristics,['артикул','sku','код']));
+  let brand='';
+  if(jsonProduct?.brand){ brand=norm(typeof jsonProduct.brand==='string'?jsonProduct.brand:jsonProduct.brand.name); }
+  if(!brand) brand=fieldFromLabels(characteristics,['бренд','виробник','производитель']);
+  const price=norm(jsonProduct?.offers?.price || jsonProduct?.offers?.lowPrice || '');
+
+  return {url,title,description,sku,brand,price,sizes,characteristics,body_sample:bodyText.slice(0,1200)};
+}
+
+function feedDetails(r){
+  const pm=r?.params||{};
+  const combined=(r?.name||'')+' '+(r?.description||'');
+  return {
+    producer: r?.brand || fieldFromLabels(pm,['бренд','виробник','производитель']) || findBrand(combined),
+    type: fieldFromLabels(pm,['вид виробу','вид товара','тип виробу','тип товара','категорія']) || findType(combined),
+    color: fieldFromLabels(pm,['колір','цвет']) || findColor(combined),
+    sizes: uniq(Object.entries(pm).filter(([k])=>/розмір|размер|size/i.test(k)).flatMap(([_k,v])=>detectSizes(v)).concat(detectSizes(combined))),
+    material: fieldFromLabels(pm,['матеріал','материал','склад','состав']),
+    season: fieldFromLabels(pm,['сезон']),
+    country: fieldFromLabels(pm,['країна','страна']),
+    purpose: fieldFromLabels(pm,['призначення','назначение']),
+    features: fieldFromLabels(pm,['особливості','особенности']),
+    membrane: fieldFromLabels(pm,['мембрана']),
+    insulation: fieldFromLabels(pm,['утеплювач','утеплитель']),
+    zipper: fieldFromLabels(pm,['блискавка','молния']),
+    weight: fieldFromLabels(pm,['вага','вес'])
+  };
+}
+
+function pageDetails(page){
+  const c=page?.characteristics||{};
+  const combined=(page?.title||'')+' '+(page?.description||'');
+  return {
+    producer: page?.brand || fieldFromLabels(c,['бренд','виробник','производитель']) || findBrand(combined),
+    type: fieldFromLabels(c,['вид виробу','вид товара','тип виробу','тип товара']) || findType(combined),
+    color: fieldFromLabels(c,['колір','цвет']) || findColor(combined),
+    sizes: uniq([...(page?.sizes||[]),...detectSizes(combined)]),
+    material: fieldFromLabels(c,['матеріал','материал','склад','состав']),
+    season: fieldFromLabels(c,['сезон']),
+    country: fieldFromLabels(c,['країна','страна']),
+    purpose: fieldFromLabels(c,['призначення','назначение']),
+    features: fieldFromLabels(c,['особливості','особенности']),
+    care: fieldFromLabels(c,['догляд','уход']),
+    membrane: fieldFromLabels(c,['мембрана']),
+    insulation: fieldFromLabels(c,['утеплювач','утеплитель']),
+    zipper: fieldFromLabels(c,['блискавка','молния']),
+    weight: fieldFromLabels(c,['вага','вес'])
+  };
+}
+
+function mergeSupplierDetails(feed, page){
+  const out={};
+  for(const k of ['producer','type','color','material','season','country','purpose','features','care','membrane','insulation','zipper','weight']){
+    out[k]=norm(page?.[k] || feed?.[k] || '');
+  }
+  out.sizes=uniq([...(page?.sizes||[]),...(feed?.sizes||[])]);
+  return out;
+}
+
+async function refreshSupplierFeeds(){
+  if(supplierState.loading) return;
+  supplierState.loading=true;
+  supplierState.errors=[];
+  try{
+    for(const key of ['bezet','militaris']){
+      const cfg=SUPPLIER_CONFIG[key];
+      try{
+        const xml=await fetchText(cfg.feedUrl,60000);
+        const records=parseSupplierFeed(xml,key);
+        supplierRecords[key]=records;
+        supplierIndexes[key]=buildSupplierIndex(records);
+        supplierState.sources[key]={ok:true,name:cfg.name,count:records.length,feed_url:cfg.feedUrl,site_url:cfg.siteUrl,error:null};
+      }catch(e){
+        supplierState.sources[key]={ok:false,name:cfg.name,count:0,feed_url:cfg.feedUrl,site_url:cfg.siteUrl,error:e.message||String(e)};
+        supplierState.errors.push({supplier:key,error:e.message||String(e)});
+      }
+    }
+    supplierState.updated_at=new Date().toISOString();
+  }finally{
+    supplierState.loading=false;
+  }
+}
+
+async function matchSupplierCatalog(){
+  if(supplierState.matching) return;
+  supplierState.matching=true;
+  try{
+    let products=[...promRawCache.values()];
+    if(!products.length){
+      products=await listAllProducts();
+      promRawCache=new Map(products.map(p=>[String(p.id),p]));
+    }
+    supplierMatches.clear();
+    let matched=0;
+    for(const p of products){
+      const m=bestSupplierMatch(p);
+      if(m){ supplierMatches.set(String(p.id),m); matched++; }
+    }
+    supplierState.matched_products=matched;
+    supplierState.unmatched_products=Math.max(0,products.length-matched);
+    supplierState.match_updated_at=new Date().toISOString();
+  }finally{
+    supplierState.matching=false;
+  }
+}
+
+async function getSupplierEnrichmentForProm(id, loadPage=false){
+  let p=promRawCache.get(String(id));
+  if(!p){
+    p=await getProduct(id);
+    if(p) promRawCache.set(String(id),p);
+  }
+  if(!p) throw new Error('Товар Prom не найден');
+  let match=supplierMatches.get(String(id));
+  if(!match){ match=bestSupplierMatch(p); if(match) supplierMatches.set(String(id),match); }
+  if(!match) return {ok:true,prom:{id:p.id,name:p.name},matched:false};
+  const feed=feedDetails(match.record);
+  let page=null, pageError=null;
+  if(loadPage && match.record.url){
+    try{ page=parseSupplierPage(await fetchText(match.record.url,45000),match.record.url); }
+    catch(e){ pageError=e.message||String(e); }
+  }
+  const pageD=page?pageDetails(page):null;
+  const merged=mergeSupplierDetails(feed,pageD);
+  return {
+    ok:true,
+    prom:{id:p.id,name:p.name,sku:promSkuCandidates(p)},
+    matched:true,
+    match:{supplier:match.supplier,supplier_name:match.supplier_name,score:match.score,reason:match.reason},
+    supplier_product:{id:match.record.id,sku:match.record.sku,name:match.record.name,url:match.record.url,brand:match.record.brand,price:match.record.price,params:match.record.params},
+    feed_details:feed,
+    page_loaded:Boolean(page),
+    page_error:pageError,
+    page:page,
+    merged
+  };
 }
 
 function promRequest(method,path,body=null){
@@ -521,6 +950,7 @@ async function startScan(){
 
   try{
     const products = await listAllProducts();
+    promRawCache = new Map(products.map(p => [String(p.id), p]));
     scanState.total = products.length;
 
     const rows = await poolMap(
@@ -697,14 +1127,14 @@ const html = `<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Card Manager v1.7.1 MASS FIX</title>
+<title>PrimeTac Card Manager v1.8 SUPPLIER ENRICH</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.7.1 MASS FIX</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.8 SUPPLIER ENRICH</span></h2>
 <div class="m">Рабочая запись UA keywords встроена. Остальные поля пока только проверяются и рекомендуются, чтобы не испортить категорийные характеристики Prom.</div>
 
 <div class="c">
@@ -725,6 +1155,16 @@ const html = `<!doctype html>
   <div class="stat"><div class="m">Среднее заполнение</div><div id="avg" class="n">—</div></div>
   <div class="stat"><div class="m">Нужно безопасно исправить</div><div id="need" class="n warn">—</div></div>
   <div class="stat"><div class="m">Ошибок сканирования</div><div id="errs" class="n bad">—</div></div>
+</div>
+
+<div class="c">
+  <b>🔗 Поставщики: BEZET + Militaris</b>
+  <div class="m" style="margin-top:5px">XML используется для массового сопоставления. Страница товара загружается только по кнопке, чтобы не бомбить сайты поставщиков тысячами запросов.</div>
+  <div class="row" style="margin-top:10px">
+    <button id="supplierRefreshBtn" class="secondary" onclick="supplierRefresh()">Обновить фиды</button>
+    <button id="supplierMatchBtn" class="secondary" onclick="supplierMatch()">Сопоставить с Prom</button>
+  </div>
+  <div id="supplierStatus" class="m" style="margin-top:8px">Поставщики ещё не загружены.</div>
 </div>
 
 <div class="c">
@@ -835,7 +1275,10 @@ function showDetail(id){
     html+='<div class="good">✅ Безопасных исправлений сейчас не требуется.</div>';
   }
 
+  html+='<div style="margin-top:10px"><button id="supplierOneBtn" class="secondary">🔗 Данные поставщика</button></div><div id="supplierOne" class="m" style="margin-top:10px"></div>';
   d.innerHTML=html;
+  const supplierBtn=document.getElementById('supplierOneBtn');
+  if(supplierBtn) supplierBtn.addEventListener('click',()=>loadSupplierOne(String(r.id),true));
   const fixBtn=document.getElementById('fixOneBtn');
   if(fixBtn) fixBtn.addEventListener('click',()=>fixOne(String(r.id)));
   d.scrollIntoView({behavior:'smooth',block:'start'});
@@ -954,16 +1397,123 @@ async function fixOne(id){
   }catch(e){alert('Ошибка: '+e.message)}
 }
 
+
+async function refreshSupplierState(){
+  try{
+    const d=await api('/api/suppliers/state');
+    const s=d.state||{};
+    const bz=s.sources?.bezet, mi=s.sources?.militaris;
+    let parts=[];
+    if(bz) parts.push('BEZET: '+(bz.ok?('✅ '+bz.count+' товаров'):('❌ '+bz.error)));
+    if(mi) parts.push('Militaris: '+(mi.ok?('✅ '+mi.count+' товаров'):('❌ '+mi.error)));
+    if(s.match_updated_at) parts.push('Совпало с Prom: '+s.matched_products+' / '+(s.matched_products+s.unmatched_products));
+    document.getElementById('supplierStatus').textContent=parts.length?parts.join(' • '):'Поставщики ещё не загружены.';
+    const rb=document.getElementById('supplierRefreshBtn');
+    const mb=document.getElementById('supplierMatchBtn');
+    if(rb) rb.disabled=Boolean(s.loading);
+    if(mb) mb.disabled=Boolean(s.loading||s.matching||!Object.values(s.sources||{}).some(x=>x.ok));
+  }catch(e){
+    const el=document.getElementById('supplierStatus'); if(el) el.textContent='Ошибка поставщиков: '+e.message;
+  }
+}
+
+async function supplierRefresh(){
+  const el=document.getElementById('supplierStatus'); if(el) el.textContent='Загружаю два фида...';
+  try{
+    await api('/api/suppliers/refresh',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const timer=setInterval(async()=>{
+      await refreshSupplierState();
+      const d=await api('/api/suppliers/state');
+      if(!d.state.loading){clearInterval(timer);}
+    },1200);
+  }catch(e){ if(el) el.textContent='Ошибка: '+e.message; }
+}
+
+async function supplierMatch(){
+  const el=document.getElementById('supplierStatus'); if(el) el.textContent='Сопоставляю товары по SKU/артикулу и названию...';
+  try{
+    await api('/api/suppliers/match',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const timer=setInterval(async()=>{
+      const d=await api('/api/suppliers/state');
+      await refreshSupplierState();
+      if(!d.state.matching){clearInterval(timer);}
+    },1200);
+  }catch(e){ if(el) el.textContent='Ошибка: '+e.message; }
+}
+
+function supplierField(label,value){
+  if(Array.isArray(value)) value=value.join(', ');
+  return '<div class="fbox"><b>'+esc(label)+'</b><div>'+(value?esc(value):'<span class="bad">нет данных</span>')+'</div></div>';
+}
+
+async function loadSupplierOne(id,loadPage){
+  const el=document.getElementById('supplierOne');
+  if(!el)return;
+  el.innerHTML='Ищу товар у поставщиков'+(loadPage?' и читаю страницу товара':'')+'...';
+  try{
+    const d=await api('/api/suppliers/product/'+encodeURIComponent(id)+(loadPage?'?page=1':''));
+    if(!d.matched){ el.innerHTML='<span class="bad">❌ Совпадение у поставщиков не найдено.</span>'; return; }
+    const m=d.merged||{};
+    let h='<div class="good"><b>✅ '+esc(d.match.supplier_name)+'</b> • совпадение '+d.match.score+'% ('+esc(d.match.reason)+')</div>';
+    h+='<div class="m">'+esc(d.supplier_product.name)+' • артикул '+esc(d.supplier_product.sku||'—')+'</div>';
+    if(d.supplier_product.url) h+='<div class="m">Страница: '+esc(d.supplier_product.url)+'</div>';
+    h+=supplierField('Производитель',m.producer);
+    h+=supplierField('Тип товара',m.type);
+    h+=supplierField('Цвет',m.color);
+    h+=supplierField('Размеры',m.sizes||[]);
+    h+=supplierField('Материал / состав',m.material);
+    h+=supplierField('Сезон',m.season);
+    h+=supplierField('Страна',m.country);
+    h+=supplierField('Назначение',m.purpose);
+    h+=supplierField('Особенности',m.features);
+    h+=supplierField('Мембрана',m.membrane);
+    h+=supplierField('Утеплитель',m.insulation);
+    h+=supplierField('Молния',m.zipper);
+    h+=supplierField('Вес',m.weight);
+    if(d.page_error) h+='<div class="warn">Страница не загрузилась: '+esc(d.page_error)+'</div>';
+    el.innerHTML=h;
+  }catch(e){ el.innerHTML='<span class="bad">Ошибка: '+esc(e.message)+'</span>'; }
+}
+
+refreshSupplierState();
 refresh();
 </script>
 </body></html>`;
+
+
+app.get('/api/suppliers/state', (_req,res) => {
+  const safeState=JSON.parse(JSON.stringify(supplierState));
+  res.json({ok:true,state:safeState});
+});
+
+app.post('/api/suppliers/refresh', (_req,res) => {
+  if(supplierState.loading) return res.json({ok:true,already_running:true});
+  refreshSupplierFeeds().catch(e=>{supplierState.errors.push({supplier:'all',error:e.message||String(e)});supplierState.loading=false;});
+  res.json({ok:true,started:true});
+});
+
+app.post('/api/suppliers/match', (_req,res) => {
+  if(supplierState.matching) return res.json({ok:true,already_running:true});
+  if(!supplierIndexes.bezet && !supplierIndexes.militaris) return res.status(400).json({error:'Сначала обновите фиды поставщиков'});
+  matchSupplierCatalog().catch(e=>{supplierState.errors.push({supplier:'match',error:e.message||String(e)});supplierState.matching=false;});
+  res.json({ok:true,started:true});
+});
+
+app.get('/api/suppliers/product/:id', async (req,res) => {
+  try{
+    const loadPage=String(req.query.page||'')==='1';
+    res.json(await getSupplierEnrichmentForProm(req.params.id,loadPage));
+  }catch(e){
+    res.status(500).json({error:e.message||String(e)});
+  }
+});
 
 app.get('/', (_req,res) => res.type('html').send(html));
 
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.7.1 MASS FIX',
+    app: 'PrimeTac Card Manager v1.8 SUPPLIER ENRICH',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -1033,5 +1583,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.7.1 MASS FIX started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.8 SUPPLIER ENRICH started on ${PORT}`);
 });
