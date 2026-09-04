@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v194-server-progress",
-  "version": "1.9.4",
+  "name": "primetac-card-manager-v195-no-hang",
+  "version": "1.9.5",
   "private": true,
   "main": "server.js",
   "scripts": {

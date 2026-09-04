@@ -1340,35 +1340,88 @@ async function editPromAttributes(id, details){
 
 async function testOneAttributeWrite(id=null){
   if(!supplierMatches.size) throw new Error('Сначала загрузите и сопоставьте поставщиков');
-  const candidates=id ? [String(id)] : [...supplierMatches.keys()];
-  for(const pid of candidates){
-    const match=supplierMatches.get(String(pid));
-    if(!match) continue;
-    let p=await getProduct(pid);
-    if(!p) continue;
-    const details=feedDetails(match.record);
-    const patch=buildAttributePatch(p,details);
-    if(!patch.changes.length) continue;
-    // На тесте меняем только ОДНУ характеристику.
-    const one=patch.changes[0];
-    const attrs=promAttributes(p).map(x=>JSON.parse(JSON.stringify(x)));
-    const target=findPromAttribute(p,ATTR_LABELS[one.key]||[]);
-    const idx=promAttributes(p).indexOf(target);
-    if(idx<0) continue;
-    attrs[idx]=setAttributeValue(target,one.after);
-    const payload={id:Number(pid),attributes:attrs};
-    if(p.presence) payload.presence=p.presence;
-    else if(p.status && ['available','not_available','preorder'].includes(String(p.status))) payload.presence=p.status;
-    const result=await promRequest('POST','/products/edit',[payload]);
-    await new Promise(r=>setTimeout(r,VERIFY_DELAY_MS));
-    const after=await getProduct(pid);
-    const aa=findPromAttribute(after,ATTR_LABELS[one.key]||[]);
-    const verified=Boolean(aa && norm(attrValue(aa)).toLowerCase()===norm(one.after).toLowerCase());
-    enrichState.attribute_probe={at:new Date().toISOString(),id:pid,name:p.name,field:one.name,value:one.after,verified,result};
-    if(after) promRawCache.set(String(pid),after);
-    return enrichState.attribute_probe;
+
+  // ВАЖНО: раньше тест последовательно обходил весь каталог.
+  // Если Prom API не отдавал ни одной записываемой характеристики,
+  // это выглядело как вечное зависание.
+  recalcSupplierFillable();
+
+  if(!id && Number(supplierState.fillable_fields||0) === 0){
+    throw new Error(
+      'Тест не запускается: Prom API не отдал ни одной пустой характеристики для записи (0 товаров / 0 полей). ' +
+      'Данные BEZET/Militaris найдены, но характеристики нужно обновлять через импорт Prom, а не products/edit.'
+    );
   }
-  throw new Error('Не найден товар, где Prom уже отдаёт пустую характеристику и поставщик даёт точное значение');
+
+  let candidates=[];
+  if(id){
+    candidates=[String(id)];
+  }else{
+    // Берём только товары, для которых уже по кешу реально есть план изменения.
+    for(const [pid,match] of supplierMatches.entries()){
+      const cached=promRawCache.get(String(pid));
+      if(!cached) continue;
+      const plan=supplierPlanForRawProduct(cached,match);
+      if(plan && plan.changes && plan.changes.length){
+        candidates.push(String(pid));
+        break; // для теста нужен только один товар
+      }
+    }
+  }
+
+  if(!candidates.length){
+    throw new Error(
+      'Нет товара для теста: Prom API не предоставляет записываемые пустые category attributes. ' +
+      'Используйте импорт характеристик.'
+    );
+  }
+
+  const pid=candidates[0];
+  const match=supplierMatches.get(String(pid));
+  if(!match) throw new Error('Товар поставщика не найден для теста');
+
+  let p=promRawCache.get(String(pid)) || await getProduct(pid);
+  if(!p) throw new Error('Товар Prom не найден');
+
+  const details=feedDetails(match.record);
+  const patch=buildAttributePatch(p,details);
+  if(!patch.changes.length){
+    throw new Error('У выбранного товара нет характеристики, которую Prom API позволяет заполнить');
+  }
+
+  const one=patch.changes[0];
+  const currentAttrs=promAttributes(p);
+  const attrs=currentAttrs.map(x=>JSON.parse(JSON.stringify(x)));
+  const target=findPromAttribute(p,ATTR_LABELS[one.key]||[]);
+  const idx=currentAttrs.indexOf(target);
+  if(idx<0) throw new Error('Prom не вернул нужную характеристику в attributes');
+
+  attrs[idx]=setAttributeValue(target,one.after);
+  const payload={id:Number(pid),attributes:attrs};
+  if(p.presence) payload.presence=p.presence;
+  else if(p.status && ['available','not_available','preorder'].includes(String(p.status))) payload.presence=p.status;
+
+  const result=await promRequest('POST','/products/edit',[payload]);
+  await new Promise(r=>setTimeout(r,VERIFY_DELAY_MS));
+
+  const after=await getProduct(pid);
+  const aa=findPromAttribute(after,ATTR_LABELS[one.key]||[]);
+  const verified=Boolean(
+    aa && norm(attrValue(aa)).toLowerCase()===norm(one.after).toLowerCase()
+  );
+
+  enrichState.attribute_probe={
+    at:new Date().toISOString(),
+    id:pid,
+    name:p.name,
+    field:one.name,
+    value:one.after,
+    verified,
+    result
+  };
+
+  if(after) promRawCache.set(String(pid),after);
+  return enrichState.attribute_probe;
 }
 
 async function enrichAttributesMass(limit='all'){
@@ -1435,14 +1488,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac Card Manager v1.9.4 SERVER PROGRESS</title>
+<title>PrimeTac Card Manager v1.9.5 NO HANG</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.4 SERVER PROGRESS</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.5 NO HANG</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -1478,7 +1531,7 @@ __SSR_META_REFRESH__
     <form method="post" action="/action/suppliers-sync" style="display:inline"><button type="submit">⚡ Загрузить + сопоставить</button></form>
     <form method="post" action="/action/suppliers-refresh" style="display:inline"><button type="submit" class="secondary">Только обновить фиды</button></form>
     <form method="post" action="/action/suppliers-match" style="display:inline"><button type="submit" class="secondary">Только сопоставить</button></form>
-    <form method="post" action="/action/probe-attribute" style="display:inline"><button type="submit" class="secondary">🧪 ТЕСТ 1 характеристики</button></form>
+    <form method="post" action="/action/probe-attribute" style="display:inline"><button type="submit" class="secondary">🧪 ТЕСТ API (только если есть поля)</button></form>
     <form method="post" action="/action/mass-attributes" style="display:inline"><button type="submit">🚀 Заполнить характеристики</button></form>
     <form method="post" action="/action/mass-descriptions" style="display:inline"><button type="submit" class="secondary">📝 Дополнить пустые описания</button></form>
   </div>
@@ -2067,7 +2120,12 @@ app.post('/action/probe-attribute', async (req,res) => {
 });
 
 app.post('/action/mass-attributes', (req,res) => {
-  serverActionNotice='Запущено заполнение характеристик. Если сверху указано 0 полей через API, изменений не будет.';
+  recalcSupplierFillable();
+  if(Number(supplierState.fillable_fields||0)===0){
+    serverActionNotice='⛔ Через API заполнять нечего: 0 товаров / 0 полей. Характеристики нужно обновлять через импорт Prom.';
+    return res.redirect('/');
+  }
+  serverActionNotice='Запущено заполнение характеристик через API.';
   if(!enrichState.running){
     enrichAttributesMass('all').catch(e=>{
       enrichState.running=false;
@@ -2262,7 +2320,7 @@ app.get('/', (_req,res) => {
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.9.4 SERVER PROGRESS',
+    app: 'PrimeTac Card Manager v1.9.5 NO HANG',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2337,5 +2395,5 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.9.4 SERVER PROGRESS started on ${PORT}`);
+  console.log(`PrimeTac Card Manager v1.9.5 NO HANG started on ${PORT}`);
 });
