@@ -20,6 +20,8 @@ const FIX_CONCURRENCY = Math.max(1, Math.min(3, Number(process.env.FIX_CONCURREN
 const VERIFY_DELAY_MS = Math.max(300, Number(process.env.VERIFY_DELAY_MS || 700));
 const KEYWORD_ACCEPT_MIN = Math.max(3, Math.min(7, Number(process.env.KEYWORD_ACCEPT_MIN || 4)));
 const ENRICH_CONCURRENCY = Math.max(1, Math.min(2, Number(process.env.ENRICH_CONCURRENCY || 1)));
+const AUTO_INTERVAL_HOURS = Math.max(1, Number(process.env.AUTO_INTERVAL_HOURS || 6));
+const AUTO_ON_START = String(process.env.AUTO_ON_START || 'true').toLowerCase() !== 'false';
 
 const SUPPLIER_CONFIG = {
   bezet: {
@@ -90,6 +92,31 @@ let fixState = {
 let enrichState = {
   running:false, mode:null, started_at:null, finished_at:null, planned:0, processed:0, verified:0, failed:0, changed_fields:0, errors:[], stop_requested:false, attribute_probe:null
 };
+
+let autoState = {
+  running:false,
+  stop_requested:false,
+  started_at:null,
+  finished_at:null,
+  next_run_at:null,
+  phase:'Ожидание',
+  progress:0,
+  keywords_planned:0,
+  keywords_changed:0,
+  descriptions_planned:0,
+  descriptions_changed:0,
+  attributes_planned:0,
+  attributes_imported:0,
+  import_id:null,
+  import_status:null,
+  import_error:null,
+  skipped_no_external_id:0,
+  skipped_no_group_id:0,
+  errors:[],
+  last_run_reason:null
+};
+let lastAutoImportXml='';
+
 
 function norm(v){ return String(v || '').replace(/\s+/g, ' ').trim(); }
 function stripHtml(v){
@@ -1482,20 +1509,231 @@ async function enrichDescriptionsMass(limit='all'){
 
 let serverActionNotice = '';
 
+function autoEscHtml(v){
+  return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function autoEscXml(v){
+  return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
+}
+function autoCdata(v){ return '<![CDATA['+String(v ?? '').replace(/]]>/g,']]]]><![CDATA[>')+']]>'; }
+function autoExternalId(p){ return norm(p?.external_id ?? p?.externalId ?? ''); }
+function autoGroupId(p){
+  return norm(
+    p?.group_id ?? p?.groupId ??
+    (p?.group && typeof p.group==='object' ? (p.group.id ?? p.group.external_id ?? p.group.externalId) : '') ??
+    p?.category_id ?? (p?.category && typeof p.category==='object' ? p.category.id : '') ?? ''
+  );
+}
+function autoPresence(p){
+  const x=String(p?.presence ?? p?.status ?? '').toLowerCase();
+  return !/not_available|out|нет|немає|false/.test(x);
+}
+function autoImportAttributes(match,p){
+  const map=new Map();
+  const raw=match?.record?.params || {};
+  for(const [k0,v0] of Object.entries(raw)){
+    const k=norm(k0),v=norm(v0);
+    if(!k || !v || k.length>90 || v.length>500) continue;
+    if(/ціна|цена|price|артикул|sku|код товар|наявн|налич|кількість|количество/i.test(k)) continue;
+    map.set(k,v);
+    if(map.size>=28) break;
+  }
+  const d=feedDetails(match?.record||{});
+  const put=(k,v)=>{v=norm(v); if(v && !map.has(k)) map.set(k,v);};
+  put('Виробник',d.producer);
+  put(d.type==='Куртка'?'Вид куртки':'Вид виробу',d.type);
+  put('Колір',d.color);
+  const sizes=uniq(d.sizes||[]); if(sizes.length===1) put('Міжнародний розмір',sizes[0]);
+  put('Матеріал',d.material);
+  put('Сезон',d.season);
+  put('Країна виробник',d.country);
+  put('Призначення',d.purpose);
+  put('Особливості товару',d.features);
+  put('Мембрана',d.membrane);
+  put('Утеплювач',d.insulation);
+  put('Блискавка',d.zipper);
+  put('Вага',d.weight);
+  return [...map.entries()].filter(([,v])=>norm(v));
+}
+
+function buildAutoYml(items){
+  const cats=new Map();
+  for(const x of items){
+    const gid=autoGroupId(x.p);
+    if(gid) cats.set(gid, getCategory(x.p)||'PrimeTac');
+  }
+  const catXml=[...cats.entries()].map(([id,name])=>`<category id="${autoEscXml(id)}">${autoEscXml(name)}</category>`).join('\n');
+  const offers=items.map(({p,match,attrs})=>{
+    const ext=autoExternalId(p), gid=autoGroupId(p);
+    const vendor=norm(match?.record?.brand || feedDetails(match?.record||{}).producer || '');
+    const params=attrs.map(([k,v])=>`<param name="${autoEscXml(k)}">${autoEscXml(v)}</param>`).join('\n');
+    return `<offer id="${autoEscXml(ext)}" available="${autoPresence(p)?'true':'false'}">
+<name>${autoEscXml(p.name||match?.record?.name||'Товар')}</name>
+<categoryId>${autoEscXml(gid)}</categoryId>
+${vendor?`<vendor>${autoEscXml(vendor)}</vendor>`:''}
+${params}
+</offer>`;
+  }).join('\n');
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE yml_catalog SYSTEM "shops.dtd">
+<yml_catalog date="${new Date().toISOString().slice(0,16).replace('T',' ')}">
+<shop>
+<name>PrimeTac Group Auto</name>
+<company>PrimeTac Group</company>
+<url>https://primetacgroup.pro</url>
+<currencies><currency id="UAH" rate="1"/></currencies>
+<categories>${catXml}</categories>
+<offers>${offers}</offers>
+</shop>
+</yml_catalog>`;
+}
+
+function promImportFile(xmlText,settings){
+  if(!PROM_TOKEN) return Promise.reject(new Error('PROM_TOKEN не задан'));
+  return new Promise((resolve,reject)=>{
+    const boundary='----PrimeTac'+Date.now().toString(16)+Math.random().toString(16).slice(2);
+    const chunks=[];
+    const add=x=>chunks.push(Buffer.isBuffer(x)?x:Buffer.from(String(x),'utf8'));
+    add(`--${boundary}\r\nContent-Disposition: form-data; name="data"\r\n\r\n${JSON.stringify(settings)}\r\n`);
+    add(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="primetac-attributes.xml"\r\nContent-Type: application/xml\r\n\r\n`);
+    add(Buffer.from(xmlText,'utf8'));
+    add(`\r\n--${boundary}--\r\n`);
+    const body=Buffer.concat(chunks);
+    const req=https.request({hostname:API_HOST,port:443,path:API_PREFIX+'/products/import_file',method:'POST',headers:{
+      'Authorization':`Bearer ${PROM_TOKEN}`,'Accept':'application/json','Content-Type':`multipart/form-data; boundary=${boundary}`,'Content-Length':body.length
+    },timeout:120000},res=>{
+      const bufs=[]; res.on('data',c=>bufs.push(c)); res.on('end',()=>{
+        const raw=Buffer.concat(bufs).toString('utf8'); let data={};
+        try{data=raw?JSON.parse(raw):{};}catch{data={raw};}
+        if(res.statusCode>=200&&res.statusCode<300) return resolve({status:res.statusCode,data});
+        reject(new Error(data?.error||data?.message||raw||('HTTP '+res.statusCode)));
+      });
+    });
+    req.on('timeout',()=>req.destroy(new Error('Prom import timeout'))); req.on('error',reject); req.write(body); req.end();
+  });
+}
+function autoImportId(data){ return data?.id ?? data?.import_id ?? data?.importId ?? data?.process_id ?? data?.data?.id ?? null; }
+async function waitAutoImport(id,timeoutMs=12*60*1000){
+  if(!id) return {ok:true,status:'ACCEPTED'};
+  const t0=Date.now(); let last=null;
+  while(Date.now()-t0<timeoutMs){
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+    await new Promise(r=>setTimeout(r,5000));
+    try{
+      const r=await promRequest('GET','/products/import/status/'+encodeURIComponent(id));
+      last=r.data||{};
+      const st=String(last?.status ?? last?.state ?? last?.result ?? '').toUpperCase();
+      if(/SUCCESS|DONE|FINISH|COMPLETE/.test(st)) return {ok:true,status:st,data:last};
+      if(/ERROR|FAIL/.test(st)) return {ok:false,status:st,data:last};
+    }catch(e){ autoState.errors.push({where:'import-status',error:e.message||String(e)}); }
+  }
+  return {ok:false,status:'TIMEOUT',data:last};
+}
+
+async function autoImportCharacteristics(){
+  autoState.phase='Характеристики: подготовка импорта';
+  const items=[];
+  autoState.skipped_no_external_id=0; autoState.skipped_no_group_id=0;
+  for(const [id,match] of supplierMatches.entries()){
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+    let p=promRawCache.get(String(id));
+    if(!p) continue;
+    const ext=autoExternalId(p),gid=autoGroupId(p);
+    if(!ext){autoState.skipped_no_external_id++;continue;}
+    if(!gid){autoState.skipped_no_group_id++;continue;}
+    const attrs=autoImportAttributes(match,p);
+    if(attrs.length<1) continue;
+    items.push({p,match,attrs});
+  }
+  autoState.attributes_planned=items.length;
+  if(!items.length){ autoState.import_status='SKIPPED: нет товаров для импорта'; return; }
+  const xml=buildAutoYml(items); lastAutoImportXml=xml;
+  autoState.phase=`Характеристики: отправляю ${items.length} товаров в Prom`;
+  autoState.progress=88;
+  const settings={force_update:false,only_available:false,only_update:true,mark_missing_product_as:'none',updated_fields:['attributes']};
+  const r=await promImportFile(xml,settings);
+  const id=autoImportId(r.data); autoState.import_id=id; autoState.import_status='ACCEPTED';
+  autoState.phase='Характеристики: Prom обрабатывает импорт'; autoState.progress=92;
+  const st=await waitAutoImport(id);
+  autoState.import_status=st.status;
+  if(st.ok){autoState.attributes_imported=items.length;}
+  else throw new Error('Prom не подтвердил импорт характеристик: '+st.status);
+}
+
+async function runAutoAll(reason='manual'){
+  if(autoState.running) return;
+  if(!WRITE_ENABLED) throw new Error('WRITE_ENABLED=false');
+  if(!PROM_TOKEN) throw new Error('PROM_TOKEN не задан');
+  Object.assign(autoState,{running:true,stop_requested:false,started_at:new Date().toISOString(),finished_at:null,phase:'Запуск',progress:1,
+    keywords_planned:0,keywords_changed:0,descriptions_planned:0,descriptions_changed:0,attributes_planned:0,attributes_imported:0,
+    import_id:null,import_status:null,import_error:null,errors:[],last_run_reason:reason});
+  try{
+    autoState.phase='1/5 Сканирую каталог Prom'; autoState.progress=5;
+    await startScan();
+    if(scanState.last_error) throw new Error(scanState.last_error);
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+
+    autoState.phase='2/5 Загружаю BEZET + Militaris и сопоставляю'; autoState.progress=20;
+    await syncSuppliers();
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+
+    autoState.phase='3/5 Дополняю UA ключи'; autoState.progress=42;
+    autoState.keywords_planned=Number(scanState.summary?.need_safe_fix||0);
+    await startBatchFix('all','auto-v2');
+    autoState.keywords_changed=Number(fixState.verified||0);
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+
+    autoState.phase='4/5 Дополняю слабые описания'; autoState.progress=63;
+    await enrichDescriptionsMass('all');
+    autoState.descriptions_planned=Number(enrichState.planned||0);
+    autoState.descriptions_changed=Number(enrichState.verified||0);
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+
+    autoState.phase='5/5 Заполняю характеристики через импорт Prom'; autoState.progress=82;
+    await autoImportCharacteristics();
+    autoState.phase='Готово'; autoState.progress=100;
+  }catch(e){
+    const msg=e?.message||String(e);
+    if(msg==='Остановлено пользователем') autoState.phase='Остановлено';
+    else { autoState.phase='Ошибка'; autoState.errors.unshift({where:autoState.phase,error:msg}); autoState.import_error=msg; }
+  }finally{
+    autoState.running=false; autoState.finished_at=new Date().toISOString();
+    autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
+  }
+}
+
+function renderAutoHome(){
+  const refresh=autoState.running?'<meta http-equiv="refresh" content="4">':'';
+  const fmt=v=>{try{return v?new Date(v).toLocaleString('ru-RU',{timeZone:'Europe/Kyiv'}):'—'}catch{return v||'—'}};
+  const latestErr=autoState.errors?.[0]||null;
+  const unmatched=Number(supplierState.unmatched_products||0);
+  const total=Number(scanState.summary?.valid||scanState.total||0);
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
+<title>PrimeTac AUTO v2</title><style>
+:root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v2.0 SIMPLE</span></h1><div class="m">Одна кнопка. Сам сканирует Prom, загружает BEZET + Militaris, дополняет ключи и слабые описания, затем отправляет характеристики через официальный импорт Prom. Цены, остатки и фото не трогает.</div>
+<div class="c"><form method="post" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="post" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
+<div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div></div>
+<div class="c"><b>Импорт характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>${autoState.import_error?`<div class="bad m">${autoEscHtml(autoState.import_error)}</div>`:''}</div>
+${latestErr?`<div class="c"><b class="bad">Последняя ошибка</b><div class="m">${autoEscHtml(latestErr.error||'')}</div></div>`:''}
+<div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy первый запуск начинается сам, если <code>AUTO_ON_START</code> не выключен.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/last-import.xml">Последний XML характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
+</div></body></html>`;
+}
+
 const html = `<!doctype html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac Card Manager v1.9.5 NO HANG</title>
+<title>PrimeTac AUTO v2.0 SIMPLE</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v1.9.5 NO HANG</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v2.0 SIMPLE</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -2306,21 +2544,23 @@ function renderServerHtml(){
   return out;
 }
 
-app.get('/', (_req,res) => {
-  if(PROM_TOKEN && !scanState.running && !scanState.summary && !(scanState.rows||[]).length && !scanState.last_error){
-    setTimeout(() => startScan().catch(e => {
-      scanState.last_error = e && e.message ? e.message : String(e);
-      scanState.running = false;
-      console.error('[AUTO SCAN ERROR]', scanState.last_error);
-    }), 250);
-  }
-  res.type('html').send(renderServerHtml());
+app.get('/', (_req,res) => { res.type('html').send(renderAutoHome()); });
+app.get('/legacy', (_req,res) => { res.type('html').send(renderServerHtml()); });
+app.post('/auto/run', (_req,res) => {
+  if(!autoState.running) setTimeout(()=>runAutoAll('manual').catch(e=>{autoState.errors.unshift({where:'run',error:e.message||String(e)});autoState.running=false;}),50);
+  res.redirect('/');
 });
+app.post('/auto/stop', (_req,res) => {
+  autoState.stop_requested=true; fixState.stop_requested=true; enrichState.stop_requested=true;
+  res.redirect('/');
+});
+app.get('/auto/state', (_req,res) => res.json({auto:autoState,scan:scanState.summary,suppliers:supplierState,fix:fixState,enrich:enrichState}));
+app.get('/auto/last-import.xml', (_req,res) => res.type('application/xml').send(lastAutoImportXml||'<?xml version="1.0"?><empty/>'));
 
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac Card Manager v1.9.5 NO HANG',
+    app: 'PrimeTac AUTO v2.0 SIMPLE',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2395,5 +2635,14 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac Card Manager v1.9.5 NO HANG started on ${PORT}`);
+  console.log(`PrimeTac AUTO v2.0 SIMPLE started on ${PORT}`);
+  autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
+  if(AUTO_ON_START && PROM_TOKEN && WRITE_ENABLED){
+    setTimeout(()=>runAutoAll('startup').catch(e=>{autoState.errors.unshift({where:'startup',error:e.message||String(e)});autoState.running=false;}),5000);
+  }
 });
+setInterval(()=>{
+  if(!autoState.running && PROM_TOKEN && WRITE_ENABLED){
+    runAutoAll('schedule').catch(e=>{autoState.errors.unshift({where:'schedule',error:e.message||String(e)});autoState.running=false;});
+  }
+}, AUTO_INTERVAL_HOURS*3600*1000);

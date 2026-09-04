@@ -1,6 +1,6 @@
 {
-  "name": "primetac-card-manager-v195-no-hang",
-  "version": "1.9.5",
+  "name": "primetac-auto-v2-simple",
+  "version": "2.0.0",
   "private": true,
   "main": "server.js",
   "scripts": {
