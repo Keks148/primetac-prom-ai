@@ -109,6 +109,8 @@ let autoState = {
   attributes_imported:0,
   import_id:null,
   import_status:null,
+  import_http_status:null,
+  import_response:null,
   import_error:null,
   skipped_no_external_id:0,
   skipped_no_group_id:0,
@@ -926,16 +928,15 @@ function promRequest(method,path,body=null){
           return resolve({ status: res.statusCode, data });
         }
 
-        const errText =
-          data?.error ||
-          data?.message ||
-          (data?.errors ? JSON.stringify(data.errors) : '') ||
-          raw ||
-          `HTTP ${res.statusCode}`;
+        const errText = autoErrorText(
+          data?.error ?? data?.errors ?? data?.message ?? data ?? raw
+        ) || `HTTP ${res.statusCode}`;
 
-        const e = new Error(String(errText));
+        const e = new Error(`Prom API HTTP ${res.statusCode}: ${errText}`);
         e.status = res.statusCode;
+        e.statusCode = res.statusCode;
         e.data = data;
+        e.raw = raw;
         reject(e);
       });
     });
@@ -1515,6 +1516,33 @@ function autoEscHtml(v){
 function autoEscXml(v){
   return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
+function autoSafeJson(v){
+  try{
+    if(typeof v==='string') return v;
+    return JSON.stringify(v,null,2);
+  }catch(_){ return String(v); }
+}
+function autoErrorText(v){
+  if(v==null) return '';
+  if(typeof v==='string') return v;
+  if(v instanceof Error) return v.message || String(v);
+  if(typeof v==='object'){
+    const direct=v.message ?? v.detail ?? v.description ?? v.reason;
+    const nested=v.error ?? v.errors;
+    const parts=[];
+    if(direct!=null) parts.push(autoErrorText(direct));
+    if(nested!=null) parts.push(autoErrorText(nested));
+    const txt=parts.filter(Boolean).join(' | ');
+    return txt || autoSafeJson(v);
+  }
+  return String(v);
+}
+function autoHttpError(prefix,status,data,raw){
+  const detail=autoErrorText(data?.error ?? data?.errors ?? data?.message ?? data ?? raw);
+  const e=new Error(`${prefix} HTTP ${status}${detail?': '+detail:''}`);
+  e.status=status; e.statusCode=status; e.data=data; e.raw=raw;
+  return e;
+}
 function autoCdata(v){ return '<![CDATA['+String(v ?? '').replace(/]]>/g,']]]]><![CDATA[>')+']]>'; }
 function autoExternalId(p){ return norm(p?.external_id ?? p?.externalId ?? ''); }
 function autoGroupId(p){
@@ -1566,11 +1594,20 @@ function buildAutoYml(items){
   const offers=items.map(({p,match,attrs})=>{
     const ext=autoExternalId(p), gid=autoGroupId(p);
     const vendor=norm(match?.record?.brand || feedDetails(match?.record||{}).producer || '');
+    const name=norm(p?.name || match?.record?.name || 'Товар');
+    // Prom YML requires description even when updated_fields contains only attributes.
+    // We send the current Prom description when possible; import settings prevent changing it.
+    const description=String(p?.description || match?.record?.description || name || 'Товар');
+    const price=norm(p?.price ?? p?.price_value ?? '');
+    const sku=norm(p?.sku ?? p?.presence_sku ?? p?.article ?? '');
     const params=attrs.map(([k,v])=>`<param name="${autoEscXml(k)}">${autoEscXml(v)}</param>`).join('\n');
     return `<offer id="${autoEscXml(ext)}" available="${autoPresence(p)?'true':'false'}">
-<name>${autoEscXml(p.name||match?.record?.name||'Товар')}</name>
+<name>${autoEscXml(name)}</name>
 <categoryId>${autoEscXml(gid)}</categoryId>
+${price?`<price>${autoEscXml(price)}</price>\n<currencyId>UAH</currencyId>`:''}
+${sku?`<vendorCode>${autoEscXml(sku.slice(0,25))}</vendorCode>`:''}
 ${vendor?`<vendor>${autoEscXml(vendor)}</vendor>`:''}
+<description>${autoCdata(description)}</description>
 ${params}
 </offer>`;
   }).join('\n');
@@ -1605,8 +1642,10 @@ function promImportFile(xmlText,settings){
       const bufs=[]; res.on('data',c=>bufs.push(c)); res.on('end',()=>{
         const raw=Buffer.concat(bufs).toString('utf8'); let data={};
         try{data=raw?JSON.parse(raw):{};}catch{data={raw};}
-        if(res.statusCode>=200&&res.statusCode<300) return resolve({status:res.statusCode,data});
-        reject(new Error(data?.error||data?.message||raw||('HTTP '+res.statusCode)));
+        if(res.statusCode>=200&&res.statusCode<300){
+          return resolve({status:res.statusCode,data,raw});
+        }
+        reject(autoHttpError('Prom import',res.statusCode,data,raw));
       });
     });
     req.on('timeout',()=>req.destroy(new Error('Prom import timeout'))); req.on('error',reject); req.write(body); req.end();
@@ -1625,7 +1664,9 @@ async function waitAutoImport(id,timeoutMs=12*60*1000){
       const st=String(last?.status ?? last?.state ?? last?.result ?? '').toUpperCase();
       if(/SUCCESS|DONE|FINISH|COMPLETE/.test(st)) return {ok:true,status:st,data:last};
       if(/ERROR|FAIL/.test(st)) return {ok:false,status:st,data:last};
-    }catch(e){ autoState.errors.push({where:'import-status',error:e.message||String(e)}); }
+    }catch(e){
+      autoState.errors.push({where:'import-status',status:e?.statusCode||e?.status||null,error:autoErrorText(e),data:e?.data||null});
+    }
   }
   return {ok:false,status:'TIMEOUT',data:last};
 }
@@ -1651,7 +1692,16 @@ async function autoImportCharacteristics(){
   autoState.phase=`Характеристики: отправляю ${items.length} товаров в Prom`;
   autoState.progress=88;
   const settings={force_update:false,only_available:false,only_update:true,mark_missing_product_as:'none',updated_fields:['attributes']};
-  const r=await promImportFile(xml,settings);
+  let r;
+  try{
+    r=await promImportFile(xml,settings);
+    autoState.import_http_status=r.status||null;
+    autoState.import_response=r.data||null;
+  }catch(e){
+    autoState.import_http_status=e?.statusCode||e?.status||null;
+    autoState.import_response=e?.data||e?.raw||null;
+    throw e;
+  }
   const id=autoImportId(r.data); autoState.import_id=id; autoState.import_status='ACCEPTED';
   autoState.phase='Характеристики: Prom обрабатывает импорт'; autoState.progress=92;
   const st=await waitAutoImport(id);
@@ -1666,7 +1716,7 @@ async function runAutoAll(reason='manual'){
   if(!PROM_TOKEN) throw new Error('PROM_TOKEN не задан');
   Object.assign(autoState,{running:true,stop_requested:false,started_at:new Date().toISOString(),finished_at:null,phase:'Запуск',progress:1,
     keywords_planned:0,keywords_changed:0,descriptions_planned:0,descriptions_changed:0,attributes_planned:0,attributes_imported:0,
-    import_id:null,import_status:null,import_error:null,errors:[],last_run_reason:reason});
+    import_id:null,import_status:null,import_http_status:null,import_response:null,import_error:null,errors:[],last_run_reason:reason});
   try{
     autoState.phase='1/5 Сканирую каталог Prom'; autoState.progress=5;
     await startScan();
@@ -1693,9 +1743,14 @@ async function runAutoAll(reason='manual'){
     await autoImportCharacteristics();
     autoState.phase='Готово'; autoState.progress=100;
   }catch(e){
-    const msg=e?.message||String(e);
+    const msg=autoErrorText(e) || String(e);
     if(msg==='Остановлено пользователем') autoState.phase='Остановлено';
-    else { autoState.phase='Ошибка'; autoState.errors.unshift({where:autoState.phase,error:msg}); autoState.import_error=msg; }
+    else {
+      autoState.phase='Ошибка';
+      autoState.errors.unshift({where:'auto-run',status:e?.statusCode||e?.status||null,error:msg,data:e?.data||null});
+      autoState.import_error=msg;
+      console.error('[PrimeTac AUTO ERROR]',msg,e?.data?autoSafeJson(e.data):'');
+    }
   }finally{
     autoState.running=false; autoState.finished_at=new Date().toISOString();
     autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
@@ -1709,12 +1764,12 @@ function renderAutoHome(){
   const unmatched=Number(supplierState.unmatched_products||0);
   const total=Number(scanState.summary?.valid||scanState.total||0);
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v2</title><style>
+<title>PrimeTac AUTO v2.3</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v2.2 ROUTE FIX</span></h1><div class="m">Одна кнопка. Сам сканирует Prom, загружает BEZET + Militaris, дополняет ключи и слабые описания, затем отправляет характеристики через официальный импорт Prom. Цены, остатки и фото не трогает.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v2.3 IMPORT DIAG</span></h1><div class="m">Одна кнопка. Сам сканирует Prom, загружает BEZET + Militaris, дополняет ключи и слабые описания, затем отправляет характеристики через официальный импорт Prom. Цены, остатки и фото не трогает.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div></div>
-<div class="c"><b>Импорт характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>${autoState.import_error?`<div class="bad m">${autoEscHtml(autoState.import_error)}</div>`:''}</div>
+<div class="c"><b>Импорт характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')} · HTTP: ${autoEscHtml(autoState.import_http_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>${autoState.import_error?`<div class="bad m" style="white-space:pre-wrap;margin-top:7px">${autoEscHtml(autoState.import_error)}</div>`:''}${autoState.import_response?`<details style="margin-top:8px"><summary class="m">Ответ Prom</summary><pre class="m" style="white-space:pre-wrap;overflow-wrap:anywhere">${autoEscHtml(autoSafeJson(autoState.import_response)).slice(0,8000)}</pre></details>`:''}</div>
 ${latestErr?`<div class="c"><b class="bad">Последняя ошибка</b><div class="m">${autoEscHtml(latestErr.error||'')}</div></div>`:''}
 <div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy первый запуск начинается сам, если <code>AUTO_ON_START</code> не выключен.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/last-import.xml">Последний XML характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
 </div></body></html>`;
@@ -1726,14 +1781,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v2.2 ROUTE FIX</title>
+<title>PrimeTac AUTO v2.3 IMPORT DIAG</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v2.2 ROUTE FIX</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v2.3 IMPORT DIAG</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -2576,7 +2631,7 @@ app.get('/auto/last-import.xml', (_req,res) => res.type('application/xml').send(
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v2.2 ROUTE FIX',
+    app: 'PrimeTac AUTO v2.3 IMPORT DIAG',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2651,7 +2706,7 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v2.2 ROUTE FIX started on ${PORT}`);
+  console.log(`PrimeTac AUTO v2.3 IMPORT DIAG started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   if(AUTO_ON_START && PROM_TOKEN && WRITE_ENABLED){
     setTimeout(()=>runAutoAll('startup').catch(e=>{autoState.errors.unshift({where:'startup',error:e.message||String(e)});autoState.running=false;}),5000);
