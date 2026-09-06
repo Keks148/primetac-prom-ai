@@ -25,6 +25,9 @@ const AUTO_ON_START = String(process.env.AUTO_ON_START || 'true').toLowerCase() 
 const AUTO_IMPORT_LOCK_WAIT_SEC = Math.max(15, Number(process.env.AUTO_IMPORT_LOCK_WAIT_SEC || 45));
 const AUTO_IMPORT_LOCK_MAX_MIN = Math.max(5, Number(process.env.AUTO_IMPORT_LOCK_MAX_MIN || 45));
 const AUTO_IMPORT_STATUS_MAX_MIN = Math.max(10, Number(process.env.AUTO_IMPORT_STATUS_MAX_MIN || 30));
+const SUPPLIER_FEED_ATTEMPTS = Math.max(2, Math.min(6, Number(process.env.SUPPLIER_FEED_ATTEMPTS || 4)));
+const SUPPLIER_FEED_TIMEOUT_MS = Math.max(30000, Number(process.env.SUPPLIER_FEED_TIMEOUT_MS || 90000));
+const SUPPLIER_FEED_RETRY_SEC = Math.max(2, Number(process.env.SUPPLIER_FEED_RETRY_SEC || 8));
 
 const SUPPLIER_CONFIG = {
   bezet: {
@@ -125,6 +128,34 @@ let lastAutoImportXml='';
 
 
 function norm(v){ return String(v || '').replace(/\s+/g, ' ').trim(); }
+
+function safeText(v){
+  if(v===undefined || v===null) return '';
+  if(typeof v==='string') return v;
+  if(v instanceof Error) return v.message || String(v);
+  if(typeof v==='number' || typeof v==='boolean') return String(v);
+  if(Array.isArray(v)) return v.map(safeText).filter(Boolean).join('; ');
+  if(typeof v==='object'){
+    for(const k of ['message','error_description','description','detail','reason']){
+      if(v[k]!==undefined && v[k]!==null){
+        const t=safeText(v[k]);
+        if(t) return t;
+      }
+    }
+    if(v.error!==undefined){
+      const t=safeText(v.error);
+      if(t) return t;
+    }
+    if(v.errors!==undefined){
+      const t=safeText(v.errors);
+      if(t) return t;
+    }
+    try{return JSON.stringify(v);}
+    catch{return '[не удалось прочитать объект ошибки]';}
+  }
+  return String(v);
+}
+
 function stripHtml(v){
   return String(v || '')
     .replace(/<script[\s\S]*?<\/script>/gi, ' ')
@@ -463,6 +494,28 @@ async function fetchText(url, timeoutMs=45000){
   }
 }
 
+async function fetchTextRetry(url,label='фид'){
+  let last=null;
+  for(let attempt=1;attempt<=SUPPLIER_FEED_ATTEMPTS;attempt++){
+    try{
+      if(autoState && autoState.running){
+        autoState.phase=`2/4 Загружаю ${label}: попытка ${attempt}/${SUPPLIER_FEED_ATTEMPTS}`;
+      }
+      return await fetchText(url,SUPPLIER_FEED_TIMEOUT_MS);
+    }catch(e){
+      last=e;
+      if(attempt>=SUPPLIER_FEED_ATTEMPTS) break;
+      if(autoState && autoState.stop_requested) throw new Error('Остановлено пользователем');
+      const delay=SUPPLIER_FEED_RETRY_SEC*1000*attempt;
+      if(autoState && autoState.running){
+        autoState.phase=`2/4 ${label} временно недоступен. Повтор через ${Math.round(delay/1000)} сек`;
+      }
+      await new Promise(r=>setTimeout(r,delay));
+    }
+  }
+  throw last || new Error(label+' не загрузился');
+}
+
 function arr(v){ return v===undefined || v===null ? [] : (Array.isArray(v)?v:[v]); }
 function primitive(v){
   if(v===undefined || v===null) return '';
@@ -799,15 +852,15 @@ async function refreshSupplierFeeds(){
     for(const key of ['bezet','militaris']){
       const cfg=SUPPLIER_CONFIG[key];
       try{
-        const xml=await fetchText(cfg.feedUrl,60000);
+        const xml=await fetchTextRetry(cfg.feedUrl,cfg.name);
         const records=parseSupplierFeed(xml,key);
         if(!records.length) throw new Error('Фид загрузился, но товары не распознаны. Проверьте формат фида.');
         supplierRecords[key]=records;
         supplierIndexes[key]=buildSupplierIndex(records);
         supplierState.sources[key]={ok:true,name:cfg.name,count:records.length,feed_url:cfg.feedUrl,site_url:cfg.siteUrl,error:null};
       }catch(e){
-        supplierState.sources[key]={ok:false,name:cfg.name,count:0,feed_url:cfg.feedUrl,site_url:cfg.siteUrl,error:e.message||String(e)};
-        supplierState.errors.push({supplier:key,error:e.message||String(e)});
+        supplierState.sources[key]={ok:false,name:cfg.name,count:0,feed_url:cfg.feedUrl,site_url:cfg.siteUrl,error:safeText(e)};
+        supplierState.errors.push({supplier:key,error:safeText(e)});
       }
     }
     supplierState.updated_at=new Date().toISOString();
@@ -853,8 +906,25 @@ async function matchSupplierCatalog(){
 
 async function syncSuppliers(){
   await refreshSupplierFeeds();
-  const okAny=Object.values(supplierState.sources||{}).some(x=>x && x.ok);
-  if(!okAny) throw new Error('Ни один фид поставщика не загрузился');
+
+  const missing=[];
+  for(const key of ['bezet','militaris']){
+    const src=supplierState.sources?.[key];
+    if(!src?.ok){
+      missing.push(`${SUPPLIER_CONFIG[key].name}: ${safeText(src?.error)||'не загрузился'}`);
+    }
+  }
+
+  if(missing.length){
+    supplierMatches.clear();
+    supplierState.matched_products=0;
+    supplierState.unmatched_products=Number(scanState.total||promRawCache.size||0);
+    throw new Error(
+      'Не продолжаю частичную обработку. Не загрузились все поставщики: '+
+      missing.join(' | ')
+    );
+  }
+
   await matchSupplierCatalog();
 }
 
@@ -1477,7 +1547,7 @@ async function enrichAttributesMass(limit='all'){
           if(r.skipped) continue;
           if(r.verified){ enrichState.verified++; enrichState.changed_fields+=(r.verified_changes||[]).length; }
           else { enrichState.failed++; enrichState.errors.push({id,error:'Prom не подтвердил запись характеристик',planned:r.planned_changes}); }
-        }catch(e){ enrichState.processed++; enrichState.failed++; enrichState.errors.push({id,error:e.message||String(e)}); }
+        }catch(e){ enrichState.processed++; enrichState.failed++; enrichState.errors.push({id,error:safeText(e)}); }
       }
     }
     await Promise.all(Array.from({length:Math.min(ENRICH_CONCURRENCY,Math.max(1,ids.length))},worker));
@@ -1508,7 +1578,7 @@ async function enrichDescriptionsMass(limit='all'){
         const ok=stripHtml(after?.description||'').length>=Math.min(220,src.length);
         enrichState.processed++;
         if(ok){enrichState.verified++;enrichState.changed_fields++;} else {enrichState.failed++;enrichState.errors.push({id,error:'Prom не подтвердил новое описание'});}
-      }catch(e){enrichState.processed++;enrichState.failed++;enrichState.errors.push({id,error:e.message||String(e)});}
+      }catch(e){enrichState.processed++;enrichState.failed++;enrichState.errors.push({id,error:safeText(e)});}
     }
   }finally{ enrichState.running=false; enrichState.finished_at=new Date().toISOString(); }
 }
@@ -1587,7 +1657,7 @@ async function runFastSeoPass(products){
             where:'ключи/описание',
             id:p?.id,
             name:p?.name,
-            error:e?.message||String(e)
+            error:safeText(e)
           });
         }
       }finally{
@@ -1713,9 +1783,13 @@ function promImportFile(xmlText,settings){
           return resolve({status:res.statusCode,data,raw});
         }
 
-        const msg=data?.error||data?.message||
-          (data?.errors?JSON.stringify(data.errors):'')||
-          raw||('HTTP '+res.statusCode);
+        const msg=
+          safeText(data?.error) ||
+          safeText(data?.message) ||
+          safeText(data?.errors) ||
+          safeText(data) ||
+          raw ||
+          ('HTTP '+res.statusCode);
 
         const e=new Error(String(msg));
         e.status=Number(res.statusCode||0);
@@ -1737,9 +1811,11 @@ function promImportFile(xmlText,settings){
 }
 
 function isConcurrentImportError(e){
-  const text=String(
-    e?.message || e?.data?.error || e?.data?.message || e?.raw || ''
-  ).toLowerCase();
+  const text=[
+    safeText(e?.message),
+    safeText(e?.data),
+    safeText(e?.raw)
+  ].filter(Boolean).join(' ').toLowerCase();
 
   return Number(e?.status)===400 && (
     text.includes('одновременн') ||
@@ -1835,7 +1911,7 @@ async function waitAutoImport(id,timeoutMs=AUTO_IMPORT_STATUS_MAX_MIN*60*1000){
         autoState.errors.push({
           where:'import-status',
           import_id:id,
-          error:e.message||String(e)
+          error:safeText(e)
         });
       }
     }
@@ -1993,7 +2069,7 @@ async function runAutoAll(reason='manual'){
     autoState.current=0;
     autoState.current_total=0;
   }catch(e){
-    const msg=e?.message||String(e);
+    const msg=safeText(e);
     if(msg==='Остановлено пользователем'){
       autoState.phase='Остановлено';
     }else{
@@ -2014,14 +2090,20 @@ function renderAutoHome(){
   const latestErr=autoState.errors?.[0]||null;
   const unmatched=Number(supplierState.unmatched_products||0);
   const total=Number(scanState.summary?.valid||scanState.total||0);
+  const bezetSrc=supplierState.sources?.bezet||null;
+  const militarisSrc=supplierState.sources?.militaris||null;
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v2.4 AUTO WAIT</title><style>
+<title>PrimeTac AUTO v2.5 STABLE</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v2.4 AUTO WAIT</span></h1><div class="m">Одна кнопка. Быстро загружает каталог Prom, сопоставляет BEZET + Militaris, одним проходом дополняет ключи и слабые описания, затем импортирует характеристики. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены, остатки и фото не трогает.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v2.5 STABLE</span></h1><div class="m">Одна кнопка. Быстро загружает каталог Prom, сопоставляет BEZET + Militaris, одним проходом дополняет ключи и слабые описания, затем импортирует характеристики. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены, остатки и фото не трогает.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
-<div class="c"><b>Импорт характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>${autoState.import_error?`<div class="bad m">${autoEscHtml(autoState.import_error)}</div>`:''}</div>
-${latestErr?`<div class="c"><b class="bad">Последняя ошибка</b><div class="m">${autoEscHtml(latestErr.error||'')}</div></div>`:''}
+<div class="c"><b>Поставщики</b>
+<div class="m" style="margin-top:7px">BEZET: ${bezetSrc?.ok?`✅ ${bezetSrc.count} товаров`:`❌ ${autoEscHtml(safeText(bezetSrc?.error)||'не загружен')}`}</div>
+<div class="m">Militaris: ${militarisSrc?.ok?`✅ ${militarisSrc.count} товаров`:`❌ ${autoEscHtml(safeText(militarisSrc?.error)||'не загружен')}`}</div>
+</div>
+<div class="c"><b>Импорт характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>${autoState.import_error?`<div class="bad m">${autoEscHtml(safeText(autoState.import_error))}</div>`:''}</div>
+${latestErr?`<div class="c"><b class="bad">Последняя ошибка</b><div class="m">${autoEscHtml(safeText(latestErr?.error)||'')}</div></div>`:''}
 <div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy первый запуск начинается сам, если <code>AUTO_ON_START</code> не выключен.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/last-import.xml">Последний XML характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
 </div></body></html>`;
 }
@@ -2032,14 +2114,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v2.4 AUTO WAIT</title>
+<title>PrimeTac AUTO v2.5 STABLE</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v2.4 AUTO WAIT</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v2.5 STABLE</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -2533,14 +2615,14 @@ app.post('/api/enrich/test-attribute', async (req,res) => {
     const probe=await testOneAttributeWrite(req.body?.id || null);
     recalcSupplierFillable();
     res.json({ok:true,probe});
-  }catch(e){ res.status(400).json({error:e.message||String(e),prom:e.data||null}); }
+  }catch(e){ res.status(400).json({error:safeText(e),prom:e.data||null}); }
 });
 
 app.post('/api/enrich/attributes/start', (req,res) => {
   if(!WRITE_ENABLED) return res.status(400).json({error:'WRITE_ENABLED=false'});
   if(enrichState.running) return res.json({ok:true,already_running:true});
   const limit=req.body?.limit==='all'?'all':Math.max(1,Math.min(5000,Number(req.body?.limit||25)));
-  enrichAttributesMass(limit).catch(e=>{enrichState.running=false;enrichState.errors.push({error:e.message||String(e)});});
+  enrichAttributesMass(limit).catch(e=>{enrichState.running=false;enrichState.errors.push({error:safeText(e)});});
   res.json({ok:true,started:true,limit});
 });
 
@@ -2548,7 +2630,7 @@ app.post('/api/enrich/descriptions/start', (req,res) => {
   if(!WRITE_ENABLED) return res.status(400).json({error:'WRITE_ENABLED=false'});
   if(enrichState.running) return res.json({ok:true,already_running:true});
   const limit=req.body?.limit==='all'?'all':Math.max(1,Math.min(5000,Number(req.body?.limit||25)));
-  enrichDescriptionsMass(limit).catch(e=>{enrichState.running=false;enrichState.errors.push({error:e.message||String(e)});});
+  enrichDescriptionsMass(limit).catch(e=>{enrichState.running=false;enrichState.errors.push({error:safeText(e)});});
   res.json({ok:true,started:true,limit});
 });
 
@@ -2560,7 +2642,7 @@ app.post('/api/enrich/stop', (_req,res) => {
 app.post('/api/suppliers/sync', (_req,res) => {
   if(supplierState.loading || supplierState.matching) return res.json({ok:true,already_running:true});
   syncSuppliers().catch(e=>{
-    supplierState.errors.push({supplier:'sync',error:e.message||String(e)});
+    supplierState.errors.push({supplier:'sync',error:safeText(e)});
     supplierState.loading=false;
     supplierState.matching=false;
   });
@@ -2574,14 +2656,14 @@ app.get('/api/suppliers/state', (_req,res) => {
 
 app.post('/api/suppliers/refresh', (_req,res) => {
   if(supplierState.loading) return res.json({ok:true,already_running:true});
-  refreshSupplierFeeds().catch(e=>{supplierState.errors.push({supplier:'all',error:e.message||String(e)});supplierState.loading=false;});
+  refreshSupplierFeeds().catch(e=>{supplierState.errors.push({supplier:'all',error:safeText(e)});supplierState.loading=false;});
   res.json({ok:true,started:true});
 });
 
 app.post('/api/suppliers/match', (_req,res) => {
   if(supplierState.matching) return res.json({ok:true,already_running:true});
   if(!supplierIndexes.bezet && !supplierIndexes.militaris) return res.status(400).json({error:'Сначала обновите фиды поставщиков'});
-  matchSupplierCatalog().catch(e=>{supplierState.errors.push({supplier:'match',error:e.message||String(e)});supplierState.matching=false;});
+  matchSupplierCatalog().catch(e=>{supplierState.errors.push({supplier:'match',error:safeText(e)});supplierState.matching=false;});
   res.json({ok:true,started:true});
 });
 
@@ -2622,7 +2704,7 @@ app.post('/action/suppliers-sync', (req,res) => {
     syncSuppliers().catch(e=>{
       supplierState.loading=false;
       supplierState.matching=false;
-      supplierState.errors.push({supplier:'all',error:e.message||String(e)});
+      supplierState.errors.push({supplier:'all',error:safeText(e)});
     });
   }
   res.redirect('/');
@@ -2633,7 +2715,7 @@ app.post('/action/suppliers-refresh', (req,res) => {
   if(!supplierState.loading){
     refreshSupplierFeeds().catch(e=>{
       supplierState.loading=false;
-      supplierState.errors.push({supplier:'all',error:e.message||String(e)});
+      supplierState.errors.push({supplier:'all',error:safeText(e)});
     });
   }
   res.redirect('/');
@@ -2644,7 +2726,7 @@ app.post('/action/suppliers-match', (req,res) => {
   if(!supplierState.matching){
     matchSupplierCatalog().catch(e=>{
       supplierState.matching=false;
-      supplierState.errors.push({supplier:'all',error:e.message||String(e)});
+      supplierState.errors.push({supplier:'all',error:safeText(e)});
     });
   }
   res.redirect('/');
@@ -2673,7 +2755,7 @@ app.post('/action/mass-attributes', (req,res) => {
   if(!enrichState.running){
     enrichAttributesMass('all').catch(e=>{
       enrichState.running=false;
-      enrichState.errors.push({error:e.message||String(e)});
+      enrichState.errors.push({error:safeText(e)});
     });
   }
   res.redirect('/');
@@ -2684,7 +2766,7 @@ app.post('/action/mass-descriptions', (req,res) => {
   if(!enrichState.running){
     enrichDescriptionsMass('all').catch(e=>{
       enrichState.running=false;
-      enrichState.errors.push({error:e.message||String(e)});
+      enrichState.errors.push({error:safeText(e)});
     });
   }
   res.redirect('/');
@@ -2695,7 +2777,7 @@ app.get('/api/suppliers/product/:id', async (req,res) => {
     const loadPage=String(req.query.page||'')==='1';
     res.json(await getSupplierEnrichmentForProm(req.params.id,loadPage));
   }catch(e){
-    res.status(500).json({error:e.message||String(e)});
+    res.status(500).json({error:safeText(e)});
   }
 });
 
@@ -2861,7 +2943,7 @@ app.get('/legacy', (_req,res) => { res.type('html').send(renderServerHtml()); })
 function startAutoRoute(_req,res){
   if(!autoState.running){
     setTimeout(()=>runAutoAll('manual').catch(e=>{
-      autoState.errors.unshift({where:'run',error:e.message||String(e)});
+      autoState.errors.unshift({where:'run',error:safeText(e)});
       autoState.running=false;
     }),50);
   }
@@ -2888,7 +2970,7 @@ app.get('/auto/last-import.xml', (_req,res) => res.type('application/xml').send(
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v2.4 AUTO WAIT',
+    app: 'PrimeTac AUTO v2.5 STABLE',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2963,14 +3045,14 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v2.4 AUTO WAIT started on ${PORT}`);
+  console.log(`PrimeTac AUTO v2.5 STABLE started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   if(AUTO_ON_START && PROM_TOKEN && WRITE_ENABLED){
-    setTimeout(()=>runAutoAll('startup').catch(e=>{autoState.errors.unshift({where:'startup',error:e.message||String(e)});autoState.running=false;}),5000);
+    setTimeout(()=>runAutoAll('startup').catch(e=>{autoState.errors.unshift({where:'startup',error:safeText(e)});autoState.running=false;}),5000);
   }
 });
 setInterval(()=>{
   if(!autoState.running && PROM_TOKEN && WRITE_ENABLED){
-    runAutoAll('schedule').catch(e=>{autoState.errors.unshift({where:'schedule',error:e.message||String(e)});autoState.running=false;});
+    runAutoAll('schedule').catch(e=>{autoState.errors.unshift({where:'schedule',error:safeText(e)});autoState.running=false;});
   }
 }, AUTO_INTERVAL_HOURS*3600*1000);
