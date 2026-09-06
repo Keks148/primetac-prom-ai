@@ -1,6 +1,6 @@
 {
-  "name": "primetac-auto-v2-simple",
-  "version": "2.0.0",
+  "name": "primetac-auto-v2-1-fast",
+  "version": "2.1.0",
   "private": true,
   "main": "server.js",
   "scripts": {
