@@ -1,18 +1,33 @@
-PrimeTac AUTO v2.3 IMPORT DIAG
+PrimeTac AUTO v2.4 AUTO WAIT
 
-Что исправлено:
-- вместо [object Object] теперь показывает реальный ответ Prom и HTTP-код;
-- ответ Prom сохраняется в /auto/state и раскрывается прямо на главной;
-- ошибка импорта логируется с status/data/raw;
-- YML импорта характеристик теперь содержит обязательные name, categoryId и description;
-- в YML добавляются текущие цена/артикул из Prom, но updated_fields остается только ["attributes"], поэтому программа не должна менять цену, остатки, фото или описание;
-- сохранены исправления маршрутов /auto/run и /auto/stop из v2.2.
+Главное исправление:
+Prom разрешает только ограниченное число одновременных импортов.
+Раньше HTTP 400 сразу завершал весь автомат ошибкой.
 
-Установка на Render:
-1. Полностью замени package.json, README.txt и server.js файлами из этого архива.
-2. Environment оставь как есть: PROM_TOKEN, WRITE_ENABLED=true и остальные существующие переменные.
-3. Сделай Clear build cache & deploy.
-4. На странице должно быть: PrimeTac AUTO v2.3 IMPORT DIAG.
-5. Нажми «ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ».
+Теперь:
+- если Prom отвечает HTTP 400 из-за уже активного импорта, программа НЕ падает;
+- показывает WAITING_PREVIOUS_IMPORT;
+- ждёт 45 секунд и повторяет попытку сама;
+- может ждать до 45 минут (настраивается);
+- после освобождения импорта продолжает с того же пакета;
+- характеристики отправляются партиями;
+- статус каждого принятого импорта проверяется до 30 минут;
+- /auto/run и /auto/stop работают через GET и POST;
+- цены, остатки, наличие и фото не меняются.
 
-Если импорт снова не пройдет, на странице теперь появятся HTTP-код и блок «Ответ Prom» вместо бесполезного [object Object].
+Обязательные Render Environment:
+PROM_TOKEN=...
+WRITE_ENABLED=true
+
+Необязательные:
+AUTO_ON_START=true
+AUTO_INTERVAL_HOURS=6
+AUTO_SEO_CONCURRENCY=5
+AUTO_IMPORT_CHUNK=150
+AUTO_IMPORT_LOCK_WAIT_SEC=45
+AUTO_IMPORT_LOCK_MAX_MIN=45
+AUTO_IMPORT_STATUS_MAX_MIN=30
+
+Если на экране:
+WAITING_PREVIOUS_IMPORT
+ничего вручную делать не нужно. Программа сама повторит импорт.

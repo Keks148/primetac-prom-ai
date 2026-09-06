@@ -22,6 +22,9 @@ const KEYWORD_ACCEPT_MIN = Math.max(3, Math.min(7, Number(process.env.KEYWORD_AC
 const ENRICH_CONCURRENCY = Math.max(1, Math.min(2, Number(process.env.ENRICH_CONCURRENCY || 1)));
 const AUTO_INTERVAL_HOURS = Math.max(1, Number(process.env.AUTO_INTERVAL_HOURS || 6));
 const AUTO_ON_START = String(process.env.AUTO_ON_START || 'true').toLowerCase() !== 'false';
+const AUTO_IMPORT_LOCK_WAIT_SEC = Math.max(15, Number(process.env.AUTO_IMPORT_LOCK_WAIT_SEC || 45));
+const AUTO_IMPORT_LOCK_MAX_MIN = Math.max(5, Number(process.env.AUTO_IMPORT_LOCK_MAX_MIN || 45));
+const AUTO_IMPORT_STATUS_MAX_MIN = Math.max(10, Number(process.env.AUTO_IMPORT_STATUS_MAX_MIN || 30));
 
 const SUPPLIER_CONFIG = {
   bezet: {
@@ -109,13 +112,14 @@ let autoState = {
   attributes_imported:0,
   import_id:null,
   import_status:null,
-  import_http_status:null,
-  import_response:null,
   import_error:null,
   skipped_no_external_id:0,
   skipped_no_group_id:0,
   errors:[],
-  last_run_reason:null
+  last_run_reason:null,
+  current:0,
+  current_total:0,
+  seo_errors:0
 };
 let lastAutoImportXml='';
 
@@ -928,15 +932,16 @@ function promRequest(method,path,body=null){
           return resolve({ status: res.statusCode, data });
         }
 
-        const errText = autoErrorText(
-          data?.error ?? data?.errors ?? data?.message ?? data ?? raw
-        ) || `HTTP ${res.statusCode}`;
+        const errText =
+          data?.error ||
+          data?.message ||
+          (data?.errors ? JSON.stringify(data.errors) : '') ||
+          raw ||
+          `HTTP ${res.statusCode}`;
 
-        const e = new Error(`Prom API HTTP ${res.statusCode}: ${errText}`);
+        const e = new Error(String(errText));
         e.status = res.statusCode;
-        e.statusCode = res.statusCode;
         e.data = data;
-        e.raw = raw;
         reject(e);
       });
     });
@@ -1516,34 +1521,90 @@ function autoEscHtml(v){
 function autoEscXml(v){
   return String(v ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&apos;');
 }
-function autoSafeJson(v){
-  try{
-    if(typeof v==='string') return v;
-    return JSON.stringify(v,null,2);
-  }catch(_){ return String(v); }
-}
-function autoErrorText(v){
-  if(v==null) return '';
-  if(typeof v==='string') return v;
-  if(v instanceof Error) return v.message || String(v);
-  if(typeof v==='object'){
-    const direct=v.message ?? v.detail ?? v.description ?? v.reason;
-    const nested=v.error ?? v.errors;
-    const parts=[];
-    if(direct!=null) parts.push(autoErrorText(direct));
-    if(nested!=null) parts.push(autoErrorText(nested));
-    const txt=parts.filter(Boolean).join(' | ');
-    return txt || autoSafeJson(v);
-  }
-  return String(v);
-}
-function autoHttpError(prefix,status,data,raw){
-  const detail=autoErrorText(data?.error ?? data?.errors ?? data?.message ?? data ?? raw);
-  const e=new Error(`${prefix} HTTP ${status}${detail?': '+detail:''}`);
-  e.status=status; e.statusCode=status; e.data=data; e.raw=raw;
-  return e;
-}
 function autoCdata(v){ return '<![CDATA['+String(v ?? '').replace(/]]>/g,']]]]><![CDATA[>')+']]>'; }
+
+async function autoSeoOneFast(p){
+  const id=String(p.id);
+  const match=supplierMatches.get(id)||null;
+
+  const ua=await getTranslation(p.id,'uk');
+  if(ua && ua.__error) throw new Error(ua.__error);
+
+  const oldKeywords=parseKeywords(ua?.keywords||'');
+  const suggestions=keywordSuggestions(p,ua?.name||p.name);
+  const proposed=uniq([...oldKeywords,...suggestions]).slice(0,7);
+  const needKeywords=oldKeywords.length<KEYWORD_ACCEPT_MIN && proposed.length>oldKeywords.length;
+
+  const currentDescription=stripHtml(ua?.description || p.description || '');
+  const supplierDescription=stripHtml(match?.record?.description || '');
+  const needDescription=Boolean(
+    match &&
+    currentDescription.length<320 &&
+    supplierDescription.length>=260 &&
+    supplierDescription.length>currentDescription.length+80
+  );
+
+  if(needKeywords) autoState.keywords_planned++;
+  if(needDescription) autoState.descriptions_planned++;
+  if(!needKeywords && !needDescription) return {changed:false};
+
+  const payload={
+    product_id:Number(p.id),
+    lang:'uk',
+    name:norm(ua?.name||p.name||''),
+    description:needDescription ? supplierDescription : String(ua?.description ?? p.description ?? ''),
+    keywords:(needKeywords ? proposed : oldKeywords).join(', ')
+  };
+
+  await promRequest('PUT','/products/translation',payload);
+
+  if(needKeywords) autoState.keywords_changed++;
+  if(needDescription) autoState.descriptions_changed++;
+
+  return {changed:true,keywords:needKeywords,description:needDescription};
+}
+
+async function runFastSeoPass(products){
+  autoState.current=0;
+  autoState.current_total=products.length;
+  autoState.seo_errors=0;
+
+  let index=0;
+  const concurrency=Math.max(2,Math.min(8,Number(process.env.AUTO_SEO_CONCURRENCY||5)));
+
+  async function runner(){
+    while(true){
+      if(autoState.stop_requested) return;
+      const i=index++;
+      if(i>=products.length) return;
+      const p=products[i];
+      try{
+        await autoSeoOneFast(p);
+      }catch(e){
+        autoState.seo_errors++;
+        if(autoState.errors.length<30){
+          autoState.errors.push({
+            where:'ключи/описание',
+            id:p?.id,
+            name:p?.name,
+            error:e?.message||String(e)
+          });
+        }
+      }finally{
+        autoState.current++;
+        const ratio=autoState.current/Math.max(1,autoState.current_total);
+        autoState.progress=Math.round(35 + ratio*40);
+        autoState.phase=`3/4 Ключи + описания ${autoState.current}/${autoState.current_total}`;
+      }
+
+      // Give Render event loop a chance to answer the status page.
+      if(autoState.current%10===0) await new Promise(r=>setTimeout(r,0));
+    }
+  }
+
+  await Promise.all(Array.from({length:Math.min(concurrency,products.length)},runner));
+}
+
 function autoExternalId(p){ return norm(p?.external_id ?? p?.externalId ?? ''); }
 function autoGroupId(p){
   return norm(
@@ -1594,20 +1655,11 @@ function buildAutoYml(items){
   const offers=items.map(({p,match,attrs})=>{
     const ext=autoExternalId(p), gid=autoGroupId(p);
     const vendor=norm(match?.record?.brand || feedDetails(match?.record||{}).producer || '');
-    const name=norm(p?.name || match?.record?.name || 'Товар');
-    // Prom YML requires description even when updated_fields contains only attributes.
-    // We send the current Prom description when possible; import settings prevent changing it.
-    const description=String(p?.description || match?.record?.description || name || 'Товар');
-    const price=norm(p?.price ?? p?.price_value ?? '');
-    const sku=norm(p?.sku ?? p?.presence_sku ?? p?.article ?? '');
     const params=attrs.map(([k,v])=>`<param name="${autoEscXml(k)}">${autoEscXml(v)}</param>`).join('\n');
     return `<offer id="${autoEscXml(ext)}" available="${autoPresence(p)?'true':'false'}">
-<name>${autoEscXml(name)}</name>
+<name>${autoEscXml(p.name||match?.record?.name||'Товар')}</name>
 <categoryId>${autoEscXml(gid)}</categoryId>
-${price?`<price>${autoEscXml(price)}</price>\n<currencyId>UAH</currencyId>`:''}
-${sku?`<vendorCode>${autoEscXml(sku.slice(0,25))}</vendorCode>`:''}
 ${vendor?`<vendor>${autoEscXml(vendor)}</vendor>`:''}
-<description>${autoCdata(description)}</description>
 ${params}
 </offer>`;
   }).join('\n');
@@ -1636,123 +1688,322 @@ function promImportFile(xmlText,settings){
     add(Buffer.from(xmlText,'utf8'));
     add(`\r\n--${boundary}--\r\n`);
     const body=Buffer.concat(chunks);
-    const req=https.request({hostname:API_HOST,port:443,path:API_PREFIX+'/products/import_file',method:'POST',headers:{
-      'Authorization':`Bearer ${PROM_TOKEN}`,'Accept':'application/json','Content-Type':`multipart/form-data; boundary=${boundary}`,'Content-Length':body.length
-    },timeout:120000},res=>{
-      const bufs=[]; res.on('data',c=>bufs.push(c)); res.on('end',()=>{
-        const raw=Buffer.concat(bufs).toString('utf8'); let data={};
-        try{data=raw?JSON.parse(raw):{};}catch{data={raw};}
-        if(res.statusCode>=200&&res.statusCode<300){
+
+    const req=https.request({
+      hostname:API_HOST,
+      port:443,
+      path:API_PREFIX+'/products/import_file',
+      method:'POST',
+      headers:{
+        'Authorization':`Bearer ${PROM_TOKEN}`,
+        'Accept':'application/json',
+        'Content-Type':`multipart/form-data; boundary=${boundary}`,
+        'Content-Length':body.length
+      },
+      timeout:120000
+    },res=>{
+      const bufs=[];
+      res.on('data',c=>bufs.push(c));
+      res.on('end',()=>{
+        const raw=Buffer.concat(bufs).toString('utf8');
+        let data={};
+        try{ data=raw?JSON.parse(raw):{}; }catch{ data={raw}; }
+
+        if(res.statusCode>=200 && res.statusCode<300){
           return resolve({status:res.statusCode,data,raw});
         }
-        reject(autoHttpError('Prom import',res.statusCode,data,raw));
+
+        const msg=data?.error||data?.message||
+          (data?.errors?JSON.stringify(data.errors):'')||
+          raw||('HTTP '+res.statusCode);
+
+        const e=new Error(String(msg));
+        e.status=Number(res.statusCode||0);
+        e.data=data;
+        e.raw=raw;
+        reject(e);
       });
     });
-    req.on('timeout',()=>req.destroy(new Error('Prom import timeout'))); req.on('error',reject); req.write(body); req.end();
+
+    req.on('timeout',()=>{
+      const e=new Error('Prom import request timeout');
+      e.code='REQUEST_TIMEOUT';
+      req.destroy(e);
+    });
+    req.on('error',reject);
+    req.write(body);
+    req.end();
   });
 }
+
+function isConcurrentImportError(e){
+  const text=String(
+    e?.message || e?.data?.error || e?.data?.message || e?.raw || ''
+  ).toLowerCase();
+
+  return Number(e?.status)===400 && (
+    text.includes('одновременн') ||
+    text.includes('одночасн') ||
+    text.includes('concurrent') ||
+    text.includes('simultaneous') ||
+    text.includes('попереднього імпорту') ||
+    text.includes('предыдущего импорта') ||
+    (text.includes('импорт') && text.includes('огранич'))
+  );
+}
+
+async function interruptibleSleep(ms){
+  const step=1000;
+  let left=ms;
+  while(left>0){
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+    const x=Math.min(step,left);
+    await new Promise(r=>setTimeout(r,x));
+    left-=x;
+  }
+}
+
+async function promImportFileQueued(xmlText,settings,batchText=''){
+  const waitMs=AUTO_IMPORT_LOCK_WAIT_SEC*1000;
+  const maxWaitMs=AUTO_IMPORT_LOCK_MAX_MIN*60*1000;
+  const started=Date.now();
+  let attempt=0;
+
+  while(true){
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+    attempt++;
+
+    try{
+      autoState.import_error=null;
+      return await promImportFile(xmlText,settings);
+    }catch(e){
+      if(!isConcurrentImportError(e)) throw e;
+
+      const elapsed=Date.now()-started;
+      if(elapsed>=maxWaitMs){
+        const err=new Error(
+          `Prom всё ещё занят предыдущим импортом спустя ${AUTO_IMPORT_LOCK_MAX_MIN} мин. `+
+          `Новый импорт не запускался.`
+        );
+        err.status=400;
+        throw err;
+      }
+
+      const leftMin=Math.max(0,Math.ceil((maxWaitMs-elapsed)/60000));
+      autoState.import_status='WAITING_PREVIOUS_IMPORT';
+      autoState.phase=
+        `4/4 Prom занят предыдущим импортом${batchText?` (${batchText})`:''}. `+
+        `Жду ${AUTO_IMPORT_LOCK_WAIT_SEC} сек и попробую снова`;
+      autoState.import_error=
+        `Prom временно запрещает второй импорт. Автомат ждёт сам. `+
+        `Попытка ${attempt}; запас ожидания ещё ~${leftMin} мин.`;
+
+      await interruptibleSleep(waitMs);
+    }
+  }
+}
+
 function autoImportId(data){ return data?.id ?? data?.import_id ?? data?.importId ?? data?.process_id ?? data?.data?.id ?? null; }
-async function waitAutoImport(id,timeoutMs=12*60*1000){
-  if(!id) return {ok:true,status:'ACCEPTED'};
-  const t0=Date.now(); let last=null;
+async function waitAutoImport(id,timeoutMs=AUTO_IMPORT_STATUS_MAX_MIN*60*1000){
+  if(!id) return {ok:true,status:'ACCEPTED_WITHOUT_ID'};
+  const t0=Date.now();
+  let last=null, polls=0;
+
   while(Date.now()-t0<timeoutMs){
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
-    await new Promise(r=>setTimeout(r,5000));
+    await interruptibleSleep(5000);
+    polls++;
+
     try{
       const r=await promRequest('GET','/products/import/status/'+encodeURIComponent(id));
       last=r.data||{};
-      const st=String(last?.status ?? last?.state ?? last?.result ?? '').toUpperCase();
-      if(/SUCCESS|DONE|FINISH|COMPLETE/.test(st)) return {ok:true,status:st,data:last};
-      if(/ERROR|FAIL/.test(st)) return {ok:false,status:st,data:last};
+      const st=String(
+        last?.status ?? last?.state ?? last?.result ??
+        last?.import_status ?? last?.data?.status ?? ''
+      ).toUpperCase();
+
+      autoState.import_status=st || 'PROCESSING';
+      if(/SUCCESS|DONE|FINISH|COMPLETE|COMPLETED/.test(st)){
+        return {ok:true,status:st||'DONE',data:last};
+      }
+      if(/ERROR|FAIL|FAILED|CANCEL|CANCELED|CANCELLED/.test(st)){
+        return {ok:false,status:st||'FAILED',data:last};
+      }
     }catch(e){
-      autoState.errors.push({where:'import-status',status:e?.statusCode||e?.status||null,error:autoErrorText(e),data:e?.data||null});
+      // Status endpoint may transiently fail. Keep waiting instead of killing the whole run.
+      if(autoState.errors.length<30){
+        autoState.errors.push({
+          where:'import-status',
+          import_id:id,
+          error:e.message||String(e)
+        });
+      }
     }
   }
-  return {ok:false,status:'TIMEOUT',data:last};
+
+  return {
+    ok:false,
+    status:`TIMEOUT_${AUTO_IMPORT_STATUS_MAX_MIN}MIN`,
+    data:last
+  };
 }
 
 async function autoImportCharacteristics(){
-  autoState.phase='Характеристики: подготовка импорта';
+  autoState.phase='4/4 Характеристики: готовлю импорт';
+  autoState.current=0;
+  autoState.current_total=0;
+
   const items=[];
-  autoState.skipped_no_external_id=0; autoState.skipped_no_group_id=0;
+  autoState.skipped_no_external_id=0;
+  autoState.skipped_no_group_id=0;
+
   for(const [id,match] of supplierMatches.entries()){
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
-    let p=promRawCache.get(String(id));
+    const p=promRawCache.get(String(id));
     if(!p) continue;
+
     const ext=autoExternalId(p),gid=autoGroupId(p);
     if(!ext){autoState.skipped_no_external_id++;continue;}
     if(!gid){autoState.skipped_no_group_id++;continue;}
+
     const attrs=autoImportAttributes(match,p);
-    if(attrs.length<1) continue;
+    if(!attrs.length) continue;
     items.push({p,match,attrs});
   }
+
   autoState.attributes_planned=items.length;
-  if(!items.length){ autoState.import_status='SKIPPED: нет товаров для импорта'; return; }
-  const xml=buildAutoYml(items); lastAutoImportXml=xml;
-  autoState.phase=`Характеристики: отправляю ${items.length} товаров в Prom`;
-  autoState.progress=88;
-  const settings={force_update:false,only_available:false,only_update:true,mark_missing_product_as:'none',updated_fields:['attributes']};
-  let r;
-  try{
-    r=await promImportFile(xml,settings);
-    autoState.import_http_status=r.status||null;
-    autoState.import_response=r.data||null;
-  }catch(e){
-    autoState.import_http_status=e?.statusCode||e?.status||null;
-    autoState.import_response=e?.data||e?.raw||null;
-    throw e;
+  autoState.current_total=items.length;
+
+  if(!items.length){
+    autoState.import_status='SKIPPED: нет товаров для импорта';
+    return;
   }
-  const id=autoImportId(r.data); autoState.import_id=id; autoState.import_status='ACCEPTED';
-  autoState.phase='Характеристики: Prom обрабатывает импорт'; autoState.progress=92;
-  const st=await waitAutoImport(id);
-  autoState.import_status=st.status;
-  if(st.ok){autoState.attributes_imported=items.length;}
-  else throw new Error('Prom не подтвердил импорт характеристик: '+st.status);
+
+  const chunkSize=Math.max(50,Math.min(250,Number(process.env.AUTO_IMPORT_CHUNK||150)));
+  const settings={
+    force_update:false,
+    only_available:false,
+    only_update:true,
+    mark_missing_product_as:'none',
+    updated_fields:['attributes']
+  };
+
+  let successful=0;
+  for(let start=0;start<items.length;start+=chunkSize){
+    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
+
+    const part=items.slice(start,start+chunkSize);
+    const xml=buildAutoYml(part);
+    lastAutoImportXml=xml;
+
+    autoState.current=Math.min(start+part.length,items.length);
+    autoState.phase=`4/4 Характеристики: импорт ${autoState.current}/${items.length}`;
+    autoState.progress=Math.round(78 + 20*(autoState.current/Math.max(1,items.length)));
+
+    const r=await promImportFileQueued(
+      xml,
+      settings,
+      `${Math.min(start+1,items.length)}-${Math.min(start+part.length,items.length)} из ${items.length}`
+    );
+    const importId=autoImportId(r.data);
+    autoState.import_id=importId||autoState.import_id;
+    autoState.import_status='ACCEPTED';
+
+    const st=await waitAutoImport(importId);
+    autoState.import_status=st.status;
+
+    if(!st.ok){
+      throw new Error('Prom не подтвердил импорт характеристик: '+st.status);
+    }
+
+    successful+=part.length;
+    autoState.attributes_imported=successful;
+  }
 }
 
 async function runAutoAll(reason='manual'){
   if(autoState.running) return;
   if(!WRITE_ENABLED) throw new Error('WRITE_ENABLED=false');
   if(!PROM_TOKEN) throw new Error('PROM_TOKEN не задан');
-  Object.assign(autoState,{running:true,stop_requested:false,started_at:new Date().toISOString(),finished_at:null,phase:'Запуск',progress:1,
-    keywords_planned:0,keywords_changed:0,descriptions_planned:0,descriptions_changed:0,attributes_planned:0,attributes_imported:0,
-    import_id:null,import_status:null,import_http_status:null,import_response:null,import_error:null,errors:[],last_run_reason:reason});
+
+  Object.assign(autoState,{
+    running:true,
+    stop_requested:false,
+    started_at:new Date().toISOString(),
+    finished_at:null,
+    phase:'Запуск',
+    progress:1,
+    keywords_planned:0,
+    keywords_changed:0,
+    descriptions_planned:0,
+    descriptions_changed:0,
+    attributes_planned:0,
+    attributes_imported:0,
+    import_id:null,
+    import_status:null,
+    import_error:null,
+    errors:[],
+    last_run_reason:reason,
+    current:0,
+    current_total:0,
+    seo_errors:0
+  });
+
   try{
-    autoState.phase='1/5 Сканирую каталог Prom'; autoState.progress=5;
-    await startScan();
-    if(scanState.last_error) throw new Error(scanState.last_error);
+    // FAST: only one catalog-list pass here. No 1641 translation requests in phase 1.
+    autoState.phase='1/4 Загружаю каталог Prom';
+    autoState.progress=5;
+
+    const products=await listAllProducts();
+    promRawCache=new Map(products.map(p=>[String(p.id),p]));
+    scanState.total=products.length;
+    scanState.processed=products.length;
+    scanState.errors=0;
+    scanState.last_error=null;
+    scanState.summary={
+      total:products.length,
+      valid:products.length,
+      errors:0,
+      average_score:0,
+      need_safe_fix:0,
+      missing:{}
+    };
+
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
 
-    autoState.phase='2/5 Загружаю BEZET + Militaris и сопоставляю'; autoState.progress=20;
+    autoState.phase='2/4 Загружаю BEZET + Militaris и сопоставляю';
+    autoState.progress=18;
     await syncSuppliers();
+
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
 
-    autoState.phase='3/5 Дополняю UA ключи'; autoState.progress=42;
-    autoState.keywords_planned=Number(scanState.summary?.need_safe_fix||0);
-    await startBatchFix('all','auto-v2');
-    autoState.keywords_changed=Number(fixState.verified||0);
+    // One common translation pass for keywords AND descriptions.
+    autoState.phase=`3/4 Ключи + описания 0/${products.length}`;
+    autoState.progress=35;
+    await runFastSeoPass(products);
+
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
 
-    autoState.phase='4/5 Дополняю слабые описания'; autoState.progress=63;
-    await enrichDescriptionsMass('all');
-    autoState.descriptions_planned=Number(enrichState.planned||0);
-    autoState.descriptions_changed=Number(enrichState.verified||0);
-    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
-
-    autoState.phase='5/5 Заполняю характеристики через импорт Prom'; autoState.progress=82;
+    autoState.phase='4/4 Характеристики';
+    autoState.progress=78;
     await autoImportCharacteristics();
-    autoState.phase='Готово'; autoState.progress=100;
+
+    autoState.phase='✅ Готово';
+    autoState.progress=100;
+    autoState.current=0;
+    autoState.current_total=0;
   }catch(e){
-    const msg=autoErrorText(e) || String(e);
-    if(msg==='Остановлено пользователем') autoState.phase='Остановлено';
-    else {
+    const msg=e?.message||String(e);
+    if(msg==='Остановлено пользователем'){
+      autoState.phase='Остановлено';
+    }else{
       autoState.phase='Ошибка';
-      autoState.errors.unshift({where:'auto-run',status:e?.statusCode||e?.status||null,error:msg,data:e?.data||null});
+      autoState.errors.unshift({where:'AUTO',error:msg});
       autoState.import_error=msg;
-      console.error('[PrimeTac AUTO ERROR]',msg,e?.data?autoSafeJson(e.data):'');
     }
   }finally{
-    autoState.running=false; autoState.finished_at=new Date().toISOString();
+    autoState.running=false;
+    autoState.finished_at=new Date().toISOString();
     autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   }
 }
@@ -1764,12 +2015,12 @@ function renderAutoHome(){
   const unmatched=Number(supplierState.unmatched_products||0);
   const total=Number(scanState.summary?.valid||scanState.total||0);
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v2.3</title><style>
+<title>PrimeTac AUTO v2.4 AUTO WAIT</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v2.3 IMPORT DIAG</span></h1><div class="m">Одна кнопка. Сам сканирует Prom, загружает BEZET + Militaris, дополняет ключи и слабые описания, затем отправляет характеристики через официальный импорт Prom. Цены, остатки и фото не трогает.</div>
-<div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
-<div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div></div>
-<div class="c"><b>Импорт характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')} · HTTP: ${autoEscHtml(autoState.import_http_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>${autoState.import_error?`<div class="bad m" style="white-space:pre-wrap;margin-top:7px">${autoEscHtml(autoState.import_error)}</div>`:''}${autoState.import_response?`<details style="margin-top:8px"><summary class="m">Ответ Prom</summary><pre class="m" style="white-space:pre-wrap;overflow-wrap:anywhere">${autoEscHtml(autoSafeJson(autoState.import_response)).slice(0,8000)}</pre></details>`:''}</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v2.4 AUTO WAIT</span></h1><div class="m">Одна кнопка. Быстро загружает каталог Prom, сопоставляет BEZET + Militaris, одним проходом дополняет ключи и слабые описания, затем импортирует характеристики. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены, остатки и фото не трогает.</div>
+<div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
+<div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
+<div class="c"><b>Импорт характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>${autoState.import_error?`<div class="bad m">${autoEscHtml(autoState.import_error)}</div>`:''}</div>
 ${latestErr?`<div class="c"><b class="bad">Последняя ошибка</b><div class="m">${autoEscHtml(latestErr.error||'')}</div></div>`:''}
 <div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy первый запуск начинается сам, если <code>AUTO_ON_START</code> не выключен.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/last-import.xml">Последний XML характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
 </div></body></html>`;
@@ -1781,14 +2032,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v2.3 IMPORT DIAG</title>
+<title>PrimeTac AUTO v2.4 AUTO WAIT</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v2.3 IMPORT DIAG</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v2.4 AUTO WAIT</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -2599,9 +2850,15 @@ function renderServerHtml(){
   return out;
 }
 
-app.get('/', (_req,res) => { res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate'); res.type('html').send(renderAutoHome()); });
+app.get('/', (_req,res) => {
+  res.set('Cache-Control','no-store, no-cache, must-revalidate, proxy-revalidate');
+  res.set('Pragma','no-cache');
+  res.set('Expires','0');
+  res.type('html').send(renderAutoHome());
+});
 app.get('/legacy', (_req,res) => { res.type('html').send(renderServerHtml()); });
-function handleAutoRun(_req,res){
+
+function startAutoRoute(_req,res){
   if(!autoState.running){
     setTimeout(()=>runAutoAll('manual').catch(e=>{
       autoState.errors.unshift({where:'run',error:e.message||String(e)});
@@ -2610,28 +2867,28 @@ function handleAutoRun(_req,res){
   }
   res.redirect(303,'/');
 }
-function handleAutoStop(_req,res){
+function stopAutoRoute(_req,res){
   autoState.stop_requested=true;
   fixState.stop_requested=true;
   enrichState.stop_requested=true;
   res.redirect(303,'/');
 }
-app.get('/auto/run', handleAutoRun);
-app.post('/auto/run', handleAutoRun);
-app.get('/auto/run/', handleAutoRun);
-app.post('/auto/run/', handleAutoRun);
-app.get('/auto/stop', handleAutoStop);
-app.post('/auto/stop', handleAutoStop);
-app.get('/auto/stop/', handleAutoStop);
-app.post('/auto/stop/', handleAutoStop);
-app.get('/auto', (_req,res) => res.redirect(303,'/'));
+
+app.get('/auto/run', startAutoRoute);
+app.post('/auto/run', startAutoRoute);
+app.get('/auto/run/', startAutoRoute);
+app.post('/auto/run/', startAutoRoute);
+app.get('/auto/stop', stopAutoRoute);
+app.post('/auto/stop', stopAutoRoute);
+app.get('/auto/stop/', stopAutoRoute);
+app.post('/auto/stop/', stopAutoRoute);
 app.get('/auto/state', (_req,res) => res.json({auto:autoState,scan:scanState.summary,suppliers:supplierState,fix:fixState,enrich:enrichState}));
 app.get('/auto/last-import.xml', (_req,res) => res.type('application/xml').send(lastAutoImportXml||'<?xml version="1.0"?><empty/>'));
 
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v2.3 IMPORT DIAG',
+    app: 'PrimeTac AUTO v2.4 AUTO WAIT',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -2706,7 +2963,7 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v2.3 IMPORT DIAG started on ${PORT}`);
+  console.log(`PrimeTac AUTO v2.4 AUTO WAIT started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   if(AUTO_ON_START && PROM_TOKEN && WRITE_ENABLED){
     setTimeout(()=>runAutoAll('startup').catch(e=>{autoState.errors.unshift({where:'startup',error:e.message||String(e)});autoState.running=false;}),5000);
