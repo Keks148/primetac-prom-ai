@@ -1,6 +1,6 @@
 {
-  "name": "primetac-auto-v2-1-fast",
-  "version": "2.1.0",
+  "name": "primetac-auto-v2-2-route-fix",
+  "version": "2.2.0",
   "private": true,
   "main": "server.js",
   "scripts": {
