@@ -1,6 +1,6 @@
 {
-  "name": "primetac-auto-v2-5-stable",
-  "version": "2.5.0",
+  "name": "primetac-auto-v3-group-manager",
+  "version": "3.0.0",
   "private": true,
   "main": "server.js",
   "scripts": {
