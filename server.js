@@ -29,6 +29,9 @@ const AUTO_ON_START = String(process.env.AUTO_ON_START || 'true').toLowerCase() 
 const AUTO_IMPORT_LOCK_WAIT_SEC = Math.max(15, Number(process.env.AUTO_IMPORT_LOCK_WAIT_SEC || 45));
 const AUTO_IMPORT_LOCK_MAX_MIN = Math.max(5, Number(process.env.AUTO_IMPORT_LOCK_MAX_MIN || 45));
 const AUTO_IMPORT_STATUS_MAX_MIN = Math.max(15, Number(process.env.AUTO_IMPORT_STATUS_MAX_MIN || 90));
+const AUTO_STATUS_POLL_MAX_SEC = Math.max(30, Number(process.env.AUTO_STATUS_POLL_MAX_SEC || 75));
+const AUTO_STATUS_ERROR_LIMIT = Math.max(2, Number(process.env.AUTO_STATUS_ERROR_LIMIT || 3));
+
 const SUPPLIER_FEED_ATTEMPTS = Math.max(2, Math.min(6, Number(process.env.SUPPLIER_FEED_ATTEMPTS || 4)));
 const SUPPLIER_FEED_TIMEOUT_MS = Math.max(30000, Number(process.env.SUPPLIER_FEED_TIMEOUT_MS || 90000));
 const SUPPLIER_FEED_RETRY_SEC = Math.max(2, Number(process.env.SUPPLIER_FEED_RETRY_SEC || 8));
@@ -188,7 +191,11 @@ let autoState = {
   import_poll_count:0,
   import_last_status_payload:null,
   feed_progress:{},
-  feed_download_source:{}
+  feed_download_source:{},
+  import_background:false,
+  managed_groups_verified:0,
+  managed_groups_total:0,
+  status_endpoint_errors:0
 };
 let lastAutoImportXml='';
 
@@ -2228,17 +2235,42 @@ function importCountersDeep(v,depth=0,out={}){
   for(const x of Object.values(v)) importCountersDeep(x,depth+1,out);
   return out;
 }
+
+const MANAGED_GROUP_IDS = new Set(MANAGED_GROUPS.map(g=>String(g.id)));
+
+async function verifyManagedGroupsNow(){
+  try{
+    const products=await listAllProducts();
+    let managed=0;
+    for(const p of products){
+      const gid=String(autoGroupId(p)||'');
+      if(gid && MANAGED_GROUP_IDS.has(gid)) managed++;
+    }
+    autoState.managed_groups_verified=managed;
+    autoState.managed_groups_total=products.length;
+    return {ok:true,managed,total:products.length};
+  }catch(e){
+    autoState.errors.unshift({where:'verify-groups',error:safeText(e)});
+    return {ok:false,managed:0,total:0,error:safeText(e)};
+  }
+}
+
 async function waitAutoImport(id,totalItems=0,timeoutMs=AUTO_IMPORT_STATUS_MAX_MIN*60*1000){
-  if(!id) return {ok:true,status:'ACCEPTED_WITHOUT_ID'};
+  if(!id){
+    autoState.import_background=true;
+    return {ok:true,status:'ACCEPTED_BACKGROUND',pending:true};
+  }
 
   const t0=Date.now();
   let last=null;
+  let statusErrors=0;
 
   autoState.import_poll_count=0;
   autoState.import_elapsed_sec=0;
   autoState.import_last_status_payload=null;
+  autoState.status_endpoint_errors=0;
 
-  while(Date.now()-t0<timeoutMs){
+  while((Date.now()-t0) < AUTO_STATUS_POLL_MAX_SEC*1000){
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
 
     await interruptibleSleep(7000);
@@ -2256,31 +2288,51 @@ async function waitAutoImport(id,totalItems=0,timeoutMs=AUTO_IMPORT_STATUS_MAX_M
 
       const mm=Math.floor(autoState.import_elapsed_sec/60);
       const ss=String(autoState.import_elapsed_sec%60).padStart(2,'0');
-
       const processed=Number.isFinite(c.processed) ? c.processed : null;
       const total=Number.isFinite(c.total) ? c.total : (totalItems||null);
       const countText=(processed!==null && total!==null) ? ` · Prom: ${processed}/${total}` : '';
 
-      autoState.phase=`4/5 Prom обрабатывает единый импорт${totalItems?` ${totalItems} товаров`:''} · статус ${st}${countText} · ${mm}:${ss}`;
+      autoState.phase=`4/5 Prom обрабатывает импорт · ${st}${countText} · ${mm}:${ss}`;
       autoState.progress=88;
 
       if(/SUCCESS|DONE|FINISH|FINISHED|COMPLETE|COMPLETED/.test(st)){
-        return {ok:true,status:st,data:last,counters:c};
+        autoState.import_background=false;
+        return {ok:true,status:st,data:last,counters:c,pending:false};
       }
       if(/ERROR|FAIL|FAILED|CANCEL|CANCELED|CANCELLED/.test(st)){
-        return {ok:false,status:st,data:last,counters:c};
+        return {ok:false,status:st,data:last,counters:c,pending:false};
       }
     }catch(e){
-      // A temporary status error should not kill a valid import job.
-      autoState.import_error='Не удалось прочитать статус Prom: '+safeText(e)+'. Повторяю.';
-      autoState.phase=`4/5 Импорт уже отправлен. Жду Prom и повторяю проверку статуса · ${autoState.import_elapsed_sec} сек`;
+      statusErrors++;
+      autoState.status_endpoint_errors=statusErrors;
+      autoState.import_error='Статус Prom сейчас не читается: '+safeText(e);
+      autoState.phase=`4/5 Импорт уже принят Prom. Ошибка чтения статуса ${statusErrors}/${AUTO_STATUS_ERROR_LIMIT}`;
+
+      if(statusErrors>=AUTO_STATUS_ERROR_LIMIT) break;
     }
   }
 
+  // Do not hang for an hour. The import remains accepted and keeps running on Prom.
+  autoState.import_background=true;
+  autoState.import_status='ACCEPTED_BACKGROUND';
+  autoState.phase='4/5 Импорт принят Prom и выполняется в фоне. Проверяю реальные группы';
+  autoState.progress=92;
+
+  await interruptibleSleep(15000);
+  const verify=await verifyManagedGroupsNow();
+
+  if(verify.ok && verify.managed>0){
+    autoState.phase=`4/5 Уже видно товаров в новых группах: ${verify.managed}/${verify.total}. Prom может продолжать обработку в фоне`;
+  }else{
+    autoState.phase='4/5 Импорт принят. Status API не читается, поэтому автомат не зависает и продолжает работу';
+  }
+
   return {
-    ok:false,
-    status:`TIMEOUT_${AUTO_IMPORT_STATUS_MAX_MIN}MIN`,
-    data:last
+    ok:true,
+    status:'ACCEPTED_BACKGROUND',
+    data:last,
+    pending:true,
+    verified:verify
   };
 }
 
@@ -2336,6 +2388,7 @@ function firstProductImage(p,match){
 }
 async function auditManagedGroups(){
   autoState.phase='5/5 Проверяю группы магазина';
+  await verifyManagedGroupsNow();
   autoState.progress=97;
 
   try{
@@ -2449,10 +2502,17 @@ async function autoImportCharacteristics(){
   }
 
   autoState.current=items.length;
-  autoState.groups_imported=items.length;
-  autoState.attributes_imported=autoState.attributes_planned;
-  autoState.import_error=null;
-  autoState.progress=96;
+  if(st.pending){
+    autoState.groups_imported=autoState.managed_groups_verified||0;
+    autoState.attributes_imported=0;
+    autoState.import_error=null;
+    autoState.progress=95;
+  }else{
+    autoState.groups_imported=items.length;
+    autoState.attributes_imported=autoState.attributes_planned;
+    autoState.import_error=null;
+    autoState.progress=96;
+  }
 }
 
 async function runAutoAll(reason='manual'){
@@ -2493,7 +2553,11 @@ async function runAutoAll(reason='manual'){
     import_poll_count:0,
     import_last_status_payload:null,
     feed_progress:{},
-    feed_download_source:{}
+    feed_download_source:{},
+    import_background:false,
+    managed_groups_verified:0,
+    managed_groups_total:0,
+    status_endpoint_errors:0
   });
 
   try{
@@ -2567,9 +2631,9 @@ function renderAutoHome(){
   const bezetSrc=supplierState.sources?.bezet||null;
   const militarisSrc=supplierState.sources?.militaris||null;
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v3.2 FEED STABLE</title><style>
+<title>PrimeTac AUTO v3.3 NO HANG</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.2 FEED STABLE</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены, остатки и фото не трогает.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.3 NO HANG</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED проверка статуса длится недолго: если endpoint Prom не отвечает, автомат больше не висит часами. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены, остатки и фото не трогает.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
 <div class="c"><b>Поставщики</b>
@@ -2587,9 +2651,11 @@ function renderAutoHome(){
 </div>
 <div class="c"><b>Импорт групп + характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>
 <div class="m">Опросов статуса Prom: ${autoState.import_poll_count||0}; ожидание: ${autoState.import_elapsed_sec||0} сек.</div>
+<div class="m">Фактически видно в управляемых группах: ${autoState.managed_groups_verified||0}/${autoState.managed_groups_total||total||0}. ${autoState.import_background?'Prom продолжает импорт в фоне.':''}</div>
+<div class="m">Ошибок status endpoint: ${autoState.status_endpoint_errors||0}. После ${AUTO_STATUS_ERROR_LIMIT} ошибок автомат перестаёт ждать его.</div>
 <div class="m">Здесь больше не будет «120/1606»: весь каталог отправляется одной задачей, а экран показывает реальный статус Prom.</div>${autoState.import_error?`<div class="bad m">${autoEscHtml(safeText(autoState.import_error))}</div>`:''}</div>
 ${latestErr?`<div class="c"><b class="bad">Последняя ошибка</b><div class="m">${autoEscHtml(safeText(latestErr?.error)||'')}</div></div>`:''}
-<div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy первый запуск начинается сам, если <code>AUTO_ON_START</code> не выключен.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/last-import.xml">Последний XML групп/характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
+<div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy первый запуск начинается сам, если <code>AUTO_ON_START</code> не выключен.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/verify">Проверить результат Prom</a> · <a href="/auto/last-import.xml">Последний XML групп/характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
 </div></body></html>`;
 }
 
@@ -2599,14 +2665,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v3.2 FEED STABLE</title>
+<title>PrimeTac AUTO v3.3 NO HANG</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v3.2 FEED STABLE</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v3.3 NO HANG</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -3481,11 +3547,21 @@ app.get('/groups/covers', (_req,res)=>{
 });
 
 app.get('/auto/last-import.xml', (_req,res) => res.type('application/xml').send(lastAutoImportXml||'<?xml version="1.0"?><empty/>'));
+app.get('/auto/verify', async (_req,res)=>{
+  try{
+    await verifyManagedGroupsNow();
+    await auditManagedGroups();
+  }catch(e){
+    autoState.errors.unshift({where:'manual-verify',error:safeText(e)});
+  }
+  res.redirect('/');
+});
+
 
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v3.2 FEED STABLE',
+    app: 'PrimeTac AUTO v3.3 NO HANG',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED
   });
@@ -3560,7 +3636,7 @@ app.get('/api/card/:id', async (req,res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v3.2 FEED STABLE started on ${PORT}`);
+  console.log(`PrimeTac AUTO v3.3 NO HANG started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   if(AUTO_ON_START && PROM_TOKEN && WRITE_ENABLED){
     setTimeout(()=>runAutoAll('startup').catch(e=>{autoState.errors.unshift({where:'startup',error:safeText(e)});autoState.running=false;}),5000);
