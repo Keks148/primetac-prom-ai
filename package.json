@@ -1,6 +1,6 @@
 {
-  "name": "primetac-auto-v3-3-no-hang",
-  "version": "3.3.0",
+  "name": "primetac-auto-v3-4-stock-monitor",
+  "version": "3.4.0",
   "private": true,
   "main": "server.js",
   "scripts": {

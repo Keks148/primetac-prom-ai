@@ -31,6 +31,16 @@ const AUTO_IMPORT_LOCK_MAX_MIN = Math.max(5, Number(process.env.AUTO_IMPORT_LOCK
 const AUTO_IMPORT_STATUS_MAX_MIN = Math.max(15, Number(process.env.AUTO_IMPORT_STATUS_MAX_MIN || 90));
 const AUTO_STATUS_POLL_MAX_SEC = Math.max(30, Number(process.env.AUTO_STATUS_POLL_MAX_SEC || 75));
 const AUTO_STATUS_ERROR_LIMIT = Math.max(2, Number(process.env.AUTO_STATUS_ERROR_LIMIT || 3));
+const STOCK_MONITOR_ENABLED = String(process.env.STOCK_MONITOR_ENABLED || 'true').toLowerCase() !== 'false';
+const STOCK_WRITE_ENABLED = String(process.env.STOCK_WRITE_ENABLED || 'false').toLowerCase() === 'true';
+const STOCK_INTERVAL_HOURS = Math.max(1, Number(process.env.STOCK_INTERVAL_HOURS || 4));
+const STOCK_LOW_THRESHOLD = Math.max(1, Number(process.env.STOCK_LOW_THRESHOLD || 3));
+const STOCK_MAX_WRITES = Math.max(10, Number(process.env.STOCK_MAX_WRITES || 250));
+const STOCK_ALLOW_MASS = String(process.env.STOCK_ALLOW_MASS || 'false').toLowerCase() === 'true';
+const STOCK_BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.STOCK_BATCH_SIZE || 40)));
+const STOCK_START_DELAY_SEC = Math.max(15, Number(process.env.STOCK_START_DELAY_SEC || 90));
+const STOCK_SNAPSHOT_PATH = String(process.env.STOCK_SNAPSHOT_PATH || '/tmp/primetac-stock-snapshot.json');
+
 
 const SUPPLIER_FEED_ATTEMPTS = Math.max(2, Math.min(6, Number(process.env.SUPPLIER_FEED_ATTEMPTS || 4)));
 const SUPPLIER_FEED_TIMEOUT_MS = Math.max(30000, Number(process.env.SUPPLIER_FEED_TIMEOUT_MS || 90000));
@@ -197,6 +207,37 @@ let autoState = {
   managed_groups_total:0,
   status_endpoint_errors:0
 };
+
+let stockState = {
+  running:false,
+  started_at:null,
+  finished_at:null,
+  next_run_at:null,
+  last_run_reason:null,
+  phase:'Ожидание',
+  progress:0,
+  prom_total:0,
+  matched:0,
+  unmatched:0,
+  stock_known:0,
+  stock_unknown:0,
+  in_stock:0,
+  low_stock:0,
+  out_of_stock:0,
+  planned_changes:0,
+  applied_changes:0,
+  failed_changes:0,
+  skipped_stale_source:0,
+  skipped_unsafe_match:0,
+  missing_from_feed:0,
+  new_supplier_skus:0,
+  safety_blocked:false,
+  write_enabled:STOCK_WRITE_ENABLED,
+  sources:{},
+  changes:[],
+  errors:[]
+};
+
 let lastAutoImportXml='';
 
 
@@ -872,9 +913,10 @@ function supplierRecordFromNode(n, supplier){
   const pictures=uniq(arr(n.picture || n.pictures || n.image || n.images).flatMap(x=>arr(x)).map(primitive).filter(Boolean));
   const price=norm(primitive(n.price || n.priceRUAH || n.cost));
   const category=norm(primitive(n.categoryId || n.category || n.category_id));
-  const available=norm(primitive(n['@_available'] ?? n.available ?? n.stock ?? n.quantity));
+  const stock=stockInfoFromNode(n);
+  const available=norm(primitive(n['@_available'] ?? n.available ?? n.presence ?? n.stock ?? n.quantity));
   const id=norm(primitive(n['@_id'] || n.id || sku || name));
-  return {supplier,id,sku,name,brand,url,description,pictures,price,category,available,params,raw_hint:Object.keys(n).slice(0,30)};
+  return {supplier,id,sku,name,brand,url,description,pictures,price,category,available,stock,params,raw_hint:Object.keys(n).slice(0,30)};
 }
 
 function parseSupplierFeed(xml, supplier){
@@ -894,6 +936,423 @@ function parseSupplierFeed(xml, supplier){
     seen.add(k); records.push(r);
   }
   return records;
+}
+
+
+function parseNumberish(v){
+  if(v===undefined || v===null) return null;
+  const t=norm(primitive(v)).replace(/\s/g,'').replace(',','.');
+  if(!t) return null;
+  const m=t.match(/-?\d+(?:\.\d+)?/);
+  if(!m) return null;
+  const n=Number(m[0]);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseAvailableBool(v){
+  if(v===undefined || v===null) return null;
+  const t=norm(primitive(v)).toLowerCase();
+  if(!t) return null;
+
+  if(['true','1','yes','y','available','in_stock','instock','!','+','в наличии','в наявності','есть','є'].includes(t)) return true;
+  if(['false','0','no','n','not_available','out_of_stock','outofstock','-','нет','немає','відсутній','отсутствует'].includes(t)) return false;
+
+  if(/немає|нет в наличии|не в наличии|out.?of.?stock|not.?available|відсут/.test(t)) return false;
+  if(/в наявності|в наличии|available|готово/.test(t)) return true;
+  return null;
+}
+
+function stockInfoFromNode(n){
+  const qCandidates=[
+    n?.quantity_in_stock,
+    n?.stock_quantity,
+    n?.quantity,
+    n?.stock,
+    n?.remains,
+    n?.balance,
+    n?.rest
+  ];
+  let quantity=null;
+  let quantityRaw='';
+  for(const x of qCandidates){
+    const q=parseNumberish(x);
+    if(q!==null){
+      quantity=Math.max(0,Math.floor(q));
+      quantityRaw=norm(primitive(x));
+      break;
+    }
+  }
+
+  const aCandidates=[
+    n?.['@_available'],
+    n?.available,
+    n?.in_stock,
+    n?.presence,
+    n?.status
+  ];
+  let available=null;
+  let availableRaw='';
+  for(const x of aCandidates){
+    const b=parseAvailableBool(x);
+    if(b!==null){
+      available=b;
+      availableRaw=norm(primitive(x));
+      break;
+    }
+  }
+
+  if(quantity!==null) available=quantity>0;
+
+  return {
+    known: quantity!==null || available!==null,
+    quantity,
+    available,
+    quantity_raw:quantityRaw,
+    available_raw:availableRaw
+  };
+}
+
+function promQuantity(p){
+  for(const k of ['quantity_in_stock','stock_quantity','quantity','stock']){
+    if(p && p[k]!==undefined && p[k]!==null){
+      const n=Number(p[k]);
+      if(Number.isFinite(n)) return Math.max(0,Math.floor(n));
+    }
+  }
+  return null;
+}
+
+function promPresence(p){
+  return norm(p?.presence ?? p?.status ?? '').toLowerCase();
+}
+
+function isBezetPromProduct(p){
+  const text=norm([
+    p?.name,
+    p?.brand,
+    p?.vendor,
+    p?.manufacturer,
+    findBrand(p?.name||'')
+  ].filter(Boolean).join(' ')).toLowerCase();
+  return text.includes('bezet');
+}
+
+function sourceIsFresh(key){
+  const src=supplierState.sources?.[key];
+  if(!src?.ok) return false;
+  const mode=src?.download?.mode;
+  // Old feeds without diagnostics are treated as fresh only if no error is present.
+  return mode ? mode==='fresh' : !src.error;
+}
+
+function exactStockMatch(p){
+  const skus=promSkuCandidates(p);
+  if(!skus.length) return null;
+
+  const preferred=isBezetPromProduct(p)
+    ? ['bezet','militaris']
+    : ['militaris','bezet'];
+
+  for(const key of preferred){
+    const idx=supplierIndexes[key];
+    if(!idx) continue;
+
+    for(const sku of skus){
+      const rows=idx.sku.get(sku)||[];
+      if(!rows.length) continue;
+
+      // Exact SKU only. Stock is too important for fuzzy matching.
+      const r=rows[0];
+      return {
+        supplier:key,
+        supplier_name:SUPPLIER_CONFIG[key].name,
+        record:r,
+        reason:'SKU/артикул',
+        score:100
+      };
+    }
+  }
+  return null;
+}
+
+function readStockSnapshot(){
+  try{
+    const d=JSON.parse(fs.readFileSync(STOCK_SNAPSHOT_PATH,'utf8'));
+    return d && typeof d==='object' ? d : {products:{}};
+  }catch{
+    return {products:{}};
+  }
+}
+
+function writeStockSnapshot(data){
+  try{
+    fs.writeFileSync(STOCK_SNAPSHOT_PATH,JSON.stringify(data,null,2),'utf8');
+  }catch(e){
+    stockState.errors.unshift({where:'snapshot',error:safeText(e)});
+  }
+}
+
+function productStockPlan(p,match){
+  if(!match?.record?.stock?.known) return null;
+
+  const st=match.record.stock;
+  const currentQty=promQuantity(p);
+  const currentPresence=promPresence(p);
+
+  const desiredPresence=st.available===true
+    ? 'available'
+    : st.available===false
+      ? 'not_available'
+      : null;
+
+  const payload={id:Number(p.id)};
+  const changes=[];
+
+  if(st.quantity!==null){
+    if(currentQty===null || currentQty!==st.quantity){
+      payload.quantity_in_stock=st.quantity;
+      changes.push({field:'quantity_in_stock',before:currentQty,after:st.quantity});
+    }
+  }
+
+  if(desiredPresence){
+    const curAvailable=/^available$|in_stock|ready|готов/.test(currentPresence);
+    const curNot=/not_available|out_of_stock|нет|немає/.test(currentPresence);
+
+    if((desiredPresence==='available' && !curAvailable) ||
+       (desiredPresence==='not_available' && !curNot)){
+      payload.presence=desiredPresence;
+      payload.in_stock=(desiredPresence==='available');
+      changes.push({field:'presence',before:currentPresence||null,after:desiredPresence});
+    }
+  }
+
+  if(!changes.length) return null;
+  return {payload,changes,stock:st};
+}
+
+async function applyStockBatch(plans){
+  if(!plans.length) return {ok:true,count:0};
+  const payload=plans.map(x=>x.payload);
+  const r=await promRequest('POST','/products/edit',payload);
+  return {ok:true,count:plans.length,result:r};
+}
+
+async function runStockMonitor(reason='manual'){
+  if(stockState.running) return;
+  if(!STOCK_MONITOR_ENABLED && reason!=='manual') return;
+  if(!PROM_TOKEN) throw new Error('PROM_TOKEN не задан');
+
+  Object.assign(stockState,{
+    running:true,
+    started_at:new Date().toISOString(),
+    finished_at:null,
+    last_run_reason:reason,
+    phase:'1/4 Загружаю каталог Prom',
+    progress:5,
+    prom_total:0,
+    matched:0,
+    unmatched:0,
+    stock_known:0,
+    stock_unknown:0,
+    in_stock:0,
+    low_stock:0,
+    out_of_stock:0,
+    planned_changes:0,
+    applied_changes:0,
+    failed_changes:0,
+    skipped_stale_source:0,
+    skipped_unsafe_match:0,
+    missing_from_feed:0,
+    new_supplier_skus:0,
+    safety_blocked:false,
+    write_enabled:STOCK_WRITE_ENABLED,
+    sources:{},
+    changes:[],
+    errors:[]
+  });
+
+  try{
+    const products=await listAllProducts();
+    stockState.prom_total=products.length;
+    promRawCache=new Map(products.map(p=>[String(p.id),p]));
+
+    stockState.phase='2/4 Загружаю XML BEZET + Militaris';
+    stockState.progress=20;
+
+    // refreshSupplierFeeds handles retries/cache itself.
+    // For stock WRITES we later require a FRESH source, never stale cache.
+    await refreshSupplierFeeds();
+
+    stockState.sources={
+      bezet:{
+        ok:Boolean(supplierState.sources?.bezet?.ok),
+        fresh:sourceIsFresh('bezet'),
+        count:Number(supplierState.sources?.bezet?.count||0),
+        error:safeText(supplierState.sources?.bezet?.error||'')
+      },
+      militaris:{
+        ok:Boolean(supplierState.sources?.militaris?.ok),
+        fresh:sourceIsFresh('militaris'),
+        count:Number(supplierState.sources?.militaris?.count||0),
+        error:safeText(supplierState.sources?.militaris?.error||'')
+      }
+    };
+
+    stockState.phase='3/4 Сравниваю остатки';
+    stockState.progress=45;
+
+    const snapshot=readStockSnapshot();
+    const previous=snapshot.products||{};
+    const nextProducts={};
+    const plans=[];
+
+    const promSkuSet=new Set();
+    for(const p of products){
+      for(const sku of promSkuCandidates(p)) promSkuSet.add(sku);
+    }
+
+    // Count supplier SKUs not present in Prom. Informational only.
+    const supplierUnique=new Set();
+    for(const key of ['bezet','militaris']){
+      for(const r of supplierRecords[key]||[]){
+        const sku=cleanSku(r.sku);
+        if(sku) supplierUnique.add(key+'|'+sku);
+      }
+    }
+    let newSupplier=0;
+    for(const token of supplierUnique){
+      const sku=token.split('|').slice(1).join('|');
+      if(sku && !promSkuSet.has(sku)) newSupplier++;
+    }
+    stockState.new_supplier_skus=newSupplier;
+
+    for(const p of products){
+      const match=exactStockMatch(p);
+
+      if(!match){
+        stockState.unmatched++;
+        stockState.skipped_unsafe_match++;
+        continue;
+      }
+
+      stockState.matched++;
+      const key=match.supplier;
+      const st=match.record.stock||{known:false};
+
+      nextProducts[String(p.id)]={
+        supplier:key,
+        sku:cleanSku(match.record.sku)||promSkuCandidates(p)[0]||'',
+        name:p.name||'',
+        stock:st,
+        seen_at:new Date().toISOString()
+      };
+
+      if(!st.known){
+        stockState.stock_unknown++;
+        continue;
+      }
+
+      stockState.stock_known++;
+
+      if(st.quantity!==null){
+        if(st.quantity===0) stockState.out_of_stock++;
+        else if(st.quantity<=STOCK_LOW_THRESHOLD) stockState.low_stock++;
+        else stockState.in_stock++;
+      }else if(st.available===false){
+        stockState.out_of_stock++;
+      }else if(st.available===true){
+        stockState.in_stock++;
+      }
+
+      const plan=productStockPlan(p,match);
+      if(!plan) continue;
+
+      // Never write from a stale cache or failed source.
+      if(!sourceIsFresh(key)){
+        stockState.skipped_stale_source++;
+        continue;
+      }
+
+      plans.push({
+        id:String(p.id),
+        name:p.name||'',
+        supplier:key,
+        sku:cleanSku(match.record.sku)||'',
+        ...plan
+      });
+    }
+
+    // Products that were previously mapped but are absent now are only reported.
+    // They are NOT automatically set out-of-stock. This prevents one bad feed from killing sales.
+    let missing=0;
+    for(const [pid,old] of Object.entries(previous)){
+      if(!old?.supplier || !old?.sku) continue;
+      const idx=supplierIndexes[old.supplier];
+      if(!idx || !sourceIsFresh(old.supplier)) continue;
+      if(!(idx.sku.get(cleanSku(old.sku))||[]).length) missing++;
+    }
+    stockState.missing_from_feed=missing;
+
+    stockState.planned_changes=plans.length;
+    stockState.changes=plans.slice(0,100).map(x=>({
+      id:x.id,
+      name:x.name,
+      supplier:x.supplier,
+      sku:x.sku,
+      changes:x.changes
+    }));
+
+    writeStockSnapshot({
+      updated_at:new Date().toISOString(),
+      products:nextProducts
+    });
+
+    stockState.phase='4/4 Обновляю Prom';
+    stockState.progress=75;
+
+    if(!STOCK_WRITE_ENABLED){
+      stockState.phase='✅ Проверено. Режим предварительного просмотра: запись в Prom выключена';
+      stockState.progress=100;
+      return;
+    }
+
+    if(plans.length>STOCK_MAX_WRITES && !STOCK_ALLOW_MASS){
+      stockState.safety_blocked=true;
+      stockState.phase=`⚠️ Защита остановила массовую запись: ${plans.length} изменений > лимита ${STOCK_MAX_WRITES}`;
+      stockState.progress=100;
+      return;
+    }
+
+    for(let i=0;i<plans.length;i+=STOCK_BATCH_SIZE){
+      const part=plans.slice(i,i+STOCK_BATCH_SIZE);
+      try{
+        await applyStockBatch(part);
+        stockState.applied_changes+=part.length;
+      }catch(e){
+        stockState.failed_changes+=part.length;
+        stockState.errors.unshift({
+          where:'stock-write',
+          batch:`${i+1}-${i+part.length}`,
+          error:safeText(e)
+        });
+      }
+      stockState.progress=Math.min(99,75+Math.round(24*((i+part.length)/Math.max(1,plans.length))));
+    }
+
+    stockState.phase=stockState.failed_changes
+      ? `⚠️ Готово: обновлено ${stockState.applied_changes}, ошибок ${stockState.failed_changes}`
+      : `✅ Склад обновлён: ${stockState.applied_changes} товаров`;
+    stockState.progress=100;
+
+  }catch(e){
+    stockState.phase='Ошибка';
+    stockState.errors.unshift({where:'stock-monitor',error:safeText(e)});
+  }finally{
+    stockState.running=false;
+    stockState.finished_at=new Date().toISOString();
+    stockState.next_run_at=new Date(Date.now()+STOCK_INTERVAL_HOURS*3600*1000).toISOString();
+  }
 }
 
 function buildSupplierIndex(records){
@@ -2631,11 +3090,28 @@ function renderAutoHome(){
   const bezetSrc=supplierState.sources?.bezet||null;
   const militarisSrc=supplierState.sources?.militaris||null;
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v3.3 NO HANG</title><style>
+<title>PrimeTac AUTO v3.4 STOCK MONITOR</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.3 NO HANG</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED проверка статуса длится недолго: если endpoint Prom не отвечает, автомат больше не висит часами. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены, остатки и фото не трогает.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4 STOCK MONITOR</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED проверка статуса длится недолго: если endpoint Prom не отвечает, автомат больше не висит часами. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
+<div class="c"><b>📦 Контроль склада</b>
+<div class="m" style="margin-top:7px">Автопроверка: каждые ${STOCK_INTERVAL_HOURS} ч. · запись в Prom: <b class="${STOCK_WRITE_ENABLED?'ok':'warn'}">${STOCK_WRITE_ENABLED?'ВКЛ':'ВЫКЛ (предпросмотр)'}</b></div>
+<div class="grid" style="margin-top:10px">
+  <div class="s"><div class="m">Сопоставлено по SKU</div><div class="n ok">${stockState.matched||0}</div></div>
+  <div class="s"><div class="m">Заканчиваются ≤ ${STOCK_LOW_THRESHOLD}</div><div class="n warn">${stockState.low_stock||0}</div></div>
+  <div class="s"><div class="m">Нет в наличии</div><div class="n ${stockState.out_of_stock?'bad':''}">${stockState.out_of_stock||0}</div></div>
+  <div class="s"><div class="m">План изменений</div><div class="n">${stockState.planned_changes||0}</div></div>
+  <div class="s"><div class="m">Обновлено в Prom</div><div class="n ok">${stockState.applied_changes||0}</div></div>
+  <div class="s"><div class="m">Пропали из XML</div><div class="n ${stockState.missing_from_feed?'warn':''}">${stockState.missing_from_feed||0}</div></div>
+</div>
+<div class="m" style="margin-top:9px">${autoEscHtml(stockState.phase||'Ожидание')}</div>
+<div class="m">BEZET: ${stockState.sources?.bezet?.fresh?'✅ свежий XML':(stockState.sources?.bezet?.ok?'⚠️ кеш/устарел':'❌ нет данных')} · Militaris: ${stockState.sources?.militaris?.fresh?'✅ свежий XML':(stockState.sources?.militaris?.ok?'⚠️ кеш/устарел':'❌ нет данных')}</div>
+<div class="m">Новые SKU у поставщиков, которых нет в Prom: ${stockState.new_supplier_skus||0}. Неопознанные/без точного SKU: ${stockState.unmatched||0}.</div>
+${stockState.safety_blocked?`<div class="m bad">Защита от массовой записи сработала. Ничего массово не записано.</div>`:''}
+${stockState.errors?.[0]?`<div class="m bad">Последняя ошибка: ${autoEscHtml(safeText(stockState.errors[0].error))}</div>`:''}
+<div style="margin-top:10px"><a href="/stock/run">Проверить склад сейчас</a> · <a href="/stock/state">Отчёт склада JSON</a></div>
+</div>
 <div class="c"><b>Поставщики</b>
 <div class="m" style="margin-top:7px">BEZET: ${bezetSrc?.ok?`✅ ${bezetSrc.count} товаров${bezetSrc.download?.mode==='cache'?' · кеш':''}`:`❌ ${autoEscHtml(safeText(bezetSrc?.error)||'не загружен')}`}</div>
 <div class="m">Militaris: ${militarisSrc?.ok?`✅ ${militarisSrc.count} товаров${militarisSrc.download?.mode==='cache'?' · кеш':''}`:`❌ ${autoEscHtml(safeText(militarisSrc?.error)||'не загружен')}`}</div>
@@ -2665,14 +3141,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v3.3 NO HANG</title>
+<title>PrimeTac AUTO v3.4 STOCK MONITOR</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v3.3 NO HANG</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v3.4 STOCK MONITOR</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -3517,6 +3993,29 @@ app.get('/auto/stop/', stopAutoRoute);
 app.post('/auto/stop/', stopAutoRoute);
 app.get('/auto/state', (_req,res) => res.json({auto:autoState,scan:scanState.summary,suppliers:supplierState,fix:fixState,enrich:enrichState}));
 
+app.get('/stock/state', (_req,res) => res.json({
+  stock:stockState,
+  config:{
+    monitor_enabled:STOCK_MONITOR_ENABLED,
+    write_enabled:STOCK_WRITE_ENABLED,
+    interval_hours:STOCK_INTERVAL_HOURS,
+    low_threshold:STOCK_LOW_THRESHOLD,
+    max_writes:STOCK_MAX_WRITES,
+    allow_mass:STOCK_ALLOW_MASS
+  }
+}));
+
+app.get('/stock/run', (_req,res)=>{
+  if(!stockState.running){
+    setTimeout(()=>runStockMonitor('manual').catch(e=>{
+      stockState.errors.unshift({where:'manual',error:safeText(e)});
+      stockState.running=false;
+    }),50);
+  }
+  res.redirect(303,'/');
+});
+
+
 app.get('/groups/plan', (_req,res)=>{
   res.json({
     version:'v3.0',
@@ -3561,9 +4060,11 @@ app.get('/auto/verify', async (_req,res)=>{
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v3.3 NO HANG',
+    app: 'PrimeTac AUTO v3.4 STOCK MONITOR',
     prom_connected: Boolean(PROM_TOKEN),
-    write_enabled: WRITE_ENABLED
+    write_enabled: WRITE_ENABLED,
+    stock_monitor_enabled: STOCK_MONITOR_ENABLED,
+    stock_write_enabled: STOCK_WRITE_ENABLED
   });
 });
 
@@ -3635,11 +4136,40 @@ app.get('/api/card/:id', async (req,res) => {
   }
 });
 
+let stockRetryTimer=null;
+function startStockWhenFree(reason='schedule'){
+  if(!STOCK_MONITOR_ENABLED || !PROM_TOKEN || stockState.running) return;
+
+  if(autoState.running || supplierState.loading){
+    stockState.phase='Контроль склада ждёт завершения основного процесса';
+    stockState.next_run_at=new Date(Date.now()+15*60*1000).toISOString();
+
+    if(!stockRetryTimer){
+      stockRetryTimer=setTimeout(()=>{
+        stockRetryTimer=null;
+        startStockWhenFree(reason+'-retry');
+      },15*60*1000);
+    }
+    return;
+  }
+
+  runStockMonitor(reason).catch(e=>{
+    stockState.errors.unshift({where:reason,error:safeText(e)});
+    stockState.running=false;
+  });
+}
+
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v3.3 NO HANG started on ${PORT}`);
+  console.log(`PrimeTac AUTO v3.4 STOCK MONITOR started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
+  stockState.next_run_at=new Date(Date.now()+STOCK_INTERVAL_HOURS*3600*1000).toISOString();
+
   if(AUTO_ON_START && PROM_TOKEN && WRITE_ENABLED){
     setTimeout(()=>runAutoAll('startup').catch(e=>{autoState.errors.unshift({where:'startup',error:safeText(e)});autoState.running=false;}),5000);
+  }
+
+  if(STOCK_MONITOR_ENABLED && PROM_TOKEN){
+    setTimeout(()=>startStockWhenFree('startup'),STOCK_START_DELAY_SEC*1000);
   }
 });
 setInterval(()=>{
@@ -3647,3 +4177,8 @@ setInterval(()=>{
     runAutoAll('schedule').catch(e=>{autoState.errors.unshift({where:'schedule',error:safeText(e)});autoState.running=false;});
   }
 }, AUTO_INTERVAL_HOURS*3600*1000);
+
+setInterval(()=>{
+  startStockWhenFree('schedule');
+}, STOCK_INTERVAL_HOURS*3600*1000);
+
