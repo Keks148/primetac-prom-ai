@@ -208,9 +208,6 @@ let autoState = {
   status_endpoint_errors:0
 };
 
-let stockPendingPlans = [];
-const STOCK_PILOT_LIMIT = 20;
-
 let stockState = {
   running:false,
   started_at:null,
@@ -236,13 +233,23 @@ let stockState = {
   new_supplier_skus:0,
   safety_blocked:false,
   write_enabled:STOCK_WRITE_ENABLED,
-  pilot_limit:STOCK_PILOT_LIMIT,
-  pilot_applied:0,
-  pilot_failed:0,
-  pilot_last_at:null,
   sources:{},
   changes:[],
   errors:[]
+};
+
+
+let lastStockPlans=[];
+let stockDiag={
+  running:false,
+  at:null,
+  product:null,
+  request:null,
+  http_status:null,
+  response:null,
+  error:null,
+  verified:null,
+  after:null
 };
 
 let lastAutoImportXml='';
@@ -1138,6 +1145,57 @@ function productStockPlan(p,match){
   return {payload,changes,stock:st};
 }
 
+
+async function runOneStockDiagnostic(){
+  if(stockDiag.running) return stockDiag;
+  stockDiag={running:true,at:new Date().toISOString(),product:null,request:null,http_status:null,response:null,error:null,verified:null,after:null};
+  try{
+    // If there is no current plan (e.g. just after deploy), build a fresh preview first.
+    if(!lastStockPlans.length){
+      await runStockMonitor('diagnostic-preview');
+    }
+    if(!lastStockPlans.length) throw new Error('Нет запланированных изменений склада для теста');
+
+    // Prefer the simplest case: quantity only, without presence switch.
+    const plan=lastStockPlans.find(x=>Array.isArray(x.changes) && x.changes.length===1 && x.changes[0].field==='quantity_in_stock') || lastStockPlans[0];
+    const payload=JSON.parse(JSON.stringify(plan.payload));
+    stockDiag.product={id:plan.id,name:plan.name,sku:plan.sku,supplier:plan.supplier,changes:plan.changes};
+    stockDiag.request={method:'POST',path:'/products/edit',body:[payload]};
+
+    let result;
+    try{
+      result=await promRequest('POST','/products/edit',[payload]);
+      stockDiag.http_status=result?.status ?? 200;
+      stockDiag.response=result?.data ?? result;
+    }catch(e){
+      stockDiag.http_status=e?.status ?? null;
+      stockDiag.response=e?.data ?? null;
+      stockDiag.error={message:e?.message||String(e),status:e?.status??null,data:e?.data??null};
+      return stockDiag;
+    }
+
+    await new Promise(r=>setTimeout(r,2500));
+    const after=await getProduct(plan.id);
+    stockDiag.after=after?{
+      id:after.id,
+      quantity_in_stock:after.quantity_in_stock ?? after.stock_quantity ?? after.quantity ?? null,
+      presence:after.presence ?? after.status ?? null
+    }:null;
+
+    const wantQ=payload.quantity_in_stock;
+    const gotQ=stockDiag.after?.quantity_in_stock;
+    const wantP=payload.presence;
+    const gotP=String(stockDiag.after?.presence||'').toLowerCase();
+    const qOk=wantQ===undefined || Number(gotQ)===Number(wantQ);
+    const pOk=wantP===undefined || gotP===String(wantP).toLowerCase();
+    stockDiag.verified=Boolean(after && qOk && pOk);
+    return stockDiag;
+  }finally{
+    stockDiag.running=false;
+    stockDiag.at=new Date().toISOString();
+  }
+}
+
 async function applyStockBatch(plans){
   if(!plans.length) return {ok:true,count:0};
   const payload=plans.map(x=>x.payload);
@@ -1302,7 +1360,7 @@ async function runStockMonitor(reason='manual'){
     stockState.missing_from_feed=missing;
 
     stockState.planned_changes=plans.length;
-    stockPendingPlans=plans;
+    lastStockPlans=plans;
     stockState.changes=plans.slice(0,100).map(x=>({
       id:x.id,
       name:x.name,
@@ -3098,9 +3156,9 @@ function renderAutoHome(){
   const bezetSrc=supplierState.sources?.bezet||null;
   const militarisSrc=supplierState.sources?.militaris||null;
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v3.4.2 PILOT 20</title><style>
+<title>PrimeTac AUTO v3.4.3 DIAG ONE</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.2 PILOT 20</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED проверка статуса длится недолго: если endpoint Prom не отвечает, автомат больше не висит часами. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.3 DIAG ONE</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED проверка статуса длится недолго: если endpoint Prom не отвечает, автомат больше не висит часами. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
 <div class="c"><b>📦 Контроль склада</b>
@@ -3119,14 +3177,17 @@ function renderAutoHome(){
 <div class="m">Новые SKU у поставщиков, которых нет в Prom: ${stockState.new_supplier_skus||0}. Неопознанные/без точного SKU: ${stockState.unmatched||0}.</div>
 ${stockState.safety_blocked?`<div class="m bad">Защита от массовой записи сработала. Ничего массово не записано.</div>`:''}
 ${stockState.errors?.[0]?`<div class="m bad">Последняя ошибка: ${autoEscHtml(safeText(stockState.errors[0].error))}</div>`:''}
+<div class="m" style="margin-top:10px;padding:10px;border:1px solid #465;border-radius:8px">
+<b>🧪 Диагностика записи 1 товара</b><br>
+${stockDiag.at?`Товар: ${autoEscHtml(stockDiag.product?.name||'—')} · HTTP: ${stockDiag.http_status??'—'} · проверка: ${stockDiag.verified===true?'✅ успешно':stockDiag.verified===false?'❌ не подтверждено':'—'}<br>`:''}
+${stockDiag.error?`<span class="bad">Ошибка: ${autoEscHtml(JSON.stringify(stockDiag.error))}</span><br>`:''}
+${stockDiag.response?`<span class="m">Ответ Prom: ${autoEscHtml(JSON.stringify(stockDiag.response))}</span><br>`:''}
+<form method="get" action="/stock/test-one" style="display:inline"><button class="btn" style="padding:10px 14px;width:auto" ${stockDiag.running?'disabled':''}>${stockDiag.running?'⏳ ТЕСТ...':'🧪 ТЕСТ 1 ТОВАРА'}</button></form>
+<a href="/stock/diag">Диагностика JSON</a>
+</div>
 <div style="margin-top:10px">
 <form method="get" action="/stock/run" style="display:inline"><button class="btn" style="padding:10px 14px;width:auto" ${stockState.running?'disabled':''}>${stockState.running?'⏳ ПРОВЕРЯЮ СКЛАД...':'📦 ПРОВЕРИТЬ СКЛАД СЕЙЧАС'}</button></form>
-${stockState.planned_changes>0 && !stockState.running ? `
-<form method="post" action="/stock/pilot20" style="display:inline;margin-left:6px" onsubmit="return confirm('Применить ТОЛЬКО первые 20 изменений остатков в Prom?')">
-<button class="btn" style="padding:10px 14px;width:auto">🧪 ПРИМЕНИТЬ 20 ТЕСТОВЫХ</button>
-</form>` : ''}
 <span class="m"> · </span><a href="/stock/state">Отчёт склада JSON</a>
-<div class="m" style="margin-top:6px">Пилот: применено ${stockState.pilot_applied||0}, ошибок ${stockState.pilot_failed||0}${stockState.pilot_last_at?` · ${stockState.pilot_last_at}`:''}</div>
 </div>
 </div>
 <div class="c"><b>Поставщики</b>
@@ -3158,14 +3219,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v3.4.2 PILOT 20</title>
+<title>PrimeTac AUTO v3.4.3 DIAG ONE</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.2 PILOT 20</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.3 DIAG ONE</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -4012,6 +4073,7 @@ app.get('/auto/state', (_req,res) => res.json({auto:autoState,scan:scanState.sum
 
 app.get('/stock/state', (_req,res) => res.json({
   stock:stockState,
+  diagnostic:stockDiag,
   config:{
     monitor_enabled:STOCK_MONITOR_ENABLED,
     write_enabled:STOCK_WRITE_ENABLED,
@@ -4021,6 +4083,19 @@ app.get('/stock/state', (_req,res) => res.json({
     allow_mass:STOCK_ALLOW_MASS
   }
 }));
+
+
+app.get('/stock/diag', (_req,res)=>res.json({diag:stockDiag,plan_count:lastStockPlans.length,write_enabled:STOCK_WRITE_ENABLED}));
+
+app.get('/stock/test-one', async (_req,res)=>{
+  try{
+    await runOneStockDiagnostic();
+  }catch(e){
+    stockDiag.error={message:e?.message||String(e),status:e?.status??null,data:e?.data??null};
+    stockDiag.running=false;
+  }
+  return res.redirect(303,'/');
+});
 
 app.get('/stock/run', async (_req,res)=>{
   if(stockState.running){
@@ -4044,41 +4119,6 @@ app.get('/stock/run', async (_req,res)=>{
     stockState.phase='Ошибка ручной проверки склада';
     stockState.running=false;
   }
-  return res.redirect(303,'/');
-});
-
-app.post('/stock/pilot20', async (_req,res)=>{
-  if(stockState.running){
-    stockState.phase='Нельзя запустить пилот: сейчас идёт проверка склада';
-    return res.redirect(303,'/');
-  }
-  const plans=(stockPendingPlans||[]).slice(0,STOCK_PILOT_LIMIT);
-  if(!plans.length){
-    stockState.phase='Нет подготовленных изменений. Сначала нажми «Проверить склад сейчас»';
-    return res.redirect(303,'/');
-  }
-  stockState.phase=`🧪 Пилот: применяю ${plans.length} тестовых изменений`;
-  stockState.progress=90;
-  let ok=0, fail=0;
-  for(let i=0;i<plans.length;i+=STOCK_BATCH_SIZE){
-    const part=plans.slice(i,i+STOCK_BATCH_SIZE);
-    try{
-      await applyStockBatch(part);
-      ok+=part.length;
-    }catch(e){
-      fail+=part.length;
-      stockState.errors.unshift({where:'pilot20',batch:`${i+1}-${i+part.length}`,error:safeText(e)});
-    }
-  }
-  stockState.pilot_applied=(stockState.pilot_applied||0)+ok;
-  stockState.pilot_failed=(stockState.pilot_failed||0)+fail;
-  stockState.pilot_last_at=new Date().toISOString();
-  stockState.applied_changes=ok;
-  stockState.failed_changes=fail;
-  stockState.progress=100;
-  stockState.phase=fail
-    ? `⚠️ Пилот завершён: применено ${ok}, ошибок ${fail}`
-    : `✅ Пилот завершён: применено ${ok} из ${plans.length}. Полная автозапись всё ещё выключена`;
   return res.redirect(303,'/');
 });
 
@@ -4127,7 +4167,7 @@ app.get('/auto/verify', async (_req,res)=>{
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v3.4.2 PILOT 20',
+    app: 'PrimeTac AUTO v3.4.3 DIAG ONE',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED,
     stock_monitor_enabled: STOCK_MONITOR_ENABLED,
@@ -4227,7 +4267,7 @@ function startStockWhenFree(reason='schedule'){
 }
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v3.4.2 PILOT 20 started on ${PORT}`);
+  console.log(`PrimeTac AUTO v3.4.3 DIAG ONE started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   stockState.next_run_at=new Date(Date.now()+STOCK_INTERVAL_HOURS*3600*1000).toISOString();
 
