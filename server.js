@@ -25,12 +25,11 @@ const VERIFY_DELAY_MS = Math.max(300, Number(process.env.VERIFY_DELAY_MS || 700)
 const KEYWORD_ACCEPT_MIN = Math.max(3, Math.min(7, Number(process.env.KEYWORD_ACCEPT_MIN || 4)));
 const ENRICH_CONCURRENCY = Math.max(1, Math.min(2, Number(process.env.ENRICH_CONCURRENCY || 1)));
 const AUTO_INTERVAL_HOURS = Math.max(1, Number(process.env.AUTO_INTERVAL_HOURS || 4));
-const AUTO_ON_START = String(process.env.AUTO_ON_START || 'true').toLowerCase() !== 'false';
-const AUTO_IMPORT_LOCK_WAIT_SEC = Math.max(15, Number(process.env.AUTO_IMPORT_LOCK_WAIT_SEC || 45));
-const AUTO_IMPORT_LOCK_MAX_MIN = Math.max(5, Number(process.env.AUTO_IMPORT_LOCK_MAX_MIN || 45));
-const AUTO_IMPORT_STATUS_MAX_MIN = Math.max(15, Number(process.env.AUTO_IMPORT_STATUS_MAX_MIN || 90));
-const AUTO_STATUS_POLL_MAX_SEC = Math.max(30, Number(process.env.AUTO_STATUS_POLL_MAX_SEC || 75));
-const AUTO_STATUS_ERROR_LIMIT = Math.max(2, Number(process.env.AUTO_STATUS_ERROR_LIMIT || 3));
+const AUTO_ON_START = String(process.env.AUTO_ON_START || 'false').toLowerCase() === 'true';
+const AUTO_IMPORT_STATUS_MAX_MIN = Math.max(5, Number(process.env.AUTO_IMPORT_STATUS_MAX_MIN || 15));
+const AUTO_STATUS_POLL_SEC = Math.max(10, Number(process.env.AUTO_STATUS_POLL_SEC || 20));
+const AUTO_STATUS_VERIFY_SEC = Math.max(30, Number(process.env.AUTO_STATUS_VERIFY_SEC || 60));
+const AUTO_BACKGROUND_WATCH_MAX_MIN = Math.max(15, Number(process.env.AUTO_BACKGROUND_WATCH_MAX_MIN || 120));
 const STOCK_MONITOR_ENABLED = String(process.env.STOCK_MONITOR_ENABLED || 'true').toLowerCase() !== 'false';
 const STOCK_WRITE_ENABLED = String(process.env.STOCK_WRITE_ENABLED || 'false').toLowerCase() === 'true';
 const STOCK_INTERVAL_HOURS = Math.max(1, Number(process.env.STOCK_INTERVAL_HOURS || 4));
@@ -173,8 +172,10 @@ let autoState = {
   next_run_at:null,
   phase:'Ожидание',
   progress:0,
+  keywords_checked:0,
   keywords_planned:0,
   keywords_changed:0,
+  descriptions_checked:0,
   descriptions_planned:0,
   descriptions_changed:0,
   attributes_planned:0,
@@ -203,8 +204,12 @@ let autoState = {
   feed_progress:{},
   feed_download_source:{},
   import_background:false,
+  import_terminal_confirmed:false,
+  import_baseline_groups:0,
   managed_groups_verified:0,
   managed_groups_total:0,
+  attributes_verified:0,
+  attributes_verifiable:0,
   status_endpoint_errors:0
 };
 
@@ -253,6 +258,9 @@ let stockDiag={
 };
 
 let lastAutoImportXml='';
+let lastAutoImportPlan=[];
+let autoImportWatchTimer=null;
+let autoImportWatchStartedAt=0;
 
 
 function norm(v){ return String(v || '').replace(/\s+/g, ' ').trim(); }
@@ -2487,6 +2495,8 @@ async function runFastSeoPass(products){
         }
       }finally{
         autoState.current++;
+        autoState.keywords_checked=autoState.current;
+        autoState.descriptions_checked=autoState.current;
         const ratio=autoState.current/Math.max(1,autoState.current_total);
         autoState.progress=Math.round(35 + ratio*40);
         autoState.phase=`3/5 Ключи + описания ${autoState.current}/${autoState.current_total}`;
@@ -2665,42 +2675,33 @@ async function interruptibleSleep(ms){
 }
 
 async function promImportFileQueued(xmlText,settings,batchText=''){
-  const waitMs=AUTO_IMPORT_LOCK_WAIT_SEC*1000;
-  const maxWaitMs=AUTO_IMPORT_LOCK_MAX_MIN*60*1000;
-  const started=Date.now();
-  let attempt=0;
+  if(autoState.stop_requested) throw new Error('Остановлено пользователем');
 
-  while(true){
-    if(autoState.stop_requested) throw new Error('Остановлено пользователем');
-    attempt++;
+  try{
+    autoState.import_error=null;
+    return await promImportFile(xmlText,settings);
+  }catch(e){
+    if(!isConcurrentImportError(e)) throw e;
 
-    try{
-      autoState.import_error=null;
-      return await promImportFile(xmlText,settings);
-    }catch(e){
-      if(!isConcurrentImportError(e)) throw e;
+    // Safety first: if Prom already has an import in progress, do NOT queue a
+    // second identical import after it. We cannot know that previous import ID,
+    // so we watch the real catalog instead of blindly resubmitting.
+    autoState.import_status='PREVIOUS_IMPORT_ACTIVE';
+    autoState.import_background=true;
+    autoState.phase=
+      `4/5 Prom уже выполняет предыдущий импорт${batchText?` (${batchText})`:''}. `+
+      `Новый импорт НЕ запускаю, проверяю результат предыдущего`;
+    autoState.import_error=
+      'Prom запретил одновременный импорт. Защита от дубля сработала: второй импорт не будет отправлен.';
+    autoState.progress=90;
+    autoImportWatchStartedAt=Date.now();
+    scheduleBackgroundImportWatcher(null,lastAutoImportPlan.length);
 
-      const elapsed=Date.now()-started;
-      if(elapsed>=maxWaitMs){
-        const err=new Error(
-          `Prom всё ещё занят предыдущим импортом спустя ${AUTO_IMPORT_LOCK_MAX_MIN} мин. `+
-          `Новый импорт не запускался.`
-        );
-        err.status=400;
-        throw err;
-      }
-
-      const leftMin=Math.max(0,Math.ceil((maxWaitMs-elapsed)/60000));
-      autoState.import_status='WAITING_PREVIOUS_IMPORT';
-      autoState.phase=
-        `4/5 Prom занят предыдущим импортом${batchText?` (${batchText})`:''}. `+
-        `Жду ${AUTO_IMPORT_LOCK_WAIT_SEC} сек и попробую снова`;
-      autoState.import_error=
-        `Prom временно запрещает второй импорт. Автомат ждёт сам. `+
-        `Попытка ${attempt}; запас ожидания ещё ~${leftMin} мин.`;
-
-      await interruptibleSleep(waitMs);
-    }
+    return {
+      status:202,
+      data:{status:'PREVIOUS_IMPORT_ACTIVE'},
+      previous_active:true
+    };
   }
 }
 
@@ -2763,102 +2764,282 @@ function importCountersDeep(v,depth=0,out={}){
 
 const MANAGED_GROUP_IDS = new Set(MANAGED_GROUPS.map(g=>String(g.id)));
 
-async function verifyManagedGroupsNow(){
+function autoAttributeMatches(p,name,value){
+  const wantName=normalizeLabel(name);
+  const wantValue=norm(value).toLowerCase();
+  if(!wantName || !wantValue) return false;
+  for(const a of promAttributes(p)){
+    const gotName=normalizeLabel(attrName(a));
+    if(!gotName) continue;
+    if(!(gotName===wantName || gotName.includes(wantName) || wantName.includes(gotName))) continue;
+    const gotValue=norm(attrValue(a)).toLowerCase();
+    if(!gotValue) continue;
+    if(gotValue===wantValue || gotValue.includes(wantValue) || wantValue.includes(gotValue)) return true;
+  }
+  return false;
+}
+
+async function verifyLastImportNow(){
   try{
     const products=await listAllProducts();
-    let managed=0;
-    for(const p of products){
-      const gid=String(autoGroupId(p)||'');
-      if(gid && MANAGED_GROUP_IDS.has(gid)) managed++;
+    const byId=new Map(products.map(p=>[String(p.id),p]));
+
+    if(!lastAutoImportPlan.length){
+      let managed=0;
+      for(const p of products){
+        const gid=String(autoGroupId(p)||'');
+        if(gid && MANAGED_GROUP_IDS.has(gid)) managed++;
+      }
+      autoState.managed_groups_verified=managed;
+      autoState.managed_groups_total=products.length;
+      autoState.groups_imported=managed;
+      return {
+        ok:true,
+        managed,
+        total:products.length,
+        groups_complete:false,
+        attributes_verified:0,
+        attributes_verifiable:0,
+        attributes_planned:autoState.attributes_planned||0
+      };
     }
-    autoState.managed_groups_verified=managed;
-    autoState.managed_groups_total=products.length;
-    return {ok:true,managed,total:products.length};
+
+    let groupsMatched=0;
+    let attrPlannedProducts=0;
+    let attrReadableProducts=0;
+    let attrVerifiedProducts=0;
+
+    for(const plan of lastAutoImportPlan){
+      const product=byId.get(String(plan.id));
+      if(!product) continue;
+
+      const actualGroup=String(autoGroupId(product)||'');
+      if(actualGroup && actualGroup===String(plan.group_id||'')) groupsMatched++;
+
+      if(Array.isArray(plan.attrs) && plan.attrs.length){
+        attrPlannedProducts++;
+        if(promAttributes(product).length){
+          attrReadableProducts++;
+          if(plan.attrs.every(([name,value])=>autoAttributeMatches(product,name,value))){
+            attrVerifiedProducts++;
+          }
+        }
+      }
+    }
+
+    autoState.managed_groups_verified=groupsMatched;
+    autoState.managed_groups_total=lastAutoImportPlan.length;
+    autoState.groups_imported=groupsMatched;
+    autoState.attributes_verifiable=attrReadableProducts;
+    autoState.attributes_verified=attrVerifiedProducts;
+    if(attrReadableProducts>0) autoState.attributes_imported=attrVerifiedProducts;
+
+    return {
+      ok:true,
+      managed:groupsMatched,
+      total:lastAutoImportPlan.length,
+      groups_complete:lastAutoImportPlan.length>0 && groupsMatched===lastAutoImportPlan.length,
+      attributes_verified:attrVerifiedProducts,
+      attributes_verifiable:attrReadableProducts,
+      attributes_planned:attrPlannedProducts,
+      attributes_complete:attrPlannedProducts===0 || (attrReadableProducts===attrPlannedProducts && attrVerifiedProducts===attrPlannedProducts)
+    };
   }catch(e){
-    autoState.errors.unshift({where:'verify-groups',error:safeText(e)});
-    return {ok:false,managed:0,total:0,error:safeText(e)};
+    autoState.errors.unshift({where:'verify-import',error:safeText(e)});
+    return {ok:false,managed:0,total:lastAutoImportPlan.length||0,error:safeText(e)};
   }
 }
 
-async function waitAutoImport(id,totalItems=0,timeoutMs=AUTO_IMPORT_STATUS_MAX_MIN*60*1000){
-  if(!id){
-    autoState.import_background=true;
-    return {ok:true,status:'ACCEPTED_BACKGROUND',pending:true};
-  }
+async function verifyManagedGroupsNow(){
+  return verifyLastImportNow();
+}
 
+async function pollAutoImportStatusOnce(id,totalItems=0){
+  if(!id) return {status:'NO_IMPORT_ID',data:null,counters:{}};
+  const r=await promRequest('GET','/products/import/status/'+encodeURIComponent(id));
+  const data=r.data||{};
+  const status=findImportStatusDeep(data) || 'PROCESSING';
+  const counters=importCountersDeep(data);
+  autoState.import_last_status_payload=data;
+  autoState.import_status=status;
+
+  const processed=Number.isFinite(counters.processed) ? counters.processed : null;
+  const total=Number.isFinite(counters.total) ? counters.total : (totalItems||null);
+  const countText=(processed!==null && total!==null) ? ` · Prom: ${processed}/${total}` : '';
+  const mm=Math.floor((autoState.import_elapsed_sec||0)/60);
+  const ss=String((autoState.import_elapsed_sec||0)%60).padStart(2,'0');
+  autoState.phase=`4/5 Prom обрабатывает импорт · ${status}${countText} · ${mm}:${ss}`;
+
+  return {status,data,counters};
+}
+
+function importSucceeded(status){
+  return /SUCCESS|DONE|FINISH|FINISHED|COMPLETE|COMPLETED/.test(String(status||'').toUpperCase());
+}
+function importFailed(status){
+  return /ERROR|FAIL|FAILED|CANCEL|CANCELED|CANCELLED/.test(String(status||'').toUpperCase());
+}
+
+function catalogProvesImport(verify){
+  if(!verify || !verify.ok) return false;
+  const total=Number(verify.total||0);
+  const baseline=Number(autoState.import_baseline_groups||0);
+  const groupsProgressed=Boolean(verify.groups_complete && total>0 && baseline<total);
+  const attrsProved=Boolean(
+    Number(verify.attributes_planned||0)>0 &&
+    Number(verify.attributes_verifiable||0)===Number(verify.attributes_planned||0) &&
+    verify.attributes_complete
+  );
+  return groupsProgressed || attrsProved;
+}
+
+function scheduleBackgroundImportWatcher(id,totalItems=0){
+  if(autoImportWatchTimer) clearTimeout(autoImportWatchTimer);
+  if(!autoImportWatchStartedAt) autoImportWatchStartedAt=Date.now();
+
+  const tick=async()=>{
+    autoImportWatchTimer=null;
+    if(!autoState.import_background) return;
+
+    const elapsed=Date.now()-autoImportWatchStartedAt;
+    autoState.import_elapsed_sec=Math.round(elapsed/1000);
+    if(elapsed > AUTO_BACKGROUND_WATCH_MAX_MIN*60*1000){
+      if(autoState.import_status==='PREVIOUS_IMPORT_ACTIVE'){
+        autoState.import_background=false;
+        autoState.phase=`⚠️ Предыдущий импорт не подтвердил наш план за ${AUTO_BACKGROUND_WATCH_MAX_MIN} мин. Автомат разблокирован для нового запуска`;
+        autoState.import_error='Предыдущий импорт Prom не удалось связать с текущим планом. Новый запуск теперь разрешён.';
+        autoState.progress=100;
+        return;
+      }
+      autoState.phase=`⚠️ Импорт Prom всё ещё не подтверждён спустя ${AUTO_BACKGROUND_WATCH_MAX_MIN} мин. Новый импорт заблокирован до проверки`;
+      autoState.progress=95;
+      return;
+    }
+
+    let terminal='';
+    if(id){
+      try{
+        autoState.import_poll_count++;
+        const r=await pollAutoImportStatusOnce(id,totalItems);
+        terminal=r.status;
+        if(importFailed(terminal)){
+          autoState.import_background=false;
+          autoState.import_terminal_confirmed=true;
+          autoState.import_error='Prom завершил импорт со статусом '+terminal;
+          autoState.phase='Ошибка импорта Prom: '+terminal;
+          autoState.progress=100;
+          return;
+        }
+      }catch(e){
+        autoState.status_endpoint_errors++;
+        autoState.import_error='Status API временно не отвечает: '+safeText(e);
+      }
+    }
+
+    const verify=await verifyLastImportNow();
+    if(importSucceeded(terminal) || catalogProvesImport(verify)){
+      autoState.import_background=false;
+      autoState.import_terminal_confirmed=importSucceeded(terminal);
+      autoState.import_status=importSucceeded(terminal) ? terminal : 'VERIFIED_BY_CATALOG';
+      autoState.import_error=null;
+      await auditManagedGroups();
+      autoState.phase=importSucceeded(terminal)
+        ? '✅ Готово. Prom подтвердил импорт'
+        : '✅ Готово. Импорт подтверждён по фактическим группам каталога';
+      autoState.progress=100;
+      autoState.finished_at=new Date().toISOString();
+      autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
+      return;
+    }
+
+    autoState.phase=`⏳ Prom ещё обрабатывает импорт. Подтверждено групп ${verify.managed||0}/${verify.total||totalItems||0}`;
+    autoState.progress=95;
+    autoImportWatchTimer=setTimeout(tick,AUTO_STATUS_VERIFY_SEC*1000);
+  };
+
+  autoImportWatchTimer=setTimeout(tick,AUTO_STATUS_VERIFY_SEC*1000);
+}
+
+async function waitAutoImport(id,totalItems=0,timeoutMs=AUTO_IMPORT_STATUS_MAX_MIN*60*1000){
   const t0=Date.now();
   let last=null;
-  let statusErrors=0;
+  let nextVerifyAt=0;
 
   autoState.import_poll_count=0;
   autoState.import_elapsed_sec=0;
   autoState.import_last_status_payload=null;
   autoState.status_endpoint_errors=0;
+  autoState.import_background=true;
+  autoState.import_terminal_confirmed=false;
 
-  while((Date.now()-t0) < AUTO_STATUS_POLL_MAX_SEC*1000){
+  while((Date.now()-t0) < timeoutMs){
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
 
-    await interruptibleSleep(7000);
-    autoState.import_poll_count++;
+    await interruptibleSleep(AUTO_STATUS_POLL_SEC*1000);
     autoState.import_elapsed_sec=Math.round((Date.now()-t0)/1000);
+    let status='';
 
-    try{
-      const r=await promRequest('GET','/products/import/status/'+encodeURIComponent(id));
-      last=r.data||{};
-      autoState.import_last_status_payload=last;
+    if(id){
+      try{
+        autoState.import_poll_count++;
+        const r=await pollAutoImportStatusOnce(id,totalItems);
+        last=r.data;
+        status=r.status;
+        autoState.import_error=null;
 
-      const st=findImportStatusDeep(last) || 'PROCESSING';
-      const c=importCountersDeep(last);
-      autoState.import_status=st;
+        if(importSucceeded(status)){
+          autoState.import_background=false;
+          autoState.import_terminal_confirmed=true;
+          const verified=await verifyLastImportNow();
+          return {ok:true,status,data:last,counters:r.counters,pending:false,verified};
+        }
+        if(importFailed(status)){
+          autoState.import_background=false;
+          autoState.import_terminal_confirmed=true;
+          return {ok:false,status,data:last,counters:r.counters,pending:false};
+        }
+      }catch(e){
+        autoState.status_endpoint_errors++;
+        autoState.import_error='Статус Prom временно не читается: '+safeText(e);
+        autoState.phase=`4/5 Импорт принят Prom. Status API временно не отвечает (${autoState.status_endpoint_errors} ошибок), продолжаю ждать`;
+      }
+    }else{
+      autoState.import_status='ACCEPTED_NO_ID';
+      autoState.phase='4/5 Prom принял импорт без ID. Проверяю результат по каталогу';
+    }
 
-      const mm=Math.floor(autoState.import_elapsed_sec/60);
-      const ss=String(autoState.import_elapsed_sec%60).padStart(2,'0');
-      const processed=Number.isFinite(c.processed) ? c.processed : null;
-      const total=Number.isFinite(c.total) ? c.total : (totalItems||null);
-      const countText=(processed!==null && total!==null) ? ` · Prom: ${processed}/${total}` : '';
-
-      autoState.phase=`4/5 Prom обрабатывает импорт · ${st}${countText} · ${mm}:${ss}`;
-      autoState.progress=88;
-
-      if(/SUCCESS|DONE|FINISH|FINISHED|COMPLETE|COMPLETED/.test(st)){
+    if(Date.now()>=nextVerifyAt){
+      const verify=await verifyLastImportNow();
+      nextVerifyAt=Date.now()+AUTO_STATUS_VERIFY_SEC*1000;
+      if(catalogProvesImport(verify)){
         autoState.import_background=false;
-        return {ok:true,status:st,data:last,counters:c,pending:false};
+        autoState.import_status='VERIFIED_BY_CATALOG';
+        autoState.import_error=null;
+        return {ok:true,status:'VERIFIED_BY_CATALOG',data:last,pending:false,verified:verify};
       }
-      if(/ERROR|FAIL|FAILED|CANCEL|CANCELED|CANCELLED/.test(st)){
-        return {ok:false,status:st,data:last,counters:c,pending:false};
-      }
-    }catch(e){
-      statusErrors++;
-      autoState.status_endpoint_errors=statusErrors;
-      autoState.import_error='Статус Prom сейчас не читается: '+safeText(e);
-      autoState.phase=`4/5 Импорт уже принят Prom. Ошибка чтения статуса ${statusErrors}/${AUTO_STATUS_ERROR_LIMIT}`;
 
-      if(statusErrors>=AUTO_STATUS_ERROR_LIMIT) break;
+      autoState.phase=`4/5 Жду Prom · подтверждено групп ${verify.managed||0}/${verify.total||totalItems||0} · ${autoState.import_elapsed_sec} сек`;
+      autoState.progress=90;
     }
   }
 
-  // Do not hang for an hour. The import remains accepted and keeps running on Prom.
-  autoState.import_background=true;
-  autoState.import_status='ACCEPTED_BACKGROUND';
-  autoState.phase='4/5 Импорт принят Prom и выполняется в фоне. Проверяю реальные группы';
-  autoState.progress=92;
-
-  await interruptibleSleep(15000);
-  const verify=await verifyManagedGroupsNow();
-
-  if(verify.ok && verify.managed>0){
-    autoState.phase=`4/5 Уже видно товаров в новых группах: ${verify.managed}/${verify.total}. Prom может продолжать обработку в фоне`;
-  }else{
-    autoState.phase='4/5 Импорт принят. Status API не читается, поэтому автомат не зависает и продолжает работу';
+  const verify=await verifyLastImportNow();
+  if(catalogProvesImport(verify)){
+    autoState.import_background=false;
+    autoState.import_status='VERIFIED_BY_CATALOG';
+    autoState.import_error=null;
+    return {ok:true,status:'VERIFIED_BY_CATALOG',data:last,pending:false,verified:verify};
   }
 
-  return {
-    ok:true,
-    status:'ACCEPTED_BACKGROUND',
-    data:last,
-    pending:true,
-    verified:verify
-  };
+  autoState.import_background=true;
+  autoState.import_status='ACCEPTED_BACKGROUND';
+  autoState.phase=`⏳ Prom продолжает импорт в фоне. Подтверждено групп ${verify.managed||0}/${verify.total||totalItems||0}. Новый импорт заблокирован`;
+  autoState.progress=95;
+  autoState.import_error=`За ${AUTO_IMPORT_STATUS_MAX_MIN} мин окончание не подтверждено. Фоновая проверка продолжится автоматически.`;
+  autoImportWatchStartedAt=Date.now();
+  scheduleBackgroundImportWatcher(id,totalItems);
+
+  return {ok:true,status:'ACCEPTED_BACKGROUND',data:last,pending:true,verified:verify};
 }
 
 
@@ -2984,10 +3165,18 @@ async function autoImportCharacteristics(){
   autoState.group_assignments_planned=items.length;
   autoState.attributes_planned=items.filter(x=>x.attrs.length).length;
   autoState.current_total=items.length;
+  autoState.import_baseline_groups=items.filter(x=>String(autoGroupId(x.p)||'')===String(x.managedGroup?.id||FALLBACK_GROUP.id)).length;
+  lastAutoImportPlan=items.map(x=>({
+    id:String(x.p.id),
+    external_id:autoExternalId(x.p),
+    group_id:String(x.managedGroup?.id||FALLBACK_GROUP.id),
+    attrs:(x.attrs||[]).map(([k,v])=>[String(k),String(v)])
+  }));
 
   if(!items.length){
+    lastAutoImportPlan=[];
     autoState.import_status='SKIPPED: нет товаров для импорта';
-    return;
+    return {pending:false,skipped:true};
   }
 
   // Important: one Prom import task, not 14 separate imports of 120 products.
@@ -3012,6 +3201,14 @@ async function autoImportCharacteristics(){
     `весь каталог: ${items.length} товаров`
   );
 
+  if(r.previous_active){
+    autoState.import_id=null;
+    autoState.import_status='PREVIOUS_IMPORT_ACTIVE';
+    autoState.current=items.length;
+    autoState.progress=95;
+    return {ok:true,status:'PREVIOUS_IMPORT_ACTIVE',pending:true,previous_active:true};
+  }
+
   const importId=autoImportId(r.data);
   autoState.import_id=importId||null;
   autoState.import_status='ACCEPTED';
@@ -3029,19 +3226,17 @@ async function autoImportCharacteristics(){
   autoState.current=items.length;
   if(st.pending){
     autoState.groups_imported=autoState.managed_groups_verified||0;
-    autoState.attributes_imported=0;
-    autoState.import_error=null;
     autoState.progress=95;
   }else{
-    autoState.groups_imported=items.length;
-    autoState.attributes_imported=autoState.attributes_planned;
     autoState.import_error=null;
     autoState.progress=96;
   }
+  return st;
 }
 
 async function runAutoAll(reason='manual'){
   if(autoState.running) return;
+  if(autoState.import_background) throw new Error('Предыдущий импорт Prom ещё не подтверждён. Новый импорт не запускается.');
   if(!WRITE_ENABLED) throw new Error('WRITE_ENABLED=false');
   if(!PROM_TOKEN) throw new Error('PROM_TOKEN не задан');
 
@@ -3052,8 +3247,10 @@ async function runAutoAll(reason='manual'){
     finished_at:null,
     phase:'Запуск',
     progress:1,
+    keywords_checked:0,
     keywords_planned:0,
     keywords_changed:0,
+    descriptions_checked:0,
     descriptions_planned:0,
     descriptions_changed:0,
     attributes_planned:0,
@@ -3080,12 +3277,17 @@ async function runAutoAll(reason='manual'){
     feed_progress:{},
     feed_download_source:{},
     import_background:false,
+    import_terminal_confirmed:false,
+    import_baseline_groups:0,
     managed_groups_verified:0,
     managed_groups_total:0,
+    attributes_verified:0,
+    attributes_verifiable:0,
     status_endpoint_errors:0
   });
 
   try{
+    autoImportWatchStartedAt=0;
     // FAST: only one catalog-list pass here. No 1641 translation requests in phase 1.
     autoState.phase='1/5 Загружаю каталог Prom';
     autoState.progress=5;
@@ -3122,19 +3324,31 @@ async function runAutoAll(reason='manual'){
 
     autoState.phase='4/5 Группы + характеристики';
     autoState.progress=78;
-    await autoImportCharacteristics();
+    const importResult=await autoImportCharacteristics();
+
+    if(importResult?.pending){
+      autoState.current=0;
+      autoState.current_total=0;
+      return;
+    }
 
     if(autoState.stop_requested) throw new Error('Остановлено пользователем');
     await auditManagedGroups();
 
-    autoState.phase='✅ Готово';
+    autoState.phase='✅ Готово. Результат импорта подтверждён';
     autoState.progress=100;
     autoState.current=0;
     autoState.current_total=0;
   }catch(e){
     const msg=safeText(e);
     if(msg==='Остановлено пользователем'){
-      autoState.phase='Остановлено';
+      if(autoState.import_background){
+        autoState.phase='⏹ Основной процесс остановлен. Импорт Prom мог продолжиться, поэтому слежу за ним в фоне';
+        autoImportWatchStartedAt=Date.now();
+        scheduleBackgroundImportWatcher(autoState.import_id,autoState.group_assignments_planned||0);
+      }else{
+        autoState.phase='Остановлено';
+      }
     }else{
       autoState.phase='Ошибка';
       autoState.errors.unshift({where:'AUTO',error:msg});
@@ -3148,7 +3362,7 @@ async function runAutoAll(reason='manual'){
 }
 
 function renderAutoHome(){
-  const refresh=(autoState.running||stockState.running)?'<meta http-equiv="refresh" content="4">':'';
+  const refresh=(autoState.running||autoState.import_background||stockState.running)?'<meta http-equiv="refresh" content="4">':'';
   const fmt=v=>{try{return v?new Date(v).toLocaleString('ru-RU',{timeZone:'Europe/Kyiv'}):'—'}catch{return v||'—'}};
   const latestErr=autoState.errors?.[0]||null;
   const unmatched=Number(supplierState.unmatched_products||0);
@@ -3156,11 +3370,11 @@ function renderAutoHome(){
   const bezetSrc=supplierState.sources?.bezet||null;
   const militarisSrc=supplierState.sources?.militaris||null;
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v3.4.3 DIAG ONE</title><style>
+<title>PrimeTac AUTO v3.4.4 FINAL WAIT</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.3 DIAG ONE</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED проверка статуса длится недолго: если endpoint Prom не отвечает, автомат больше не висит часами. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, программа сама ждёт освобождения и повторяет попытку. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
-<div class="c"><form method="get" action="/auto/run"><button class="btn" ${autoState.running?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
-<div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">из ${autoState.keywords_planned||0}</div></div><div class="s"><div class="m">Описания</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">проверено ${autoState.descriptions_planned||0}</div></div><div class="s"><div class="m">Характеристики</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.4 FINAL WAIT</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED автомат ждёт подтверждение до ${AUTO_IMPORT_STATUS_MAX_MIN} минут, а временные ошибки status API больше не считаются завершением. Если Prom отвечает нестабильно, результат дополнительно проверяется по фактическим группам каталога. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, защита не отправляет второй импорт: автомат проверяет результат уже запущенной задачи. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
+<div class="c"><form method="get" action="/auto/run"><button class="btn" ${(autoState.running||autoState.import_background)?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':(autoState.import_background?'⏳ ЖДЁМ ПОДТВЕРЖДЕНИЕ PROM...':'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ')}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div><div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
+<div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи изменено</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">нужно ${autoState.keywords_planned||0} · проверено ${autoState.keywords_checked||0}</div></div><div class="s"><div class="m">Описания изменено</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">нужно ${autoState.descriptions_planned||0} · проверено ${autoState.descriptions_checked||0}</div></div><div class="s"><div class="m">Характеристики подтверждено</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}${autoState.attributes_verifiable?` · API читает ${autoState.attributes_verifiable}`:(autoState.import_terminal_confirmed?' · Prom завершил импорт, но list API не отдаёт их для сверки':'')}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
 <div class="c"><b>📦 Контроль склада</b>
 <div class="m" style="margin-top:7px">Автопроверка: каждые ${STOCK_INTERVAL_HOURS} ч. · запись в Prom: <b class="${STOCK_WRITE_ENABLED?'ok':'warn'}">${STOCK_WRITE_ENABLED?'ВКЛ':'ВЫКЛ (предпросмотр)'}</b></div>
 <div class="grid" style="margin-top:10px">
@@ -3197,7 +3411,7 @@ ${stockDiag.response?`<span class="m">Ответ Prom: ${autoEscHtml(JSON.string
 </div>
 <div class="c"><b>Группы PrimeTac</b>
 <div class="m" style="margin-top:7px">Фиксированная структура: ${MANAGED_GROUPS.length} групп и подгрупп.</div>
-<div class="m">Запланировано распределить: ${autoState.group_assignments_planned||0}; Prom подтвердил импорт для: ${autoState.groups_imported||0}.</div>
+<div class="m">Запланировано распределить: ${autoState.group_assignments_planned||0}; до импорта уже совпадало: ${autoState.import_baseline_groups||0}; сейчас подтверждено: ${autoState.groups_imported||0}.</div>
 <div class="m">Лишних старых групп: <span class="${autoState.legacy_groups?'warn':''}">${autoState.legacy_groups||0}</span>; пустых кандидатов на удаление: <span class="${autoState.empty_legacy_groups?'warn':''}">${autoState.empty_legacy_groups||0}</span>.</div>
 <div class="m">Для обложек автоматически выбраны фото-кандидаты: ${Object.keys(autoState.cover_candidates||{}).length}.</div>
 <div class="m" style="margin-top:6px">Prom Public API не публикует DELETE для групп и загрузку фото группы. Поэтому автомат переносит товары и больше не использует старые группы; физически удалить уже пустые старые группы и один раз поставить обложки нужно в кабинете Prom.</div>
@@ -3205,11 +3419,11 @@ ${stockDiag.response?`<span class="m">Ответ Prom: ${autoEscHtml(JSON.string
 </div>
 <div class="c"><b>Импорт групп + характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>
 <div class="m">Опросов статуса Prom: ${autoState.import_poll_count||0}; ожидание: ${autoState.import_elapsed_sec||0} сек.</div>
-<div class="m">Фактически видно в управляемых группах: ${autoState.managed_groups_verified||0}/${autoState.managed_groups_total||total||0}. ${autoState.import_background?'Prom продолжает импорт в фоне.':''}</div>
-<div class="m">Ошибок status endpoint: ${autoState.status_endpoint_errors||0}. После ${AUTO_STATUS_ERROR_LIMIT} ошибок автомат перестаёт ждать его.</div>
+<div class="m">Фактически совпадает с планом групп: ${autoState.managed_groups_verified||0}/${autoState.managed_groups_total||total||0}. ${autoState.import_background?'Prom продолжает импорт в фоне; новый импорт заблокирован.':''}</div>
+<div class="m">Ошибок status endpoint: ${autoState.status_endpoint_errors||0}. Эти ошибки больше не завершают процесс: автомат продолжает ждать и сверяет каталог отдельно.</div>
 <div class="m">Здесь больше не будет «120/1606»: весь каталог отправляется одной задачей, а экран показывает реальный статус Prom.</div>${autoState.import_error?`<div class="bad m">${autoEscHtml(safeText(autoState.import_error))}</div>`:''}</div>
 ${latestErr?`<div class="c"><b class="bad">Последняя ошибка</b><div class="m">${autoEscHtml(safeText(latestErr?.error)||'')}</div></div>`:''}
-<div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy первый запуск начинается сам, если <code>AUTO_ON_START</code> не выключен.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/verify">Проверить результат Prom</a> · <a href="/auto/last-import.xml">Последний XML групп/характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
+<div class="c"><div class="m"><b>Автоматически:</b> каждые ${AUTO_INTERVAL_HOURS} ч. После Render Deploy новый импорт по умолчанию НЕ стартует, чтобы случайно не продублировать уже работающий импорт Prom. <code>AUTO_ON_START=true</code> включает старое поведение.</div><div class="m" style="margin-top:7px"><a href="/auto/state">Отчёт JSON</a> · <a href="/auto/verify">Проверить результат Prom</a> · <a href="/auto/last-import.xml">Последний XML групп/характеристик</a> · <a href="/legacy">Старая техническая панель</a></div></div>
 </div></body></html>`;
 }
 
@@ -3219,14 +3433,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v3.4.3 DIAG ONE</title>
+<title>PrimeTac AUTO v3.4.4 FINAL WAIT</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.3 DIAG ONE</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.4 FINAL WAIT</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -4046,6 +4260,10 @@ app.get('/', (_req,res) => {
 app.get('/legacy', (_req,res) => { res.type('html').send(renderServerHtml()); });
 
 function startAutoRoute(_req,res){
+  if(autoState.import_background){
+    autoState.phase='⏳ Предыдущий импорт Prom ещё не подтверждён. Новый импорт не запускается';
+    return res.redirect(303,'/');
+  }
   if(!autoState.running){
     setTimeout(()=>runAutoAll('manual').catch(e=>{
       autoState.errors.unshift({where:'run',error:safeText(e)});
@@ -4155,8 +4373,43 @@ app.get('/groups/covers', (_req,res)=>{
 app.get('/auto/last-import.xml', (_req,res) => res.type('application/xml').send(lastAutoImportXml||'<?xml version="1.0"?><empty/>'));
 app.get('/auto/verify', async (_req,res)=>{
   try{
-    await verifyManagedGroupsNow();
-    await auditManagedGroups();
+    let terminal='';
+    if(autoState.import_background && autoState.import_id){
+      try{
+        autoState.import_poll_count++;
+        const r=await pollAutoImportStatusOnce(autoState.import_id,autoState.group_assignments_planned||0);
+        terminal=r.status;
+        if(importFailed(terminal)){
+          autoState.import_background=false;
+          autoState.import_terminal_confirmed=true;
+          autoState.import_error='Prom завершил импорт со статусом '+terminal;
+          autoState.phase='Ошибка импорта Prom: '+terminal;
+          autoState.progress=100;
+          return res.redirect('/');
+        }
+      }catch(e){
+        autoState.status_endpoint_errors++;
+        autoState.import_error='Status API временно не отвечает: '+safeText(e);
+      }
+    }
+
+    const verify=await verifyLastImportNow();
+    if(autoState.import_background && (importSucceeded(terminal) || catalogProvesImport(verify))){
+      autoState.import_background=false;
+      autoState.import_terminal_confirmed=importSucceeded(terminal);
+      autoState.import_status=importSucceeded(terminal) ? terminal : 'VERIFIED_BY_CATALOG';
+      autoState.import_error=null;
+      if(autoImportWatchTimer){ clearTimeout(autoImportWatchTimer); autoImportWatchTimer=null; }
+      await auditManagedGroups();
+      autoState.phase=importSucceeded(terminal)
+        ? '✅ Готово. Prom подтвердил импорт'
+        : '✅ Готово. Импорт подтверждён по фактическим группам каталога';
+      autoState.progress=100;
+    }else if(autoState.import_background){
+      autoState.phase=`⏳ Импорт ещё не подтверждён. Группы ${verify.managed||0}/${verify.total||0}`;
+    }else{
+      await auditManagedGroups();
+    }
   }catch(e){
     autoState.errors.unshift({where:'manual-verify',error:safeText(e)});
   }
@@ -4167,7 +4420,7 @@ app.get('/auto/verify', async (_req,res)=>{
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v3.4.3 DIAG ONE',
+    app: 'PrimeTac AUTO v3.4.4 FINAL WAIT',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED,
     stock_monitor_enabled: STOCK_MONITOR_ENABLED,
@@ -4247,7 +4500,7 @@ let stockRetryTimer=null;
 function startStockWhenFree(reason='schedule'){
   if(!STOCK_MONITOR_ENABLED || !PROM_TOKEN || stockState.running) return;
 
-  if(autoState.running || supplierState.loading){
+  if(autoState.running || autoState.import_background || supplierState.loading){
     stockState.phase='Контроль склада ждёт завершения основного процесса';
     stockState.next_run_at=new Date(Date.now()+15*60*1000).toISOString();
 
@@ -4267,7 +4520,7 @@ function startStockWhenFree(reason='schedule'){
 }
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v3.4.3 DIAG ONE started on ${PORT}`);
+  console.log(`PrimeTac AUTO v3.4.4 FINAL WAIT started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   stockState.next_run_at=new Date(Date.now()+STOCK_INTERVAL_HOURS*3600*1000).toISOString();
 
@@ -4280,10 +4533,12 @@ app.listen(PORT, () => {
   }
 });
 setInterval(()=>{
-  if(!autoState.running && PROM_TOKEN && WRITE_ENABLED){
+  const dueAt=autoState.next_run_at ? Date.parse(autoState.next_run_at) : 0;
+  const due=!Number.isFinite(dueAt) || dueAt===0 || Date.now()>=dueAt;
+  if(due && !autoState.running && !autoState.import_background && PROM_TOKEN && WRITE_ENABLED){
     runAutoAll('schedule').catch(e=>{autoState.errors.unshift({where:'schedule',error:safeText(e)});autoState.running=false;});
   }
-}, AUTO_INTERVAL_HOURS*3600*1000);
+}, 60*1000);
 
 setInterval(()=>{
   startStockWhenFree('schedule');

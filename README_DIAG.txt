@@ -1,4 +1,4 @@
-PrimeTac AUTO v3.4.3 DIAG ONE
+PrimeTac AUTO v3.4.4 FINAL WAIT
 
 Цель: не делать массовую запись. Тестируется РОВНО 1 товар.
 
