@@ -3165,7 +3165,7 @@ function scheduleBackgroundImportWatcher(id,totalItems=0){
       autoState.import_background=false;
       autoState.import_terminal_confirmed=true;
       autoState.import_status='SUCCESS_NO_EFFECT';
-      autoState.import_error='Prom завершил задачу со статусом SUCCESS, но сообщил 0 созданных и 0 обновлённых товаров, а группы каталога не изменились. Блокировка снята. v3.4.7 проверяет результат по реальным группам Prom, а не по служебным YML categoryId.';
+      autoState.import_error='Prom завершил задачу со статусом SUCCESS, но сообщил 0 созданных и 0 обновлённых товаров, а группы каталога не изменились. Блокировка снята. v3.4.8 проверяет реальные группы Prom по всем страницам /groups/list, а не только первые 100, и не путает внутренний ID Prom со служебным YML categoryId.';
       autoState.phase='⚠️ Prom завершил импорт без изменений. Следующий запуск будет принудительным (только группы + характеристики)';
       autoState.progress=100;
       autoState.finished_at=new Date().toISOString();
@@ -3230,7 +3230,7 @@ async function waitAutoImport(id,totalItems=0,timeoutMs=AUTO_IMPORT_STATUS_MAX_M
           if(statusReportsNoEffect(r.counters) && !catalogProvesImport(verified)){
             autoState.import_background=false;
             autoState.import_status='SUCCESS_NO_EFFECT';
-            autoState.import_error='Prom завершил задачу SUCCESS, но сообщил 0 созданных и 0 обновлённых товаров; фактические группы также не изменились. Повторный запуск разрешён. v3.4.7 дополнительно проверяет реальные группы Prom по названию, потому что YML categoryId не равен внутреннему ID группы Prom.';
+            autoState.import_error='Prom завершил задачу SUCCESS, но сообщил 0 созданных и 0 обновлённых товаров; фактические группы также не изменились. Повторный запуск разрешён. v3.4.8 дополнительно читает все страницы /groups/list и проверяет реальные группы Prom по названию, потому что YML categoryId не равен внутреннему ID группы Prom.';
             autoState.phase='⚠️ Prom завершил импорт без изменений';
             clearImportLock('success-no-effect');
             return {ok:false,status:'SUCCESS_NO_EFFECT',data:last,counters:r.counters,pending:false,verified};
@@ -3320,8 +3320,48 @@ function flattenPromGroups(input,out=[]){
   return out;
 }
 async function getPromGroups(){
-  const res=await promRequest('GET','/groups/list?limit=100');
-  return flattenPromGroups(res.data||{});
+  // /groups/list is paginated. v3.4.7 read only the first 100 groups, which can
+  // make an existing PrimeTac tree look like 1/46 simply because most nodes are
+  // on later pages. Read every page before verifying or auditing the structure.
+  const all=[];
+  const seen=new Set();
+  let lastId=null;
+  let pages=0;
+  let guard=0;
+
+  while(guard++<100){
+    const url=`/groups/list?limit=100${lastId ? `&last_id=${encodeURIComponent(lastId)}` : ''}`;
+    const res=await promRequest('GET',url);
+    const data=res.data||{};
+    pages++;
+
+    const topBatch=Array.isArray(data?.groups)
+      ? data.groups
+      : (Array.isArray(data?.items) ? data.items : (Array.isArray(data) ? data : []));
+    const flat=flattenPromGroups(topBatch.length ? topBatch : data,[]);
+
+    let added=0;
+    for(const g of flat){
+      const id=String(g?.id||'');
+      if(!id || seen.has(id)) continue;
+      seen.add(id);
+      all.push(g);
+      added++;
+    }
+
+    const explicitNext = data?.last_id ?? data?.lastId ?? data?.next_last_id ?? data?.pagination?.last_id ?? data?.pagination?.lastId;
+    const fallbackNext = topBatch.length>=100 ? topBatch[topBatch.length-1]?.id : null;
+    const next = explicitNext ?? fallbackNext;
+
+    if(!next || String(next)===String(lastId) || !added) break;
+    lastId=String(next);
+
+    if(topBatch.length && topBatch.length<100 && explicitNext==null) break;
+  }
+
+  autoState.groups_pages_audited=pages;
+  autoState.groups_audited=all.length;
+  return all;
 }
 function promGroupMaps(groups=[]){
   const byId=new Map();
@@ -3688,9 +3728,9 @@ function renderAutoHome(){
   const statusErrText=autoState.status_last_error ? JSON.stringify(autoState.status_last_error).slice(0,900) : '';
   const stateStoreLabel=AUTO_STATE_PATH.startsWith('/var/data/')?'persistent disk /var/data':'локальный файл (для полной сохранности между Deploy задайте AUTO_STATE_PATH на Render Persistent Disk)';
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v3.4.7 GROUP VERIFY</title><style>
+<title>PrimeTac AUTO v3.4.8 GROUPS ALL PAGES</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.7 GROUP VERIFY</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED автомат ждёт подтверждение до ${AUTO_IMPORT_STATUS_MAX_MIN} минут, а временные ошибки status API больше не считаются завершением. Если Prom отвечает нестабильно, результат дополнительно проверяется по фактическим группам каталога. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, защита не отправляет второй импорт: автомат проверяет результат уже запущенной задачи. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.8 GROUPS ALL PAGES</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED автомат ждёт подтверждение до ${AUTO_IMPORT_STATUS_MAX_MIN} минут, а временные ошибки status API больше не считаются завершением. Если Prom отвечает нестабильно, результат дополнительно проверяется по фактическим группам каталога. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, защита не отправляет второй импорт: автомат проверяет результат уже запущенной задачи. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${(autoState.running||autoState.import_background||bootGuardActive)?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':(autoState.import_background?'⏳ ЖДЁМ ПОДТВЕРЖДЕНИЕ PROM...':(bootGuardActive?`🛡️ ЗАЩИТА ПОСЛЕ РЕСТАРТА · ${bootGuardLeftMin} МИН`:'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'))}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div>${bootGuardActive?`<div class="m warn" style="margin-top:6px">Новый импорт временно заблокирован после рестарта, даже если старый lock-файл отсутствует. Осталось примерно ${bootGuardLeftMin} мин.</div>`:''}<div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи изменено</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">нужно ${autoState.keywords_planned||0} · проверено ${autoState.keywords_checked||0}</div></div><div class="s"><div class="m">Описания изменено</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">нужно ${autoState.descriptions_planned||0} · проверено ${autoState.descriptions_checked||0}</div></div><div class="s"><div class="m">Характеристики подтверждено</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}${autoState.attributes_verifiable?` · API читает ${autoState.attributes_verifiable}`:(autoState.import_terminal_confirmed?' · Prom завершил импорт, но list API не отдаёт их для сверки':'')}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
 <div class="c"><b>📦 Контроль склада</b>
@@ -3738,6 +3778,7 @@ ${stockDiag.response?`<span class="m">Ответ Prom: ${autoEscHtml(JSON.string
 <div class="c"><b>Импорт групп + характеристик</b><div class="m">ID: ${autoEscHtml(autoState.import_id||'—')} · статус: ${autoEscHtml(autoState.import_status||'—')}</div><div class="m">Принят Prom: ${fmt(autoState.import_accepted_at)} · fingerprint: ${autoEscHtml(autoState.import_fingerprint||'—')}</div><div class="m">Пропущено без external_id: ${autoState.skipped_no_external_id||0}; без ID группы: ${autoState.skipped_no_group_id||0}.</div>
 <div class="m">Опросов статуса Prom: ${autoState.import_poll_count||0}; ожидание: ${autoState.import_elapsed_sec||0} сек.</div>
 <div class="m">Фактически совпадает с планом групп: ${autoState.managed_groups_verified||0}/${autoState.managed_groups_total||total||0}. Узлов PrimeTac найдено в Prom: ${autoState.managed_group_nodes_found||0}/${MANAGED_GROUPS.length}. ${autoState.import_background?'Prom продолжает импорт в фоне; новый импорт заблокирован.':''}</div>
+<div class="m">Групп Prom прочитано: ${autoState.groups_audited||0}; страниц /groups/list: ${autoState.groups_pages_audited||0}. Проверка v3.4.8 проходит по всем страницам, а не только по первым 100 группам.</div>
 <div class="m">🔒 Persistent lock: <b class="${autoState.persistent_lock?'ok':'warn'}">${autoState.persistent_lock?'ВКЛ':'нет'}</b> · ${autoEscHtml(stateStoreLabel)} · ${autoEscHtml(AUTO_STATE_PATH)}</div>
 <div class="m">После рестарта восстановлено: ${autoState.restored_after_restart?'✅ да':'нет'}${autoState.restored_after_restart?` · возраст lock ${autoState.restored_lock_age_sec||0} сек`:''}.</div>
 <div class="m">Ошибок status endpoint: ${autoState.status_endpoint_errors||0}. Последний HTTP: ${autoState.status_last_http??'—'} · путь: ${autoEscHtml(autoState.status_last_path||'—')}</div>
@@ -3756,14 +3797,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v3.4.7 GROUP VERIFY</title>
+<title>PrimeTac AUTO v3.4.8 GROUPS ALL PAGES</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.7 GROUP VERIFY</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.8 GROUPS ALL PAGES</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -4772,7 +4813,7 @@ app.get('/auto/unlock', (req,res)=>{
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v3.4.7 GROUP VERIFY',
+    app: 'PrimeTac AUTO v3.4.8 GROUPS ALL PAGES',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED,
     stock_monitor_enabled: STOCK_MONITOR_ENABLED,
@@ -4874,7 +4915,7 @@ function startStockWhenFree(reason='schedule'){
 restoredImportLock=restoreImportLock();
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v3.4.7 GROUP VERIFY started on ${PORT}`);
+  console.log(`PrimeTac AUTO v3.4.8 GROUPS ALL PAGES started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   stockState.next_run_at=new Date(Date.now()+STOCK_INTERVAL_HOURS*3600*1000).toISOString();
 
