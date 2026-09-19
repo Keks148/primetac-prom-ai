@@ -1,0 +1,5 @@
+v3.4.7 GROUP VERIFY
+- Correct group verification by resolving real Prom group IDs/names from /groups/list.
+- Persist group_name in import plan/fingerprint.
+- Show managed Prom group nodes count.
+- SUCCESS_NO_EFFECT no longer becomes generic AUTO error.
