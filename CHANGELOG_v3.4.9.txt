@@ -1,0 +1,20 @@
+PrimeTac AUTO v3.4.9 VALID YML + EXPECTED GROUPS
+
+1. YML offers now always contain <description>.
+   Prom's YML format marks description as required. Earlier builds omitted it because
+   updated_fields did not include description; this could result in an accepted import
+   that processed zero offers.
+
+2. The import still writes ONLY group + attributes.
+   updated_fields remains ["group", "attributes"]. Price, photos and descriptions are
+   not selected for update.
+
+3. Group verification now distinguishes:
+   - all 46 configured PrimeTac nodes;
+   - only nodes actually required by the current product distribution, including parents.
+
+4. This matters because Prom does not import empty groups/subgroups. A 46/46 check is not
+   a valid success criterion when some configured groups have no products.
+
+5. /groups/list pagination from v3.4.8 remains enabled.
+6. Persistent import lock /var/data support remains enabled.
