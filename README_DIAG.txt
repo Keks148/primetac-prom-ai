@@ -1,4 +1,4 @@
-PrimeTac AUTO v3.4.4 FINAL WAIT
+PrimeTac AUTO v3.4.5 PERSIST LOCK
 
 Цель: не делать массовую запись. Тестируется РОВНО 1 товар.
 
