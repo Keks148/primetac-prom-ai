@@ -1,0 +1,7 @@
+v3.4.15 VARIANT FAMILY PROBE
+- one-family variant recovery probe
+- supplier YML group_id used as variation group_id
+- preview before write
+- only_update + current name only in updated_fields
+- async status polling and Public API verification
+- no mass variant write

@@ -1,6 +1,6 @@
 {
-  "name": "primetac-auto-v3-4-5-persist-lock",
-  "version": "3.4.13",
+  "name": "primetac-auto-v3-4-15-variant-family-probe",
+  "version": "3.4.15",
   "private": true,
   "main": "server.js",
   "scripts": {
