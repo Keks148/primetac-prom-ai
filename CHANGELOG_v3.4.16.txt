@@ -1,0 +1,6 @@
+v3.4.16 ADAPTIVE VARIANT PROBE
+- Probe selector accepts exact supplier group_id families scattered across current Prom groups.
+- Resolves an existing real PrimeTac target Prom group from the managed group map.
+- If needed, updates only group + name for the selected small test family; otherwise name only.
+- Adds selection_diagnostics to probe state.
+- Still no bulk variant restore.
