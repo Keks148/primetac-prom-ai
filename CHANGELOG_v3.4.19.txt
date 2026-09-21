@@ -1,0 +1,7 @@
+v3.4.19 PROBE START FIX
+
+- Fixes a race in POST /variants/probe/run.
+- The probe worker now starts immediately before the 303 redirect.
+- running/status become visible before /variants/probe/status renders, so the status page receives its auto-refresh and no longer gets stuck on “family not selected / linked 0” just because setImmediate had not fired yet.
+- Keeps v3.4.18 self-healing audit rebuild and all safety limits.
+- Still restores only ONE test family; no bulk variant write.
