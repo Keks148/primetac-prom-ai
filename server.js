@@ -1723,36 +1723,67 @@ function buildSupplierIndex(records){
   return {sku,name,token,tokensByRecord};
 }
 
-function promSkuCandidates(p){
+function promStrongSkuCandidates(p){
   const vals=[];
-  for(const k of ['sku','article','vendor_code','vendorCode','code','external_id','externalId','presence_sku']){
+  // These are real product/article fields. Unlike external_id they are much less likely
+  // to collide with a supplier's internal offer id from another feed.
+  for(const k of ['sku','article','vendor_code','vendorCode','code','presence_sku']){
     if(p && p[k]!==undefined && p[k]!==null) vals.push(primitive(p[k]));
   }
   return uniq(vals.map(cleanSku).filter(Boolean));
 }
+function promExternalIdCandidates(p){
+  const vals=[];
+  for(const k of ['external_id','externalId']){
+    if(p && p[k]!==undefined && p[k]!==null) vals.push(primitive(p[k]));
+  }
+  return uniq(vals.map(cleanSku).filter(Boolean));
+}
+function promSkuCandidates(p){
+  return uniq([...promStrongSkuCandidates(p),...promExternalIdCandidates(p)]);
+}
+function supplierIdentityEvidence(p,r){
+  const pn=normalizeNameForMatch(p?.name||''), rn=normalizeNameForMatch(r?.name||'');
+  const jac=jaccardName(p?.name||'',r?.name||'');
+  const ptype=findType(p?.name||''), rtype=findType(r?.name||'');
+  const typeConflict=Boolean(ptype && rtype && ptype!==rtype);
+  const pb=norm(findBrand(p?.name||'')||actualAttrValue(p,'producer')||actualAttrValue(p,'brand')||'');
+  const rb=norm(r?.brand||findBrand((r?.name||'')+' '+(r?.brand||''))||'');
+  const brandSame=Boolean(pb && rb && pb.toLowerCase()===rb.toLowerCase());
+  const brandConflict=Boolean(pb && rb && pb.toLowerCase()!==rb.toLowerCase());
+  const exactName=Boolean(pn && rn && pn===rn);
+  // If both names expose a concrete product type, a jacket can never become a LOWA sneaker
+  // just because two unrelated systems happened to use the same numeric id.
+  const titleCorroborates=!typeConflict && (exactName || jac>=0.38 || (brandSame && jac>=0.24));
+  return {pn,rn,jac,ptype,rtype,typeConflict,pb,rb,brandSame,brandConflict,exactName,titleCorroborates};
+}
 
 function supplierScore(p,r){
-  const pSkus=promSkuCandidates(p);
+  const strongSkus=promStrongSkuCandidates(p);
+  const externalIds=promExternalIdCandidates(p);
   const rSku=cleanSku(r.sku);
   const rId=cleanSku(r.id);
-  const pb=norm(findBrand(p.name)||actualAttrValue(p,'producer')||actualAttrValue(p,'brand')||'');
-  const rb=norm(r.brand||findBrand(r.name+' '+r.brand)||'');
-  const brandConflict=Boolean(pb && rb && pb.toLowerCase()!==rb.toLowerCase());
-  // Never let a coincidental numeric id/SKU override an explicit brand conflict.
-  // This was the source of false XML group_id families (e.g. Helikon/Mil-Tec matched to an unrelated BEZET offer).
-  if(!brandConflict){
-    if(rSku && pSkus.includes(rSku)) return {score:100,reason:'точный SKU/артикул'};
-    if(rId && pSkus.includes(rId)) return {score:100,reason:'точный ID поставщика'};
+  const ev=supplierIdentityEvidence(p,r);
+
+  if(!ev.brandConflict && !ev.typeConflict){
+    // A genuine SKU/article match is the strongest identity signal.
+    if(rSku && strongSkus.includes(rSku)) return {score:100,reason:'точный SKU/артикул'};
+
+    // Supplier offer IDs and Prom external_id are NOT globally unique across feeds.
+    // Accept them only when the product title/model independently corroborates the match.
+    if(rId && strongSkus.includes(rId) && ev.titleCorroborates) return {score:99,reason:'точный ID поставщика + модель'};
+    if(rSku && externalIds.includes(rSku) && ev.titleCorroborates) return {score:98,reason:'external_id = SKU + модель'};
+    if(rId && externalIds.includes(rId) && ev.titleCorroborates) return {score:98,reason:'external_id = ID поставщика + модель'};
   }
-  const pn=normalizeNameForMatch(p.name), rn=normalizeNameForMatch(r.name);
-  if(pn && rn && pn===rn && !brandConflict) return {score:96,reason:'точное название'};
-  const jac=jaccardName(p.name,r.name);
-  let score=Math.round(jac*90);
-  if(pb && rb && pb.toLowerCase()===rb.toLowerCase()) score+=5;
-  if(brandConflict) score=Math.min(score,55);
-  const pc=findColor(p.name), rc=findColor(r.name);
+
+  if(ev.exactName && !ev.brandConflict && !ev.typeConflict) return {score:96,reason:'точное название'};
+  let score=Math.round(ev.jac*90);
+  if(ev.brandSame) score+=5;
+  if(ev.brandConflict || ev.typeConflict) score=Math.min(score,55);
+  const pc=findColor(p?.name||''), rc=findColor(r?.name||'');
   if(pc && rc && pc===rc) score+=3;
-  return {score:Math.min(94,score),reason:brandConflict?'сходство названия, но бренд не совпадает':'сходство названия'};
+  const reason=ev.typeConflict?'сходство названия, но тип товара не совпадает':(ev.brandConflict?'сходство названия, но бренд не совпадает':'сходство названия');
+  return {score:Math.min(94,score),reason};
 }
 
 function bestSupplierMatch(p){
@@ -4145,11 +4176,14 @@ function strongVariantSupplierIdentity(p,m){
   const reason=String(m.reason||'').toLowerCase();
   const score=Number(m.score||0);
   if(score<96) return false;
-  if(!(reason.includes('точный sku') || reason.includes('точный id') || reason.includes('точное название'))) return false;
-  const pb=norm(findBrand(p?.name||'')||actualAttrValue(p,'producer')||actualAttrValue(p,'brand')||'');
-  const rb=norm(m.record?.brand||findBrand((m.record?.name||'')+' '+(m.record?.brand||''))||'');
-  if(pb && rb && pb.toLowerCase()!==rb.toLowerCase()) return false;
-  return true;
+  if(!(reason.includes('точный sku') || reason.includes('точный id') || reason.includes('external_id') || reason.includes('точное название'))) return false;
+  const ev=supplierIdentityEvidence(p,m.record);
+  if(ev.brandConflict || ev.typeConflict) return false;
+  // Exact SKU/article is allowed without title corroboration. Numeric supplier IDs / external_id
+  // are accepted only when the model/title independently agrees. This blocks cross-feed id collisions.
+  if(reason.includes('точный sku/артикул')) return true;
+  if(reason.includes('точное название')) return ev.exactName;
+  return ev.titleCorroborates;
 }
 function variantSupplierVariationGroupOf(p){
   const m=variantSupplierMatchOf(p);
@@ -4582,6 +4616,18 @@ function variantProbeFamilyCoherent(items,vg){
   const matches=items.map(variantSupplierMatchOf);
   if(matches.some((m,i)=>!strongVariantSupplierIdentity(items[i],m))) return {ok:false,reason:'weak_identity'};
   if(matches.some(m=>numericVariationGroupId(m?.record?.variation_group_id||'')!==String(vg))) return {ok:false,reason:'group_id_mismatch'};
+
+  // Every Prom item must also resemble ITS matched XML offer, not merely share a numeric id.
+  // This catches collisions such as Call Dragon jackets being matched to LOWA shoes.
+  for(let i=0;i<items.length;i++){
+    const ev=supplierIdentityEvidence(items[i],matches[i]?.record||{});
+    const reason=String(matches[i]?.reason||'').toLowerCase();
+    if(ev.typeConflict) return {ok:false,reason:'model_conflict',detail:'type_conflict',prom:items[i]?.name,xml:matches[i]?.record?.name};
+    if(!reason.includes('точный sku/артикул') && !ev.titleCorroborates){
+      return {ok:false,reason:'model_conflict',detail:'prom_xml_title_conflict',prom:items[i]?.name,xml:matches[i]?.record?.name};
+    }
+  }
+
   const brands=uniq(matches.map((m,i)=>norm(m?.record?.brand||findBrand(m?.record?.name||'')||findBrand(items[i]?.name||'')||'').toLowerCase()).filter(Boolean));
   if(brands.length>1) return {ok:false,reason:'brand_conflict',brands};
   const names=matches.map(m=>m?.record?.name||'').filter(Boolean);
@@ -4795,8 +4841,13 @@ function renderVariantProbeStatus(){
 async function renderVariantProbePreview(){
   const sel=await selectVariantProbeFamily();
   const f=sel.family;
-  const rows=sel.items.map((p,i)=>`<tr><td>${i+1}</td><td>${autoEscHtml(p.name||'')}</td><td>${autoEscHtml(autoExternalId(p)||'—')}</td><td>${autoEscHtml(sel.dimensions.map(d=>d.name+': '+d.values[i]).join(' · '))}</td></tr>`).join('');
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PrimeTac — preview variant probe</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#08100b;color:#eef4ef;padding:12px}a{color:#9de38d}.c{background:#141d17;border:1px solid #304238;border-radius:14px;padding:12px;margin:10px 0}.m{font-size:12px;color:#9caf9f;line-height:1.45}.warn{color:#e8c66c}button{padding:14px 18px;border:0;border-radius:12px;background:#35653a;color:#fff;font-weight:800}table{width:100%;border-collapse:collapse;font-size:12px}th,td{border-bottom:1px solid #304238;padding:8px;text-align:left}</style></head><body><h2>🧪 Подготовлен безопасный тест одной семьи</h2><p><a href="/variants/report">← К аудиту</a></p><div class="c"><b>${autoEscHtml(f.base)}</b><div class="m">Источник: точный group_id из XML поставщика · group_id ${autoEscHtml(sel.variation_group_id)} · ${f.count} позиций · экономия после объединения ${f.savings}</div><div class="m">Текущие группы Prom: ${autoEscHtml((sel.current_group_ids||[]).join(', ')||'—')}. Целевая группа: ${autoEscHtml(sel.target_group_name)} (${autoEscHtml(sel.target_group_id)}). ${sel.move_group?'Для этой тестовой семьи потребуется привести позиции к одной уже существующей группе.':'Все позиции уже находятся в одной целевой группе.'}</div></div><div class="c warn"><b>Изменение реальное, но ограничено одной семьёй.</b><div class="m">Будет отправлен YML только для этих ${f.count} существующих товаров. В настройках импорта only_update=true. Цена, наличие, остатки, фото и описания не меняются. Если позиции семьи сейчас разбросаны по группам, разрешено изменить только их группу каталога на показанную выше целевую группу. Общий YML group_id нужен для объединения в разновидности. Если Prom не покажет связь после теста, массовый режим останется заблокирован.</div></div><div class="c"><table><tr><th>#</th><th>Товар</th><th>external_id</th><th>Различие</th></tr>${rows}</table></div><form method="post" action="/variants/probe/run"><button type="submit">🚀 ЗАПУСТИТЬ ТЕСТ ЭТОЙ СЕМЬИ</button></form></body></html>`;
+  const rows=sel.items.map((p,i)=>{
+    const m=variantSupplierMatchOf(p)||{};
+    const ev=supplierIdentityEvidence(p,m.record||{});
+    const sim=Math.round((ev.jac||0)*100);
+    return `<tr><td>${i+1}</td><td>${autoEscHtml(p.name||'')}</td><td>${autoEscHtml(m.record?.name||'—')}<div class="m">${autoEscHtml(m.reason||'—')} · схожесть ${sim}%</div></td><td>${autoEscHtml(autoExternalId(p)||'—')}</td><td>${autoEscHtml(sel.dimensions.map(d=>d.name+': '+d.values[i]).join(' · '))}</td></tr>`;
+  }).join('');
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PrimeTac — preview variant probe</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#08100b;color:#eef4ef;padding:12px}a{color:#9de38d}.c{background:#141d17;border:1px solid #304238;border-radius:14px;padding:12px;margin:10px 0}.m{font-size:12px;color:#9caf9f;line-height:1.45}.warn{color:#e8c66c}button{padding:14px 18px;border:0;border-radius:12px;background:#35653a;color:#fff;font-weight:800}table{width:100%;border-collapse:collapse;font-size:12px}th,td{border-bottom:1px solid #304238;padding:8px;text-align:left;vertical-align:top}</style></head><body><h2>🧪 Подготовлен безопасный тест одной семьи</h2><p><a href="/variants/report">← К аудиту</a></p><div class="c"><b>${autoEscHtml(f.base)}</b><div class="m">Источник: точный group_id из XML поставщика · group_id ${autoEscHtml(sel.variation_group_id)} · ${f.count} позиций · экономия после объединения ${f.savings}</div><div class="m">Текущие группы Prom: ${autoEscHtml((sel.current_group_ids||[]).join(', ')||'—')}. Целевая группа: ${autoEscHtml(sel.target_group_name)} (${autoEscHtml(sel.target_group_id)}). ${sel.move_group?'Для этой тестовой семьи потребуется привести позиции к одной уже существующей группе.':'Все позиции уже находятся в одной целевой группе.'}</div></div><div class="c warn"><b>Изменение реальное, но ограничено одной семьёй.</b><div class="m">Будет отправлен YML только для этих ${f.count} существующих товаров. В настройках импорта only_update=true. Цена, наличие, остатки, фото и описания не меняются. Если позиции семьи сейчас разбросаны по группам, разрешено изменить только их группу каталога на показанную выше целевую группу. Общий YML group_id нужен для объединения в разновидности. Если Prom не покажет связь после теста, массовый режим останется заблокирован.</div></div><div class="c"><table><tr><th>#</th><th>Товар Prom</th><th>Товар XML</th><th>external_id</th><th>Различие</th></tr>${rows}</table></div><form method="post" action="/variants/probe/run"><button type="submit">🚀 ЗАПУСТИТЬ ТЕСТ ЭТОЙ СЕМЬИ</button></form></body></html>`;
 }
 
 function renderAutoHome(){
@@ -4812,9 +4863,9 @@ function renderAutoHome(){
   const statusErrText=autoState.status_last_error ? JSON.stringify(autoState.status_last_error).slice(0,900) : '';
   const stateStoreLabel=AUTO_STATE_PATH.startsWith('/var/data/')?'persistent disk /var/data':'локальный файл (для полной сохранности между Deploy задайте AUTO_STATE_PATH на Render Persistent Disk)';
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v3.4.20 SAFE VARIANT MATCH</title><style>
+<title>PrimeTac AUTO v3.4.21 STRICT IDENTITY</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.20 SAFE VARIANT MATCH</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED автомат ждёт подтверждение до ${AUTO_IMPORT_STATUS_MAX_MIN} минут, а временные ошибки status API больше не считаются завершением. Если Prom отвечает нестабильно, результат дополнительно проверяется по фактическим группам каталога. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, защита не отправляет второй импорт: автомат проверяет результат уже запущенной задачи. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.21 STRICT IDENTITY</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED автомат ждёт подтверждение до ${AUTO_IMPORT_STATUS_MAX_MIN} минут, а временные ошибки status API больше не считаются завершением. Если Prom отвечает нестабильно, результат дополнительно проверяется по фактическим группам каталога. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, защита не отправляет второй импорт: автомат проверяет результат уже запущенной задачи. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${(autoState.running||autoState.import_background||bootGuardActive)?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':(autoState.import_background?'⏳ ЖДЁМ ПОДТВЕРЖДЕНИЕ PROM...':(bootGuardActive?`🛡️ ЗАЩИТА ПОСЛЕ РЕСТАРТА · ${bootGuardLeftMin} МИН`:'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'))}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div>${bootGuardActive?`<div class="m warn" style="margin-top:6px">Новый импорт временно заблокирован после рестарта, даже если старый lock-файл отсутствует. Осталось примерно ${bootGuardLeftMin} мин.</div>`:''}<div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи изменено</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">нужно ${autoState.keywords_planned||0} · проверено ${autoState.keywords_checked||0}</div></div><div class="s"><div class="m">Описания изменено</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">нужно ${autoState.descriptions_planned||0} · проверено ${autoState.descriptions_checked||0}</div></div><div class="s"><div class="m">Характеристики подтверждено</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}${autoState.attributes_verifiable?` · API читает ${autoState.attributes_verifiable}`:(autoState.import_terminal_confirmed?' · Prom завершил импорт, но list API не отдаёт их для сверки':'')}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
 <div class="c"><b>📦 Контроль склада</b>
@@ -4892,14 +4943,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v3.4.20 SAFE VARIANT MATCH</title>
+<title>PrimeTac AUTO v3.4.21 STRICT IDENTITY</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.20 SAFE VARIANT MATCH</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.21 STRICT IDENTITY</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -5967,7 +6018,7 @@ app.get('/auto/unlock', (req,res)=>{
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v3.4.20 SAFE VARIANT MATCH',
+    app: 'PrimeTac AUTO v3.4.21 STRICT IDENTITY',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED,
     stock_monitor_enabled: STOCK_MONITOR_ENABLED,
@@ -6069,7 +6120,7 @@ function startStockWhenFree(reason='schedule'){
 restoredImportLock=restoreImportLock();
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v3.4.20 SAFE VARIANT MATCH started on ${PORT}`);
+  console.log(`PrimeTac AUTO v3.4.21 STRICT IDENTITY started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   stockState.next_run_at=new Date(Date.now()+STOCK_INTERVAL_HOURS*3600*1000).toISOString();
 
