@@ -1,6 +1,6 @@
 {
-  "name": "primetac-auto-v3-4-15-variant-family-probe",
-  "version": "3.4.15",
+  "name": "primetac-auto-v3-4-17-variant-audit-sync",
+  "version": "3.4.17",
   "private": true,
   "main": "server.js",
   "scripts": {

@@ -43,6 +43,7 @@ const STOCK_ALLOW_MASS = String(process.env.STOCK_ALLOW_MASS || 'false').toLower
 const STOCK_BATCH_SIZE = Math.max(1, Math.min(50, Number(process.env.STOCK_BATCH_SIZE || 40)));
 const STOCK_START_DELAY_SEC = Math.max(15, Number(process.env.STOCK_START_DELAY_SEC || 90));
 const STOCK_SNAPSHOT_PATH = String(process.env.STOCK_SNAPSHOT_PATH || '/tmp/primetac-stock-snapshot.json');
+const VARIANT_AUDIT_STATE_PATH = String(process.env.VARIANT_AUDIT_STATE_PATH || path.join(path.dirname(AUTO_STATE_PATH), 'primetac-variants-audit.json'));
 
 
 const SUPPLIER_FEED_ATTEMPTS = Math.max(2, Math.min(6, Number(process.env.SUPPLIER_FEED_ATTEMPTS || 4)));
@@ -296,6 +297,29 @@ let variantState = {
   skipped_weak:0,
   notes:[]
 };
+
+let variantAuditPromise = null;
+
+function saveVariantAuditSnapshot(){
+  try{
+    const dir=path.dirname(VARIANT_AUDIT_STATE_PATH);
+    fs.mkdirSync(dir,{recursive:true});
+    const tmp=VARIANT_AUDIT_STATE_PATH+'.tmp';
+    const snap={...variantState,running:false};
+    fs.writeFileSync(tmp,JSON.stringify(snap,null,2),'utf8');
+    fs.renameSync(tmp,VARIANT_AUDIT_STATE_PATH);
+  }catch(_e){}
+}
+function loadVariantAuditSnapshot(){
+  try{
+    if(!fs.existsSync(VARIANT_AUDIT_STATE_PATH)) return;
+    const saved=JSON.parse(fs.readFileSync(VARIANT_AUDIT_STATE_PATH,'utf8'));
+    if(saved && Number(saved.total_positions||0)>0 && Array.isArray(saved.deep_families) && saved.deep_families.length){
+      Object.assign(variantState,saved,{running:false,error:null});
+    }
+  }catch(_e){}
+}
+loadVariantAuditSnapshot();
 
 let variantProbeState = {
   running:false,
@@ -4362,68 +4386,140 @@ function auditVariantFamilies(products){
   return {standalone,existing,existingGroups,families:selected,skippedWeak};
 }
 
-async function runVariantAudit(){
-  if(variantState.running) return variantState;
-  variantState.running=true;
-  variantState.started_at=new Date().toISOString();
-  variantState.finished_at=null;
-  variantState.error=null;
-  variantState.supplier_audit_error=null;
-  try{
-    const products=await listAllProducts();
-    // Deep audit is still read-only for Prom. Supplier feeds improve model/size/color reconstruction.
+async function robustSyncSuppliersForVariants(products, opts={}){
+  const tries=Math.max(2,Number(opts.tries||4));
+  const minMatches=Math.max(2,Math.floor((products?.length||0)*0.25));
+  let lastErr=null;
+  promRawCache=new Map((products||[]).map(p=>[String(p.id),p]));
+
+  for(let attempt=0;attempt<tries;attempt++){
     try{
-      if(!supplierMatches.size || supplierMatches.size<Math.floor(products.length*0.50)) await syncSuppliers();
-    }catch(e){ variantState.supplier_audit_error=safeText(e); }
-    const r=auditVariantFamilies(products);
-    const strictHigh=r.families.filter(x=>x.confidence==='high' && x.source==='strict');
-    const allHigh=r.families.filter(x=>x.confidence==='high');
-    const allMedium=r.families.filter(x=>x.confidence==='medium');
-    const counted=r.families.filter(x=>x.confidence==='high' || x.confidence==='medium');
-    const strictSavings=strictHigh.reduce((n,x)=>n+x.savings,0);
-    const deepSavings=counted.reduce((n,x)=>n+x.savings,0);
-    variantState.total_positions=products.length;
-    variantState.standalone_positions=r.standalone.length;
-    variantState.existing_variant_positions=r.existing.length;
-    variantState.existing_variant_groups=r.existingGroups.size;
-    variantState.candidate_families=r.families.length;
-    variantState.high_confidence_families=allHigh.length;
-    variantState.medium_confidence_families=allMedium.length;
-    variantState.candidate_positions=r.families.reduce((n,x)=>n+x.count,0);
-    variantState.high_confidence_positions=allHigh.reduce((n,x)=>n+x.count,0);
-    variantState.estimated_savings_high=strictSavings;
-    variantState.estimated_cards_high=Math.max(0,products.length-strictSavings);
-    variantState.deep_candidate_families=counted.length;
-    variantState.deep_high_confidence_families=allHigh.length;
-    variantState.deep_medium_confidence_families=allMedium.length;
-    variantState.deep_supplier_backed_families=counted.filter(x=>x.source==='supplier').length;
-    variantState.deep_supplier_groupid_families=counted.filter(x=>x.source==='supplier_group_id').length;
-    variantState.deep_supplier_groupid_positions=counted.filter(x=>x.source==='supplier_group_id').reduce((n,x)=>n+x.count,0);
-    variantState.deep_supplier_groupid_savings=counted.filter(x=>x.source==='supplier_group_id').reduce((n,x)=>n+x.savings,0);
-    variantState.supplier_records_with_groupid=Object.values(supplierRecords||{}).flat().filter(r=>norm(r?.variation_group_id||'')).length;
-    variantState.deep_sku_backed_families=counted.filter(x=>x.source==='sku').length;
-    variantState.estimated_savings_deep=deepSavings;
-    variantState.estimated_cards_deep=Math.max(0,products.length-deepSavings);
-    variantState.goal_gap_after_deep=Math.max(0,variantState.estimated_cards_deep-variantState.target_limit);
-    variantState.supplier_matches_for_audit=supplierMatches.size;
-    variantState.need_to_reduce=Math.max(0,products.length-variantState.target_limit);
-    variantState.families=r.families.filter(x=>x.source==='strict');
-    variantState.deep_families=r.families;
-    variantState.skipped_weak=r.skippedWeak;
-    variantState.notes=[
-      'Аудит только читает каталог Prom и фиды поставщиков; ничего в Prom не изменяет.',
-      'Сначала аудит восстанавливает точные семейства по group_id из offer поставщика, если он есть в XML.',
-      'Затем использует названия поставщика, размеры/цвета из XML и общий корень SKU/артикула.',
-      'Семьи «review» не входят в расчёт безопасной экономии и требуют ручной проверки перед объединением.',
-      'Оценка карточек ориентировочная: точный тарифный счётчик Prom может отличаться от количества записей Public API.'
-    ];
-  }catch(e){
-    variantState.error=safeText(e);
-  }finally{
-    variantState.running=false;
-    variantState.finished_at=new Date().toISOString();
+      // If another supplier refresh is running, wait for it instead of treating the catalogue as empty.
+      let waitGuard=0;
+      while(supplierState.loading && waitGuard<120){ await new Promise(r=>setTimeout(r,250)); waitGuard++; }
+      await refreshSupplierFeeds();
+
+      const bez=(supplierRecords.bezet||[]).length;
+      const mil=(supplierRecords.militaris||[]).length;
+      const gids=Object.values(supplierRecords||{}).flat().filter(r=>numericVariationGroupId(r?.variation_group_id||'')).length;
+      if(!bez || !mil || !gids) throw new Error(`фиды ещё не готовы: BEZET=${bez}, Militaris=${mil}, записей group_id=${gids}`);
+
+      await matchSupplierCatalog();
+      if(supplierMatches.size<minMatches) throw new Error(`слишком мало сопоставлений Prom↔XML: ${supplierMatches.size}/${products.length}`);
+      return {ok:true,bezet:bez,militaris:mil,groupid_records:gids,matches:supplierMatches.size,attempt:attempt+1};
+    }catch(e){
+      lastErr=e;
+      if(attempt<tries-1) await new Promise(r=>setTimeout(r,1500*(attempt+1)));
+    }
   }
-  return variantState;
+
+  // Last-chance recovery: if records were loaded on any attempt, rematch them even if the latest HTTP refresh failed.
+  try{
+    const bez=(supplierRecords.bezet||[]).length;
+    const mil=(supplierRecords.militaris||[]).length;
+    const gids=Object.values(supplierRecords||{}).flat().filter(r=>numericVariationGroupId(r?.variation_group_id||'')).length;
+    if(bez && mil && gids){
+      await matchSupplierCatalog();
+      if(supplierMatches.size>=2) return {ok:true,stale:true,bezet:bez,militaris:mil,groupid_records:gids,matches:supplierMatches.size};
+    }
+  }catch(e){ lastErr=e; }
+  throw new Error('Не удалось восстановить данные поставщиков для разновидностей: '+safeText(lastErr));
+}
+
+async function runVariantAudit(opts={}){
+  if(variantAuditPromise) return await variantAuditPromise;
+  const forceSuppliers=Boolean(opts && opts.forceSuppliers);
+  variantAuditPromise=(async()=>{
+    variantState.running=true;
+    variantState.started_at=new Date().toISOString();
+    variantState.finished_at=null;
+    variantState.error=null;
+    let supplierAuditError=null;
+    try{
+      let products=[];
+      let lastProductsError=null;
+      for(let attempt=0;attempt<3;attempt++){
+        try{
+          products=await listAllProducts();
+          if(products.length) break;
+          lastProductsError=new Error('Prom API вернул пустой список товаров');
+        }catch(e){ lastProductsError=e; }
+        if(attempt<2) await new Promise(r=>setTimeout(r,1200*(attempt+1)));
+      }
+      if(!products.length){
+        throw new Error('Аудит не получил товары Prom после 3 попыток. Старый успешный отчёт сохранён. Последняя ошибка: '+safeText(lastProductsError));
+      }
+      // Keep the product snapshot in RAM so supplier matching and probe use the same catalogue.
+      promRawCache=new Map(products.map(p=>[String(p.id),p]));
+      try{
+        if(forceSuppliers || !supplierMatches.size || supplierMatches.size<Math.floor(products.length*0.50)) {
+          await robustSyncSuppliersForVariants(products,{tries:4});
+        }
+      }catch(e){
+        supplierAuditError=safeText(e);
+        // A supplier outage must not replace a previously successful XML group_id audit with a zero-family snapshot.
+        if(Number(variantState.deep_supplier_groupid_families||0)>0 && Array.isArray(variantState.deep_families) && variantState.deep_families.length){
+          throw new Error('Фиды временно недоступны. Сохраняю предыдущий успешный аудит: '+supplierAuditError);
+        }
+      }
+      const r=auditVariantFamilies(products);
+      const strictHigh=r.families.filter(x=>x.confidence==='high' && x.source==='strict');
+      const allHigh=r.families.filter(x=>x.confidence==='high');
+      const allMedium=r.families.filter(x=>x.confidence==='medium');
+      const counted=r.families.filter(x=>x.confidence==='high' || x.confidence==='medium');
+      const strictSavings=strictHigh.reduce((n,x)=>n+x.savings,0);
+      const deepSavings=counted.reduce((n,x)=>n+x.savings,0);
+      Object.assign(variantState,{
+        supplier_audit_error:supplierAuditError,
+        total_positions:products.length,
+        standalone_positions:r.standalone.length,
+        existing_variant_positions:r.existing.length,
+        existing_variant_groups:r.existingGroups.size,
+        candidate_families:r.families.length,
+        high_confidence_families:allHigh.length,
+        medium_confidence_families:allMedium.length,
+        candidate_positions:r.families.reduce((n,x)=>n+x.count,0),
+        high_confidence_positions:allHigh.reduce((n,x)=>n+x.count,0),
+        estimated_savings_high:strictSavings,
+        estimated_cards_high:Math.max(0,products.length-strictSavings),
+        deep_candidate_families:counted.length,
+        deep_high_confidence_families:allHigh.length,
+        deep_medium_confidence_families:allMedium.length,
+        deep_supplier_backed_families:counted.filter(x=>x.source==='supplier').length,
+        deep_supplier_groupid_families:counted.filter(x=>x.source==='supplier_group_id').length,
+        deep_supplier_groupid_positions:counted.filter(x=>x.source==='supplier_group_id').reduce((n,x)=>n+x.count,0),
+        deep_supplier_groupid_savings:counted.filter(x=>x.source==='supplier_group_id').reduce((n,x)=>n+x.savings,0),
+        supplier_records_with_groupid:Object.values(supplierRecords||{}).flat().filter(r=>norm(r?.variation_group_id||'')).length,
+        deep_sku_backed_families:counted.filter(x=>x.source==='sku').length,
+        estimated_savings_deep:deepSavings,
+        estimated_cards_deep:Math.max(0,products.length-deepSavings),
+        goal_gap_after_deep:Math.max(0,Math.max(0,products.length-deepSavings)-variantState.target_limit),
+        supplier_matches_for_audit:supplierMatches.size,
+        need_to_reduce:Math.max(0,products.length-variantState.target_limit),
+        families:r.families.filter(x=>x.source==='strict'),
+        deep_families:r.families,
+        skipped_weak:r.skippedWeak,
+        notes:[
+          'Аудит только читает каталог Prom и фиды поставщиков; ничего в Prom не изменяет.',
+          'Если аудит уже запущен, повторный клик теперь ждёт тот же процесс вместо показа нулевого отчёта.',
+          'Успешный отчёт сохраняется на Persistent Disk и переживает Deploy/рестарт.',
+          'Сначала аудит восстанавливает точные семейства по group_id из offer поставщика, если он есть в XML.',
+          'Семьи «review» не входят в расчёт безопасной экономии и требуют ручной проверки перед объединением.'
+        ]
+      });
+      saveVariantAuditSnapshot();
+    }catch(e){
+      // Do not destroy a previously successful snapshot with a transient empty/API failure.
+      variantState.error=safeText(e);
+      variantState.supplier_audit_error=supplierAuditError||variantState.supplier_audit_error||null;
+    }finally{
+      variantState.running=false;
+      variantState.finished_at=new Date().toISOString();
+    }
+    return variantState;
+  })();
+  try{ return await variantAuditPromise; }
+  finally{ variantAuditPromise=null; }
 }
 
 function renderVariantReport(){
@@ -4436,7 +4532,7 @@ function renderVariantReport(){
     const source=f.source==='supplier_group_id'?'🧬 точный XML group_id '+autoEscHtml(f.supplier_variation_group_id||''):(f.source==='supplier'?'📦 XML поставщика':(f.source==='sku'?'🏷️ SKU/артикул':(f.source==='fuzzy'?'🔎 похожие названия':'📝 название Prom')));
     return `<tr><td>${i+1}</td><td><b>${autoEscHtml(f.base)}</b><div class="m">${autoEscHtml(f.group||'—')}${f.brand?' · '+autoEscHtml(f.brand):''}</div><div class="m">${source}</div><details><summary>${f.count} позиций</summary><div class="m" style="margin-top:6px">${names}</div></details></td><td>${f.count}</td><td>${f.savings}</td><td>${badge}<div class="m">${autoEscHtml(dims||'—')} · разброс цены ${f.price_spread_pct}%</div></td></tr>`;
   }).join('');
-  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PrimeTac — глубокий аудит разновидностей</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#08100b;color:#eef4ef;padding:12px}a{color:#9de38d}.c{background:#141d17;border:1px solid #304238;border-radius:14px;padding:12px;margin:10px 0}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid #304238;border-radius:10px;padding:9px}.n{font-size:22px;font-weight:800}.m{font-size:12px;color:#9caf9f;line-height:1.45}.ok{color:#8fdf7d}.warn{color:#e8c66c}.bad{color:#ff8b83}table{width:100%;border-collapse:collapse;font-size:12px}th,td{border-bottom:1px solid #304238;padding:8px;vertical-align:top;text-align:left}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}table{font-size:11px}th:nth-child(1),td:nth-child(1){display:none}}</style></head><body><h2>🧩 Глубокий аудит разновидностей PrimeTac</h2><p><a href="/">← Назад</a> · <a href="/variants/report.json">JSON</a> · <a href="/variants/audit">🔄 Повторить аудит</a> · <a href="/variants/probe/preview">🧪 ТЕСТ 1 СЕМЬИ</a></p>${v.error?`<div class="c bad">${autoEscHtml(v.error)}</div>`:''}${v.supplier_audit_error?`<div class="c warn">Фиды поставщиков не удалось обновить: ${autoEscHtml(v.supplier_audit_error)}. Аудит всё равно выполнен по данным Prom.</div>`:''}<div class="c"><div class="grid"><div class="s"><div class="m">Позиций API</div><div class="n">${v.total_positions||0}</div></div><div class="s"><div class="m">Семей deep audit</div><div class="n ok">${v.deep_candidate_families||0}</div></div><div class="s"><div class="m">Высокая / средняя</div><div class="n ok">${v.deep_high_confidence_families||0} / ${v.deep_medium_confidence_families||0}</div></div><div class="s"><div class="m">Экономия по deep audit</div><div class="n ok">${v.estimated_savings_deep||0}</div></div><div class="s"><div class="m">Оценка карточек после</div><div class="n ${v.estimated_cards_deep<=v.target_limit?'ok':'warn'}">${v.estimated_cards_deep||0}</div></div><div class="s"><div class="m">Осталось убрать до ${v.target_limit}</div><div class="n ${v.goal_gap_after_deep?'warn':'ok'}">${v.goal_gap_after_deep||0}</div></div></div><div class="m" style="margin-top:10px"><b>Точных XML group_id-семей: ${v.deep_supplier_groupid_families||0}</b> (${v.deep_supplier_groupid_positions||0} позиций, экономия ${v.deep_supplier_groupid_savings||0}); записей поставщиков с group_id: ${v.supplier_records_with_groupid||0}. Поставщик-семей по названию: ${v.deep_supplier_backed_families||0}; SKU-семей: ${v.deep_sku_backed_families||0}; сопоставлено с XML для аудита: ${v.supplier_matches_for_audit||0}. Существующих связей разновидностей Public API сейчас видит: ${v.existing_variant_positions||0} позиций / ${v.existing_variant_groups||0} групп.</div></div><div class="c"><b>Кандидаты на восстановление</b><div class="m">High и medium входят в расчёт. Review показаны только для ручной проверки и в экономию не считаются. Эта версия НИЧЕГО не записывает в Prom.</div><div style="overflow:auto"><table><tr><th>#</th><th>Модель</th><th>Позиций</th><th>Экономия</th><th>Проверка</th></tr>${rows||'<tr><td colspan="5">Запустите аудит.</td></tr>'}</table></div></div></body></html>`;
+  return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>PrimeTac — глубокий аудит разновидностей</title><style>:root{color-scheme:dark}body{font-family:system-ui;background:#08100b;color:#eef4ef;padding:12px}a{color:#9de38d}.c{background:#141d17;border:1px solid #304238;border-radius:14px;padding:12px;margin:10px 0}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid #304238;border-radius:10px;padding:9px}.n{font-size:22px;font-weight:800}.m{font-size:12px;color:#9caf9f;line-height:1.45}.ok{color:#8fdf7d}.warn{color:#e8c66c}.bad{color:#ff8b83}table{width:100%;border-collapse:collapse;font-size:12px}th,td{border-bottom:1px solid #304238;padding:8px;vertical-align:top;text-align:left}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}table{font-size:11px}th:nth-child(1),td:nth-child(1){display:none}}</style></head><body><h2>🧩 Глубокий аудит разновидностей PrimeTac</h2><p><a href="/">← Назад</a> · <a href="/variants/report.json">JSON</a> · <a href="/variants/audit">🔄 Повторить аудит</a> · ${v.running?'⏳ аудит выполняется':(v.deep_supplier_groupid_families>0?'<a href="/variants/probe/preview">🧪 ТЕСТ 1 СЕМЬИ</a>':'🧪 тест появится после успешного аудита')}</p>${v.error?`<div class="c bad">${autoEscHtml(v.error)}</div>`:''}${v.supplier_audit_error?`<div class="c warn">Фиды поставщиков не удалось обновить: ${autoEscHtml(v.supplier_audit_error)}. Аудит всё равно выполнен по данным Prom.</div>`:''}<div class="c"><div class="grid"><div class="s"><div class="m">Позиций API</div><div class="n">${v.total_positions||0}</div></div><div class="s"><div class="m">Семей deep audit</div><div class="n ok">${v.deep_candidate_families||0}</div></div><div class="s"><div class="m">Высокая / средняя</div><div class="n ok">${v.deep_high_confidence_families||0} / ${v.deep_medium_confidence_families||0}</div></div><div class="s"><div class="m">Экономия по deep audit</div><div class="n ok">${v.estimated_savings_deep||0}</div></div><div class="s"><div class="m">Оценка карточек после</div><div class="n ${v.estimated_cards_deep<=v.target_limit?'ok':'warn'}">${v.estimated_cards_deep||0}</div></div><div class="s"><div class="m">Осталось убрать до ${v.target_limit}</div><div class="n ${v.goal_gap_after_deep?'warn':'ok'}">${v.goal_gap_after_deep||0}</div></div></div><div class="m" style="margin-top:10px"><b>Точных XML group_id-семей: ${v.deep_supplier_groupid_families||0}</b> (${v.deep_supplier_groupid_positions||0} позиций, экономия ${v.deep_supplier_groupid_savings||0}); записей поставщиков с group_id: ${v.supplier_records_with_groupid||0}. Поставщик-семей по названию: ${v.deep_supplier_backed_families||0}; SKU-семей: ${v.deep_sku_backed_families||0}; сопоставлено с XML для аудита: ${v.supplier_matches_for_audit||0}. Существующих связей разновидностей Public API сейчас видит: ${v.existing_variant_positions||0} позиций / ${v.existing_variant_groups||0} групп.</div></div><div class="c"><b>Кандидаты на восстановление</b><div class="m">High и medium входят в расчёт. Review показаны только для ручной проверки и в экономию не считаются. Эта версия НИЧЕГО не записывает в Prom.</div><div style="overflow:auto"><table><tr><th>#</th><th>Модель</th><th>Позиций</th><th>Экономия</th><th>Проверка</th></tr>${rows||'<tr><td colspan="5">Запустите аудит.</td></tr>'}</table></div></div></body></html>`;
 }
 
 
@@ -4460,19 +4556,56 @@ function probeDimValuesForFamily(items){
   return {dims,signatures};
 }
 async function selectVariantProbeFamily(){
-  if(!variantState.deep_families?.length) await runVariantAudit();
-  const products=await listAllProducts();
+  // Self-contained probe preparation: never trust RAM/report state after a Render deploy.
+  let products=[];
+  let lastProductsError=null;
+  for(let attempt=0;attempt<4;attempt++){
+    try{ products=await listAllProducts(); if(products.length) break; }
+    catch(e){ lastProductsError=e; }
+    if(attempt<3) await new Promise(r=>setTimeout(r,1200*(attempt+1)));
+  }
+  if(!products.length) throw new Error('Не удалось получить товары Prom для теста после 4 попыток: '+safeText(lastProductsError));
+  promRawCache=new Map(products.map(p=>[String(p.id),p]));
+
+  const supplierDiag=await robustSyncSuppliersForVariants(products,{tries:5});
+  const fresh=auditVariantFamilies(products);
+  const exactFresh=fresh.families.filter(f=>f.confidence==='high' && f.source==='supplier_group_id' && f.count>=2);
+
+  // Refresh the visible report from the same exact data the probe is using.
+  const counted=fresh.families.filter(x=>x.confidence==='high' || x.confidence==='medium');
+  const allHigh=fresh.families.filter(x=>x.confidence==='high');
+  const allMedium=fresh.families.filter(x=>x.confidence==='medium');
+  Object.assign(variantState,{
+    running:false,error:null,supplier_audit_error:null,total_positions:products.length,
+    standalone_positions:fresh.standalone.length,existing_variant_positions:fresh.existing.length,
+    existing_variant_groups:fresh.existingGroups.size,candidate_families:fresh.families.length,
+    high_confidence_families:allHigh.length,medium_confidence_families:allMedium.length,
+    deep_candidate_families:counted.length,deep_high_confidence_families:allHigh.length,
+    deep_medium_confidence_families:allMedium.length,
+    deep_supplier_groupid_families:exactFresh.length,
+    deep_supplier_groupid_positions:exactFresh.reduce((n,x)=>n+x.count,0),
+    deep_supplier_groupid_savings:exactFresh.reduce((n,x)=>n+x.savings,0),
+    supplier_records_with_groupid:Object.values(supplierRecords||{}).flat().filter(r=>numericVariationGroupId(r?.variation_group_id||'')).length,
+    supplier_matches_for_audit:supplierMatches.size,
+    estimated_savings_deep:counted.reduce((n,x)=>n+x.savings,0),
+    estimated_cards_deep:Math.max(0,products.length-counted.reduce((n,x)=>n+x.savings,0)),
+    goal_gap_after_deep:Math.max(0,Math.max(0,products.length-counted.reduce((n,x)=>n+x.savings,0))-variantState.target_limit),
+    need_to_reduce:Math.max(0,products.length-variantState.target_limit),deep_families:fresh.families,
+    families:fresh.families.filter(x=>x.source==='strict'),finished_at:new Date().toISOString()
+  });
+  saveVariantAuditSnapshot();
+
   const byId=new Map(products.map(p=>[String(p.id),p]));
   const groups=await getPromGroups().catch(()=>[]);
   const maps=promGroupMaps(groups);
-  // Refresh real Prom IDs. If old imports scattered one model over several groups,
-  // we can safely move ONLY the chosen test family into its already existing PrimeTac group.
   try{ await refreshRealPromGroupMapping(); }catch(_e){}
-  const stats={total:0,bad_vg:0,missing_products:0,no_external_id:0,no_dimensions:0,no_target_group:0,selected:null};
-  const candidates=(variantState.deep_families||[])
-    .filter(f=>f.confidence==='high' && f.source==='supplier_group_id' && f.count>=2 && f.count<=8)
-    .sort((a,b)=>a.count-b.count || a.price_spread_pct-b.price_spread_pct || a.base.localeCompare(b.base,'ru'));
+  const stats={total:0,bad_vg:0,missing_products:0,no_external_id:0,no_dimensions:0,no_target_group:0,too_large:0,selected:null,audit_total:products.length,audit_exact:exactFresh.length,supplier_diag:supplierDiag};
+  const allExact=exactFresh.sort((a,b)=>a.count-b.count || a.price_spread_pct-b.price_spread_pct || a.base.localeCompare(b.base,'ru'));
+  // A probe family should be small enough to inspect manually, but do not throw away valid 13–20 item size runs.
+  const candidates=allExact.filter(f=>f.count<=20);
   stats.total=candidates.length;
+  stats.too_large=Math.max(0,allExact.length-candidates.length);
+
   for(const f of candidates){
     const vg=numericVariationGroupId(f.supplier_variation_group_id);
     if(!vg){ stats.bad_vg++; continue; }
@@ -4486,20 +4619,23 @@ async function selectVariantProbeFamily(){
     const currentNames=uniq(items.map(p=>productGroupName(p,maps)).filter(Boolean));
     let targetGroupId='';
     let targetGroupName='';
-    let targetManaged=null;
 
-    // f.group is produced by classifyManagedGroup() during the audit, so it should
-    // match one of our managed PrimeTac groups even if the products are currently scattered.
-    targetManaged=MANAGED_GROUPS.find(g=>groupNameKey(g.name)===groupNameKey(f.group||'')) || null;
+    const targetManaged=MANAGED_GROUPS.find(g=>groupNameKey(g.name)===groupNameKey(f.group||'')) || null;
     if(targetManaged){
       targetGroupId=mappedPromGroupId(targetManaged);
       const mm=autoState.real_group_map?.[String(targetManaged.id)]||{};
       targetGroupName=norm(mm.prom_name||targetManaged.name||'');
     }
-    // If mapping is unavailable, the old strict path is still safe when all products are already together.
-    if(!targetGroupId && currentGids.length===1){
-      targetGroupId=currentGids[0];
-      targetGroupName=currentNames[0]||f.group||'PrimeTac';
+    // If mapping by name is unavailable, use the most common current real Prom group inside this exact XML family.
+    if(!targetGroupId && currentGids.length){
+      const counts=new Map();
+      for(const p of items){ const gid=String(autoGroupId(p)||''); if(gid) counts.set(gid,(counts.get(gid)||0)+1); }
+      const best=[...counts.entries()].sort((a,b)=>b[1]-a[1])[0];
+      if(best){
+        targetGroupId=best[0];
+        const gp=items.find(p=>String(autoGroupId(p)||'')===targetGroupId);
+        targetGroupName=productGroupName(gp,maps)||currentNames[0]||f.group||'PrimeTac';
+      }
     }
     if(!targetGroupId){ stats.no_target_group++; continue; }
 
@@ -4509,9 +4645,11 @@ async function selectVariantProbeFamily(){
     variantProbeState.selection_diagnostics=stats;
     return sel;
   }
+
   variantProbeState.selection_diagnostics=stats;
-  throw new Error(`Не нашёл семью для безопасного теста. Проверено точных XML group_id-семей: ${stats.total}; без уникальных заполненных размер/цвет: ${stats.no_dimensions}; без external_id: ${stats.no_external_id}; не удалось определить реальную группу Prom: ${stats.no_target_group}; отсутствуют позиции: ${stats.missing_products}. Откройте /variants/probe/state — там есть selection_diagnostics.`);
+  throw new Error(`Не нашёл безопасную семью даже после прямой пересборки данных. Prom=${products.length}; XML group_id-семей=${stats.audit_exact}; кандидатов 2–20=${stats.total}; >20=${stats.too_large}; без размер/цвет=${stats.no_dimensions}; без external_id=${stats.no_external_id}; без целевой группы=${stats.no_target_group}; отсутствуют позиции=${stats.missing_products}; XML записей group_id=${variantState.supplier_records_with_groupid||0}; сопоставлений Prom↔XML=${supplierMatches.size}.`);
 }
+
 function buildVariantProbeYml(sel){
   const catId=String(sel.target_group_id||sel.current_group_id||'1');
   const catName=norm(sel.target_group_name||sel.current_group_name||'PrimeTac');
@@ -4616,9 +4754,9 @@ function renderAutoHome(){
   const statusErrText=autoState.status_last_error ? JSON.stringify(autoState.status_last_error).slice(0,900) : '';
   const stateStoreLabel=AUTO_STATE_PATH.startsWith('/var/data/')?'persistent disk /var/data':'локальный файл (для полной сохранности между Deploy задайте AUTO_STATE_PATH на Render Persistent Disk)';
   return `<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">${refresh}
-<title>PrimeTac AUTO v3.4.16 ADAPTIVE VARIANT PROBE</title><style>
+<title>PrimeTac AUTO v3.4.18 SELF-HEAL VARIANT PROBE</title><style>
 :root{color-scheme:dark;--bg:#08100b;--c:#141d17;--ln:#304238;--tx:#f4f7f4;--mu:#9caf9f;--g:#8fdf7d;--y:#e8c66c;--r:#ff8b83}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,Segoe UI,sans-serif}.w{max-width:820px;margin:auto;padding:14px}.c{background:var(--c);border:1px solid var(--ln);border-radius:16px;padding:14px;margin:12px 0}h1{font-size:23px;margin:4px 0}.m{font-size:12px;color:var(--mu);line-height:1.5}.btn{width:100%;border:0;border-radius:14px;padding:16px;background:#35653a;color:white;font-size:18px;font-weight:900}.stop{border:1px solid #603f3a;background:#3a2320;color:#fff;border-radius:10px;padding:10px 14px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px}.s{border:1px solid var(--ln);border-radius:12px;padding:10px}.n{font-size:23px;font-weight:850}.ok{color:var(--g)}.warn{color:var(--y)}.bad{color:var(--r)}.bar{height:10px;background:#202b24;border-radius:99px;overflow:hidden}.bar span{display:block;height:100%;background:var(--g);width:${Math.max(0,Math.min(100,autoState.progress||0))}%}a{color:#b8efb0}@media(max-width:650px){.grid{grid-template-columns:1fr 1fr}}
-</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.16 ADAPTIVE VARIANT PROBE</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED автомат ждёт подтверждение до ${AUTO_IMPORT_STATUS_MAX_MIN} минут, а временные ошибки status API больше не считаются завершением. Если Prom отвечает нестабильно, результат дополнительно проверяется по фактическим группам каталога. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, защита не отправляет второй импорт: автомат проверяет результат уже запущенной задачи. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
+</style></head><body><div class="w"><h1>🚀 PrimeTac AUTO <span class="m">v3.4.18 SELF-HEAL VARIANT PROBE</span></h1><div class="m">Одна кнопка. Каждые 4 часа загружает Prom + BEZET + Militaris, дополняет ключи и слабые описания, раскладывает товары по фиксированному дереву PrimeTac и обновляет характеристики. Группы и характеристики отправляются в Prom ОДНИМ импортом на весь каталог. После ACCEPTED автомат ждёт подтверждение до ${AUTO_IMPORT_STATUS_MAX_MIN} минут, а временные ошибки status API больше не считаются завершением. Если Prom отвечает нестабильно, результат дополнительно проверяется по фактическим группам каталога. Фиды поставщиков скачиваются потоково без старого жёсткого 90-секундного обрыва. Категории поставщиков один в один не копируются, поэтому сотен групп не будет. Если один из фидов временно не загрузился, программа повторяет загрузку и не делает частичную обработку. Если Prom занят предыдущим импортом, защита не отправляет второй импорт: автомат проверяет результат уже запущенной задачи. Цены и фото не трогает. Остатки/наличие обновляет отдельный безопасный Stock Monitor только по точному SKU.</div>
 <div class="c"><form method="get" action="/auto/run"><button class="btn" ${(autoState.running||autoState.import_background||bootGuardActive)?'disabled':''}>${autoState.running?'⏳ РАБОТАЕТ...':(autoState.import_background?'⏳ ЖДЁМ ПОДТВЕРЖДЕНИЕ PROM...':(bootGuardActive?`🛡️ ЗАЩИТА ПОСЛЕ РЕСТАРТА · ${bootGuardLeftMin} МИН`:'🚀 ПРОВЕРИТЬ И ИСПРАВИТЬ ВСЁ'))}</button></form><div style="height:8px"></div><form method="get" action="/auto/stop"><button class="stop" ${autoState.running?'':'disabled'}>⏹ Стоп</button></form><div style="margin-top:12px"><b>${autoEscHtml(autoState.phase)}</b></div>${bootGuardActive?`<div class="m warn" style="margin-top:6px">Новый импорт временно заблокирован после рестарта, даже если старый lock-файл отсутствует. Осталось примерно ${bootGuardLeftMin} мин.</div>`:''}<div class="bar" style="margin-top:8px"><span></span></div><div class="m" style="margin-top:7px">${autoState.progress||0}% · ${autoState.current_total?`обработано ${autoState.current}/${autoState.current_total} · `:''}старт: ${fmt(autoState.started_at)} · следующий автозапуск: ${fmt(autoState.next_run_at)}</div></div>
 <div class="grid"><div class="s"><div class="m">Товаров Prom</div><div class="n">${total||'—'}</div></div><div class="s"><div class="m">Сопоставлено</div><div class="n ok">${supplierState.matched_products||0}</div></div><div class="s"><div class="m">Не найдено</div><div class="n ${unmatched?'warn':''}">${unmatched}</div></div><div class="s"><div class="m">UA-ключи изменено</div><div class="n ok">${autoState.keywords_changed||0}</div><div class="m">нужно ${autoState.keywords_planned||0} · проверено ${autoState.keywords_checked||0}</div></div><div class="s"><div class="m">Описания изменено</div><div class="n ok">${autoState.descriptions_changed||0}</div><div class="m">нужно ${autoState.descriptions_planned||0} · проверено ${autoState.descriptions_checked||0}</div></div><div class="s"><div class="m">Характеристики подтверждено</div><div class="n ok">${autoState.attributes_imported||0}</div><div class="m">из ${autoState.attributes_planned||0}${autoState.attributes_verifiable?` · API читает ${autoState.attributes_verifiable}`:(autoState.import_terminal_confirmed?' · Prom завершил импорт, но list API не отдаёт их для сверки':'')}</div></div><div class="s"><div class="m">Ошибки ключи/описания</div><div class="n ${autoState.seo_errors?'bad':''}">${autoState.seo_errors||0}</div></div></div>
 <div class="c"><b>📦 Контроль склада</b>
@@ -4666,7 +4804,7 @@ ${stockDiag.response?`<span class="m">Ответ Prom: ${autoEscHtml(JSON.string
 <div class="m" style="margin-top:7px"><a href="/groups/real-map">Реальные группы Prom</a> · <a href="/groups/refresh">Обновить сопоставление</a> · <a href="/groups/probe">🧪 ТЕСТ 1 ТОВАРА</a> · <a href="/groups/plan">Структура</a> · <a href="/groups/covers">Фото</a></div>
 </div>
 <div class="c"><b>🧩 Разновидности товаров</b>
-<div class="m" style="margin-top:7px">v3.4.15 сохраняет глубокий read-only аудит, а запись разрешена только отдельной кнопкой теста одной точной XML <code>group_id</code>-семьи. Массового восстановления в этой версии нет.</div>
+<div class="m" style="margin-top:7px">v3.4.18 сам пересобирает XML-семьи перед тестом и сохраняет глубокий read-only аудит, а запись разрешена только отдельной кнопкой теста одной точной XML <code>group_id</code>-семьи. Массового восстановления в этой версии нет.</div>
 <div class="m">Последний аудит: ${variantState.finished_at?fmt(variantState.finished_at):'не запускался'} · позиций API ${variantState.total_positions||0} · кандидатов-семей <b class="ok">${variantState.candidate_families||0}</b> · высокой уверенности ${variantState.high_confidence_families||0}.</div>
 <div class="m">Глубокий аудит: экономия <b class="ok">${variantState.estimated_savings_deep||0}</b> карточек; оценка после объединения <b class="${variantState.estimated_cards_deep&&variantState.estimated_cards_deep<=variantState.target_limit?'ok':'warn'}">${variantState.estimated_cards_deep||'—'}</b>; до цели ${variantState.target_limit} останется убрать ${variantState.goal_gap_after_deep||0}.</div>
 ${variantState.error?`<div class="bad m">Ошибка аудита: ${autoEscHtml(variantState.error)}</div>`:''}
@@ -4696,14 +4834,14 @@ const html = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 __SSR_META_REFRESH__
-<title>PrimeTac AUTO v3.4.16 ADAPTIVE VARIANT PROBE</title>
+<title>PrimeTac AUTO v3.4.18 SELF-HEAL VARIANT PROBE</title>
 <style>
 :root{color-scheme:dark;--bg:#0b100d;--card:#151b18;--line:#2b352f;--text:#eef4ef;--muted:#9aa49d;--green:#8fd37c;--yellow:#e4be6a;--red:#ff8c83}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.w{max-width:1180px;margin:auto;padding:16px}.c{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px 0}.m{font-size:12px;color:var(--muted);line-height:1.45}.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}button,input,select{font:inherit;border-radius:10px;border:1px solid #405148;padding:10px 12px;background:#1e2923;color:#fff}button{font-weight:750;background:#2d472d;cursor:pointer}button.secondary{background:#1d2822}button:disabled{opacity:.45}.grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px}.stat{background:#101511;border:1px solid var(--line);border-radius:12px;padding:12px}.n{font-size:28px;font-weight:850}.good{color:var(--green)}.warn{color:var(--yellow)}.bad{color:var(--red)}table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}.pill{padding:4px 7px;border:1px solid var(--line);border-radius:999px;font-size:11px}.toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center}.fbox{border:1px solid var(--line);border-radius:10px;padding:8px;margin:6px 0}.suggest{font-size:11px;color:#c8d7c8;margin-top:4px}.bar{height:8px;background:#202823;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:#8fd37c;width:0}.detail{display:none}.detail.open{display:block}@media(max-width:800px){.grid{grid-template-columns:1fr 1fr}table{font-size:10px}.hide-mobile{display:none}}
 </style>
 </head>
 <body><div class="w">
-<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.16 ADAPTIVE VARIANT PROBE</span></h2>
+<h2>🧰 PrimeTac Card Manager <span class="m">v3.4.18 SELF-HEAL VARIANT PROBE</span></h2>
 <div class="m">Ключи и данные поставщиков разделены. 4 UA-запроса считаются достаточными. Характеристики пишутся только в уже существующие пустые поля Prom и только после успешного теста на 1 товаре.</div>
 
 <div class="c">
@@ -5765,7 +5903,7 @@ app.get('/auto/unlock', (req,res)=>{
 app.get('/health', (_req,res) => {
   res.json({
     ok: true,
-    app: 'PrimeTac AUTO v3.4.16 ADAPTIVE VARIANT PROBE',
+    app: 'PrimeTac AUTO v3.4.18 SELF-HEAL VARIANT PROBE',
     prom_connected: Boolean(PROM_TOKEN),
     write_enabled: WRITE_ENABLED,
     stock_monitor_enabled: STOCK_MONITOR_ENABLED,
@@ -5867,7 +6005,7 @@ function startStockWhenFree(reason='schedule'){
 restoredImportLock=restoreImportLock();
 
 app.listen(PORT, () => {
-  console.log(`PrimeTac AUTO v3.4.16 ADAPTIVE VARIANT PROBE started on ${PORT}`);
+  console.log(`PrimeTac AUTO v3.4.18 SELF-HEAL VARIANT PROBE started on ${PORT}`);
   autoState.next_run_at=new Date(Date.now()+AUTO_INTERVAL_HOURS*3600*1000).toISOString();
   stockState.next_run_at=new Date(Date.now()+STOCK_INTERVAL_HOURS*3600*1000).toISOString();
 
