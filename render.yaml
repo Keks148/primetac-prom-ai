@@ -1,0 +1,23 @@
+services:
+  - type: web
+    name: primetac-sync-v1
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: "20"
+      - key: SYNC_INTERVAL_HOURS
+        value: "5"
+      - key: AUTO_AUDIT
+        value: "true"
+      - key: HTTP_TIMEOUT_MS
+        value: "60000"
+      - key: PROM_TOKEN
+        sync: false
+      - key: BEZET_XML_URL
+        sync: false
+      - key: MILITARIS_XML_URL
+        sync: false
