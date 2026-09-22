@@ -10,13 +10,39 @@ function asInt(value, fallback) {
 
 const config = {
   port: asInt(process.env.PORT, 3000),
+
   promToken: String(process.env.PROM_TOKEN || "").trim(),
-  promApiBase: String(process.env.PROM_API_BASE || "https://my.prom.ua/api/v1").replace(/\/+$/, ""),
-  bezetXmlUrl: String(process.env.BEZET_XML_URL || "").trim(),
-  militarisXmlUrl: String(process.env.MILITARIS_XML_URL || "").trim(),
-  syncIntervalHours: asInt(process.env.SYNC_INTERVAL_HOURS, 5),
-  autoAudit: asBool(process.env.AUTO_AUDIT, true),
-  httpTimeoutMs: asInt(process.env.HTTP_TIMEOUT_MS, 60000)
+
+  promApiBase: String(
+    process.env.PROM_API_BASE || "https://my.prom.ua/api/v1"
+  ).replace(/\/+$/, ""),
+
+  bezetXmlUrl: String(
+    process.env.BEZET_XML_URL ||
+    process.env.BEZET_FEED_URL ||
+    ""
+  ).trim(),
+
+  militarisXmlUrl: String(
+    process.env.MILITARIS_XML_URL ||
+    process.env.MILITARIS_FEED_URL ||
+    ""
+  ).trim(),
+
+  syncIntervalHours: asInt(
+    process.env.SYNC_INTERVAL_HOURS,
+    5
+  ),
+
+  autoAudit: asBool(
+    process.env.AUTO_AUDIT,
+    true
+  ),
+
+  httpTimeoutMs: asInt(
+    process.env.HTTP_TIMEOUT_MS,
+    60000
+  )
 };
 
 function publicConfig() {
@@ -31,4 +57,7 @@ function publicConfig() {
   };
 }
 
-module.exports = { config, publicConfig };
+module.exports = {
+  config,
+  publicConfig
+};
