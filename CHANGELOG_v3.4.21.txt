@@ -1,6 +1,0 @@
-v3.4.21 STRICT IDENTITY
-- Fixed cross-feed numeric offer-id collisions.
-- external_id / supplier id matches now require title/model corroboration.
-- Added product-type conflict rejection.
-- Added per-item Prom↔XML coherence check before variant probe.
-- Probe preview now shows matched XML product and similarity diagnostics.
