@@ -1,8 +1,0 @@
-v3.4.17 VARIANT AUDIT SYNC
-- Serializes variant audit: repeated clicks wait for the same audit instead of returning a zero-state report.
-- Retries Prom product listing up to 3 times and never overwrites a successful audit with a transient empty result.
-- Persists the successful variants audit to the Persistent Disk beside AUTO_STATE_PATH.
-- Probe forces supplier-backed audit when exact XML group_id families are not ready.
-- Probe accepts exact high-confidence XML group_id families with 2-12 positions.
-- Probe button is hidden until a successful audit contains exact XML group_id families.
-- Still no bulk variant restore.
