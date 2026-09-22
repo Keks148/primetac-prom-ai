@@ -1,5 +1,0 @@
-v3.4.8 GROUPS ALL PAGES
-- FIX: getPromGroups() paginates /groups/list with last_id.
-- FIX: group verification no longer sees only the first 100 groups.
-- UI: shows total Prom groups read and page count.
-- No change to import/write behavior.
