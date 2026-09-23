@@ -295,6 +295,22 @@ function groupSupplierOffers(offers) {
   return map;
 }
 
+function familyName(items) {
+  const found =
+    (items || []).find(
+      item =>
+        String(
+          item?.name ||
+          ""
+        ).trim()
+    );
+
+  return String(
+    found?.name ||
+    ""
+  ).trim();
+}
+
 function hasPhoto(items) {
   return (items || []).some(
     item =>
@@ -410,8 +426,7 @@ function analyzeSupplier(
         ),
 
       name:
-        items[0]?.name ||
-        "",
+        familyName(items),
 
       type:
         familyClass.type,
@@ -622,6 +637,12 @@ function buildFilteredCatalogStats(
       continue;
     }
 
+    if (
+      !familyName(items)
+    ) {
+      continue;
+    }
+
     bezetSelected.push({
       supplier: "BEZET",
       familyKey:
@@ -633,8 +654,7 @@ function buildFilteredCatalogStats(
           ""
         ),
       name:
-        items[0]?.name ||
-        "",
+        familyName(items),
       type:
         "bezet_keep_all",
       reason:

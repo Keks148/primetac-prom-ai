@@ -256,6 +256,18 @@ function mapSelectedProduct(row) {
     return bySourceCategory;
   }
 
+  if (
+    hit(text, [
+      "килт",
+      "кілт"
+    ])
+  ) {
+    return mapped(
+      GROUPS.parents.clothing,
+      "clothing_tactical_kilt"
+    );
+  }
+
   // Обувь / name-based fallback
   if (
     hit(text, [
