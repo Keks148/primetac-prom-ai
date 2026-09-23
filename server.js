@@ -648,7 +648,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.5.4",
+        "1.5.5",
       mode:
         "READ_ONLY",
       running:
@@ -666,7 +666,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.5.4",
+        "1.5.5",
       mode:
         "READ_ONLY",
       config:
@@ -930,7 +930,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.5.4 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.5.5 READ_ONLY listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
