@@ -525,6 +525,41 @@ function normalizeOffer(
         ]
       ),
 
+    description:
+      valueOf(
+        raw,
+        [
+          "description",
+          "description_ua",
+          "descriptionUa",
+          "desc",
+          "annotation"
+        ]
+      ),
+
+    country:
+      valueOf(
+        raw,
+        [
+          "country",
+          "country_of_origin",
+          "countryOfOrigin",
+          "vendorCountry"
+        ]
+      ),
+
+    barcode:
+      valueOf(
+        raw,
+        [
+          "barcode",
+          "gtin",
+          "ean",
+          "ean13",
+          "upc"
+        ]
+      ),
+
     categoryId:
       valueOf(
         raw,
