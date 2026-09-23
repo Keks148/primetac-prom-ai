@@ -93,7 +93,7 @@ function renderDashboard({
       : `
     <section>
       <h2>Аудит ще не завершено</h2>
-      <p class="muted">Сервіс сам запустить READ ONLY аудит після старту.</p>
+      <p class="muted">Сервіс сам запустить CONTROL IMPORT аудит після старту.</p>
     </section>
   `;
 
@@ -107,7 +107,7 @@ function renderDashboard({
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>PrimeTac Sync v1.6.0</title>
+<title>PrimeTac Sync v1.7.0</title>
 <style>
 :root{color-scheme:dark}*{box-sizing:border-box}body{margin:0;background:#0d1117;color:#e6edf3;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}.wrap{max-width:1100px;margin:0 auto;padding:20px}header{display:flex;justify-content:space-between;gap:16px;align-items:flex-start;flex-wrap:wrap;margin-bottom:18px}h1{margin:0 0 6px;font-size:28px}h2{margin:0 0 12px;font-size:18px}.badge{display:inline-block;padding:6px 10px;border:1px solid #3fb950;border-radius:999px;color:#3fb950;font-weight:700}.muted{color:#8b949e}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:16px}.card,section{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:16px}section{margin:12px 0}.label{color:#8b949e;font-size:13px}.value{font-size:30px;font-weight:800;margin-top:4px}.sub{color:#8b949e;font-size:12px;margin-top:4px}button{appearance:none;border:0;border-radius:10px;padding:12px 16px;background:#238636;color:white;font-weight:700;cursor:pointer}button:disabled{opacity:.55;cursor:wait}.row{display:flex;gap:18px;flex-wrap:wrap}.tablewrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:650px}th,td{text-align:left;border-bottom:1px solid #30363d;padding:10px;font-size:14px}th{color:#8b949e}.error{border-color:#f85149}pre{white-space:pre-wrap;word-break:break-word;font-size:12px}.config{font-size:12px;color:#8b949e;margin-top:8px}
 </style>
@@ -116,8 +116,8 @@ function renderDashboard({
 <div class="wrap">
 <header>
 <div>
-<h1>PrimeTac Sync v1.6.0</h1>
-<span class="badge">READ ONLY</span>
+<h1>PrimeTac Sync v1.7.0</h1>
+<span class="badge">CONTROL IMPORT</span>
 <div class="config">
 Prom token: ${config.hasPromToken ? "✓" : "✗"} ·
 BEZET XML: ${config.hasBezetXmlUrl ? "✓" : "✗"} ·
