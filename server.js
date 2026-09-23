@@ -14,15 +14,15 @@ const state = {
   lastStartedAt: null,
   lastFinishedAt: null,
   lastError: null,
-  report: null
+  report: null,
+  catalogStats: null
 };
 
 let auditPromise = null;
+let statsPromise = null;
 
 async function startAudit(reason = "manual") {
-  if (auditPromise) {
-    return auditPromise;
-  }
+  if (auditPromise) return auditPromise;
 
   state.running = true;
   state.lastStartedAt = new Date().toISOString();
@@ -30,13 +30,10 @@ async function startAudit(reason = "manual") {
 
   auditPromise = (async () => {
     try {
-      const report = await runAudit({
-        reason
-      });
+      const report = await runAudit({ reason });
 
       state.report = report;
-      state.lastFinishedAt =
-        new Date().toISOString();
+      state.lastFinishedAt = new Date().toISOString();
 
       return report;
     } catch (err) {
@@ -99,12 +96,12 @@ function availabilityStatus(offer) {
   return "unknown";
 }
 
-async function getBezetStats() {
-  const suppliers =
-    await loadSuppliers();
-
+function buildSupplierStats(
+  supplierName,
+  supplierData
+) {
   const offers =
-    suppliers.bezet.offers;
+    supplierData?.offers || [];
 
   const groups = new Map();
 
@@ -116,9 +113,7 @@ async function getBezetStats() {
         ""
       ).trim();
 
-    if (!groupId) {
-      continue;
-    }
+    if (!groupId) continue;
 
     if (!groups.has(groupId)) {
       groups.set(groupId, []);
@@ -161,8 +156,7 @@ async function getBezetStats() {
   let maxVariants = 0;
 
   const variantDistribution = {};
-
-  const examples = [];
+  const availableExamples = [];
 
   for (
     const [groupId, items]
@@ -217,32 +211,53 @@ async function getBezetStats() {
     variantDistribution[bucket] =
       (variantDistribution[bucket] || 0) + 1;
 
-    if (examples.length < 20) {
-      examples.push({
+    if (
+      hasAvailable &&
+      availableExamples.length < 20
+    ) {
+      availableExamples.push({
         groupId,
         name:
           items[0]?.name ||
+          "",
+        categoryId:
+          items[0]?.categoryId ||
           "",
         variants:
           items.length,
         availableVariants:
           statuses.filter(
-            x =>
-              x ===
+            status =>
+              status ===
               "available"
           ).length,
         unavailableVariants:
           statuses.filter(
-            x =>
-              x ===
+            status =>
+              status ===
               "unavailable"
           ).length
       });
     }
   }
 
-  const result = {
-    supplier: "BEZET",
+  return {
+    supplier:
+      supplierName,
+
+    ok:
+      Boolean(
+        supplierData?.ok
+      ),
+
+    configured:
+      Boolean(
+        supplierData?.configured
+      ),
+
+    error:
+      supplierData?.error ||
+      null,
 
     totalOffers:
       offers.length,
@@ -313,10 +328,98 @@ async function getBezetStats() {
         1000
       ),
 
-    examples
+    availableExamples
   };
+}
 
-  return result;
+async function getCatalogStats() {
+  if (statsPromise) {
+    return statsPromise;
+  }
+
+  statsPromise = (async () => {
+    const suppliers =
+      await loadSuppliers();
+
+    const bezet =
+      buildSupplierStats(
+        "BEZET",
+        suppliers.bezet
+      );
+
+    const militaris =
+      buildSupplierStats(
+        "MILITARIS",
+        suppliers.militaris
+      );
+
+    const combinedAvailableProducts =
+      bezet.availableProducts +
+      militaris.availableProducts;
+
+    const combinedRealProducts =
+      bezet.realProducts +
+      militaris.realProducts;
+
+    const combinedAvailableOffers =
+      bezet.availableOffers +
+      militaris.availableOffers;
+
+    const result = {
+      generatedAt:
+        new Date().toISOString(),
+
+      suppliers: {
+        BEZET:
+          bezet,
+
+        MILITARIS:
+          militaris
+      },
+
+      combined: {
+        realProducts:
+          combinedRealProducts,
+
+        availableProducts:
+          combinedAvailableProducts,
+
+        availableOffers:
+          combinedAvailableOffers,
+
+        fitsProm1000AvailableOnly:
+          combinedAvailableProducts <= 1000,
+
+        freeSlotsIfAvailableOnly:
+          Math.max(
+            0,
+            1000 -
+            combinedAvailableProducts
+          ),
+
+        overLimitIfAvailableOnly:
+          Math.max(
+            0,
+            combinedAvailableProducts -
+            1000
+          ),
+
+        identityRule:
+          "supplier + groupId"
+      }
+    };
+
+    state.catalogStats =
+      result;
+
+    return result;
+  })();
+
+  try {
+    return await statsPromise;
+  } finally {
+    statsPromise = null;
+  }
 }
 
 async function inspectFamily(
@@ -329,9 +432,12 @@ async function inspectFamily(
   const promProducts =
     await listProducts();
 
+  const supplierKey =
+    supplierName
+      .toUpperCase();
+
   const supplier =
-    supplierName.toUpperCase() ===
-    "BEZET"
+    supplierKey === "BEZET"
       ? suppliers.bezet
       : suppliers.militaris;
 
@@ -388,6 +494,9 @@ async function inspectFamily(
         supplierName:
           offer.name,
 
+        categoryId:
+          offer.categoryId,
+
         price:
           offer.price,
 
@@ -431,7 +540,7 @@ async function inspectFamily(
 
   return {
     supplier:
-      supplierName.toUpperCase(),
+      supplierKey,
 
     groupId:
       String(groupId),
@@ -457,7 +566,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.2.0",
+        "1.3.0",
       mode:
         "READ_ONLY",
       running:
@@ -475,7 +584,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.2.0",
+        "1.3.0",
       mode:
         "READ_ONLY",
       config:
@@ -486,15 +595,65 @@ app.get(
 );
 
 app.get(
-  "/api/bezet-stats",
+  "/api/catalog-stats",
   async (_req, res) => {
     try {
       const result =
-        await getBezetStats();
+        await getCatalogStats();
 
       res.json({
         ok: true,
         result
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
+  }
+);
+
+app.get(
+  "/api/bezet-stats",
+  async (_req, res) => {
+    try {
+      const result =
+        await getCatalogStats();
+
+      res.json({
+        ok: true,
+        result:
+          result.suppliers.BEZET
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
+  }
+);
+
+app.get(
+  "/api/militaris-stats",
+  async (_req, res) => {
+    try {
+      const result =
+        await getCatalogStats();
+
+      res.json({
+        ok: true,
+        result:
+          result.suppliers.MILITARIS
       });
     } catch (err) {
       res
@@ -607,7 +766,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.2.0 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.3.0 READ_ONLY listening on :${config.port}`
     );
 
     console.log(
@@ -650,10 +809,10 @@ app.listen(
       async () => {
         try {
           const stats =
-            await getBezetStats();
+            await getCatalogStats();
 
           console.log(
-            "[BEZET_CATALOG_STATS]"
+            "[SUPPLIER_CATALOG_STATS]"
           );
 
           console.log(
@@ -663,12 +822,13 @@ app.listen(
           );
         } catch (err) {
           console.error(
-            "[BEZET_STATS_ERROR]",
-            err.message
+            "[SUPPLIER_STATS_ERROR]",
+            err?.message ||
+            String(err)
           );
         }
       },
-      10000
+      12000
     );
   }
 );
