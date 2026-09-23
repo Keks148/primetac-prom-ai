@@ -12,34 +12,82 @@ const parser = new XMLParser({
   processEntities: true
 });
 
+const SNAPSHOT_TTL_MS =
+  15 * 60 * 1000;
+
+let snapshot = null;
+let snapshotAt = 0;
+let snapshotPromise = null;
+
 function arr(value) {
   if (value == null) return [];
-  return Array.isArray(value) ? value : [value];
+  return Array.isArray(value)
+    ? value
+    : [value];
 }
 
 function valueOf(obj, keys) {
   for (const key of keys) {
-    if (obj && obj[key] != null && String(obj[key]).trim() !== "") {
+    if (
+      obj &&
+      obj[key] != null &&
+      String(obj[key]).trim() !== ""
+    ) {
       return String(obj[key]).trim();
     }
   }
+
   return "";
 }
 
-function findOfferArrays(node, depth = 0) {
-  if (!node || typeof node !== "object" || depth > 12) return [];
+function findOfferArrays(
+  node,
+  depth = 0
+) {
+  if (
+    !node ||
+    typeof node !== "object" ||
+    depth > 12
+  ) {
+    return [];
+  }
+
   const found = [];
 
-  for (const [k, v] of Object.entries(node)) {
-    const lower = k.toLowerCase();
+  for (
+    const [k, v]
+    of Object.entries(node)
+  ) {
+    const lower =
+      k.toLowerCase();
 
-    if (["offer", "item", "product"].includes(lower)) {
-      if (Array.isArray(v)) found.push(v);
-      else if (v && typeof v === "object") found.push([v]);
+    if (
+      [
+        "offer",
+        "item",
+        "product"
+      ].includes(lower)
+    ) {
+      if (Array.isArray(v)) {
+        found.push(v);
+      } else if (
+        v &&
+        typeof v === "object"
+      ) {
+        found.push([v]);
+      }
     }
 
-    if (v && typeof v === "object") {
-      found.push(...findOfferArrays(v, depth + 1));
+    if (
+      v &&
+      typeof v === "object"
+    ) {
+      found.push(
+        ...findOfferArrays(
+          v,
+          depth + 1
+        )
+      );
     }
   }
 
@@ -47,9 +95,17 @@ function findOfferArrays(node, depth = 0) {
 }
 
 function chooseOffers(parsed) {
-  const candidates = findOfferArrays(parsed)
-    .filter(list => list.length > 0)
-    .sort((a, b) => b.length - a.length);
+  const candidates =
+    findOfferArrays(parsed)
+      .filter(
+        list =>
+          list.length > 0
+      )
+      .sort(
+        (a, b) =>
+          b.length -
+          a.length
+      );
 
   return candidates[0] || [];
 }
@@ -61,142 +117,275 @@ function extractParams(raw) {
     ...arr(raw?.param),
     ...arr(raw?.params?.param),
     ...arr(raw?.parameter),
-    ...arr(raw?.parameters?.parameter)
+    ...arr(
+      raw?.parameters?.parameter
+    )
   ];
 
   for (const p of direct) {
-    if (!p || typeof p !== "object") continue;
+    if (
+      !p ||
+      typeof p !== "object"
+    ) {
+      continue;
+    }
 
-    const name = valueOf(
-      p,
-      ["@name", "name", "@id", "id"]
-    );
+    const name =
+      valueOf(
+        p,
+        [
+          "@name",
+          "name",
+          "@id",
+          "id"
+        ]
+      );
 
-    const value = valueOf(
-      p,
-      ["#text", "value", "@value"]
-    );
+    const value =
+      valueOf(
+        p,
+        [
+          "#text",
+          "value",
+          "@value"
+        ]
+      );
 
     if (name || value) {
-      params.push({ name, value });
+      params.push({
+        name,
+        value
+      });
     }
   }
 
   return params;
 }
 
-function normalizeOffer(raw, supplier) {
+function normalizeOffer(
+  raw,
+  supplier
+) {
   return {
     supplier,
 
-    id: valueOf(
-      raw,
-      ["@id", "id", "offer_id", "offerId"]
-    ),
+    id:
+      valueOf(
+        raw,
+        [
+          "@id",
+          "id",
+          "offer_id",
+          "offerId"
+        ]
+      ),
 
-    groupId: valueOf(
-      raw,
-      [
-        "@group_id",
-        "@groupId",
-        "group_id",
-        "groupId",
-        "variation_group_id",
-        "variationGroupId"
-      ]
-    ),
+    groupId:
+      valueOf(
+        raw,
+        [
+          "@group_id",
+          "@groupId",
+          "group_id",
+          "groupId",
+          "variation_group_id",
+          "variationGroupId"
+        ]
+      ),
 
-    sku: valueOf(
-      raw,
-      [
-        "vendorCode",
-        "vendor_code",
-        "sku",
-        "SKU",
-        "article",
-        "articul",
-        "code",
-        "@sku"
-      ]
-    ),
+    sku:
+      valueOf(
+        raw,
+        [
+          "vendorCode",
+          "vendor_code",
+          "sku",
+          "SKU",
+          "article",
+          "articul",
+          "code",
+          "@sku"
+        ]
+      ),
 
-    name: valueOf(
-      raw,
-      ["name", "model", "title"]
-    ),
+    name:
+      valueOf(
+        raw,
+        [
+          "name",
+          "model",
+          "title"
+        ]
+      ),
 
-    vendor: valueOf(
-      raw,
-      ["vendor", "brand", "manufacturer"]
-    ),
+    vendor:
+      valueOf(
+        raw,
+        [
+          "vendor",
+          "brand",
+          "manufacturer"
+        ]
+      ),
 
-    categoryId: valueOf(
-      raw,
-      ["categoryId", "category_id", "@category_id"]
-    ),
+    categoryId:
+      valueOf(
+        raw,
+        [
+          "categoryId",
+          "category_id",
+          "@category_id"
+        ]
+      ),
 
-    price: valueOf(
-      raw,
-      ["price", "@price"]
-    ),
+    price:
+      valueOf(
+        raw,
+        [
+          "price",
+          "@price"
+        ]
+      ),
 
-    quantity: valueOf(
-      raw,
-      ["quantity", "stock_quantity", "stock", "count"]
-    ),
+    quantity:
+      valueOf(
+        raw,
+        [
+          "quantity",
+          "stock_quantity",
+          "stock",
+          "count"
+        ]
+      ),
 
-    available: valueOf(
-      raw,
-      ["@available", "available", "in_stock", "presence"]
-    ),
+    available:
+      valueOf(
+        raw,
+        [
+          "@available",
+          "available",
+          "in_stock",
+          "presence"
+        ]
+      ),
 
-    params: extractParams(raw)
+    params:
+      extractParams(raw)
   };
 }
 
 function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
+  return new Promise(
+    resolve =>
+      setTimeout(resolve, ms)
+  );
 }
 
 function errorDetails(err) {
-  const cause = err?.cause;
+  const cause =
+    err?.cause;
 
   return {
-    message: err?.message || String(err),
-    name: err?.name || null,
-    causeMessage: cause?.message || null,
-    causeCode: cause?.code || null,
-    causeName: cause?.name || null,
-    causeErrno: cause?.errno || null,
-    causeSyscall: cause?.syscall || null,
-    causeHostname: cause?.hostname || null,
-    causeAddress: cause?.address || null,
-    causePort: cause?.port || null
+    message:
+      err?.message ||
+      String(err),
+
+    name:
+      err?.name ||
+      null,
+
+    causeMessage:
+      cause?.message ||
+      null,
+
+    causeCode:
+      cause?.code ||
+      null,
+
+    causeName:
+      cause?.name ||
+      null,
+
+    causeErrno:
+      cause?.errno ||
+      null,
+
+    causeSyscall:
+      cause?.syscall ||
+      null,
+
+    causeHostname:
+      cause?.hostname ||
+      null,
+
+    causeAddress:
+      cause?.address ||
+      null,
+
+    causePort:
+      cause?.port ||
+      null
   };
 }
 
-async function fetchTextNative(url) {
-  const controller = new AbortController();
-  const timer = setTimeout(
-    () => controller.abort(),
-    config.httpTimeoutMs
-  );
+function refererFor(
+  supplierName
+) {
+  return supplierName ===
+    "MILITARIS"
+      ? "https://militaris.com.ua/"
+      : "https://www.bezet.com.ua/";
+}
+
+async function fetchTextNative(
+  url,
+  supplierName
+) {
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      config.httpTimeoutMs
+    );
 
   try {
-    const response = await fetch(url, {
-      signal: controller.signal,
-      redirect: "follow",
-      headers: {
-        Accept: "application/xml,text/xml,text/plain;q=0.9,*/*;q=0.8",
-        "Accept-Language": "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
-        "Cache-Control": "no-cache",
-        Pragma: "no-cache",
-        Referer: "https://www.bezet.com.ua/",
-        "User-Agent":
-          "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 " +
-          "(KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
-      }
-    });
+    const response =
+      await fetch(
+        url,
+        {
+          signal:
+            controller.signal,
+
+          redirect:
+            "follow",
+
+          headers: {
+            Accept:
+              "application/xml,text/xml,text/plain;q=0.9,*/*;q=0.8",
+
+            "Accept-Language":
+              "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
+
+            "Cache-Control":
+              "no-cache",
+
+            Pragma:
+              "no-cache",
+
+            Referer:
+              refererFor(
+                supplierName
+              ),
+
+            "User-Agent":
+              "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 " +
+              "(KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
+          }
+        }
+      );
 
     if (!response.ok) {
       throw new Error(
@@ -210,132 +399,183 @@ async function fetchTextNative(url) {
   }
 }
 
-function fetchTextHttp(url, redirectsLeft = 5) {
-  return new Promise((resolve, reject) => {
-    let parsed;
+function fetchTextHttp(
+  url,
+  supplierName,
+  redirectsLeft = 5
+) {
+  return new Promise(
+    (
+      resolve,
+      reject
+    ) => {
+      let parsed;
 
-    try {
-      parsed = new URL(url);
-    } catch (err) {
-      reject(err);
-      return;
-    }
+      try {
+        parsed =
+          new URL(url);
+      } catch (err) {
+        reject(err);
+        return;
+      }
 
-    const client =
-      parsed.protocol === "http:"
-        ? http
-        : https;
+      const client =
+        parsed.protocol ===
+          "http:"
+          ? http
+          : https;
 
-    const request = client.get(
-      parsed,
-      {
-        headers: {
-          Accept:
-            "application/xml,text/xml,text/plain;q=0.9,*/*;q=0.8",
-          "Accept-Language":
-            "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
-          "Cache-Control": "no-cache",
-          Pragma: "no-cache",
-          Referer: "https://www.bezet.com.ua/",
-          "User-Agent":
-            "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 " +
-            "(KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
-        }
-      },
-      response => {
-        const status =
-          Number(response.statusCode || 0);
+      const request =
+        client.get(
+          parsed,
+          {
+            headers: {
+              Accept:
+                "application/xml,text/xml,text/plain;q=0.9,*/*;q=0.8",
 
-        if (
-          status >= 300 &&
-          status < 400 &&
-          response.headers.location
-        ) {
-          response.resume();
+              "Accept-Language":
+                "uk-UA,uk;q=0.9,ru;q=0.8,en;q=0.7",
 
-          if (redirectsLeft <= 0) {
-            reject(
-              new Error("Too many redirects")
+              "Cache-Control":
+                "no-cache",
+
+              Pragma:
+                "no-cache",
+
+              Referer:
+                refererFor(
+                  supplierName
+                ),
+
+              "User-Agent":
+                "Mozilla/5.0 (Linux; Android 11) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/140.0 Mobile Safari/537.36"
+            }
+          },
+          response => {
+            const status =
+              Number(
+                response.statusCode ||
+                0
+              );
+
+            if (
+              status >= 300 &&
+              status < 400 &&
+              response.headers.location
+            ) {
+              response.resume();
+
+              if (
+                redirectsLeft <= 0
+              ) {
+                reject(
+                  new Error(
+                    "Too many redirects"
+                  )
+                );
+                return;
+              }
+
+              const nextUrl =
+                new URL(
+                  response.headers.location,
+                  parsed
+                ).toString();
+
+              fetchTextHttp(
+                nextUrl,
+                supplierName,
+                redirectsLeft - 1
+              ).then(
+                resolve,
+                reject
+              );
+
+              return;
+            }
+
+            if (
+              status < 200 ||
+              status >= 300
+            ) {
+              response.resume();
+
+              reject(
+                new Error(
+                  `HTTP ${status} ${response.statusMessage || ""}`.trim()
+                )
+              );
+
+              return;
+            }
+
+            response.setEncoding(
+              "utf8"
             );
-            return;
+
+            let body = "";
+
+            response.on(
+              "data",
+              chunk => {
+                body += chunk;
+              }
+            );
+
+            response.on(
+              "end",
+              () =>
+                resolve(body)
+            );
           }
+        );
 
-          const nextUrl = new URL(
-            response.headers.location,
-            parsed
-          ).toString();
-
-          fetchTextHttp(
-            nextUrl,
-            redirectsLeft - 1
-          ).then(resolve, reject);
-
-          return;
-        }
-
-        if (status < 200 || status >= 300) {
-          response.resume();
-
-          reject(
+      request.setTimeout(
+        config.httpTimeoutMs,
+        () => {
+          request.destroy(
             new Error(
-              `HTTP ${status} ${response.statusMessage || ""}`.trim()
+              `Request timeout after ${config.httpTimeoutMs}ms`
             )
           );
-
-          return;
         }
+      );
 
-        response.setEncoding("utf8");
-
-        let body = "";
-
-        response.on(
-          "data",
-          chunk => {
-            body += chunk;
-          }
-        );
-
-        response.on(
-          "end",
-          () => resolve(body)
-        );
-      }
-    );
-
-    request.setTimeout(
-      config.httpTimeoutMs,
-      () => {
-        request.destroy(
-          new Error(
-            `Request timeout after ${config.httpTimeoutMs}ms`
-          )
-        );
-      }
-    );
-
-    request.on(
-      "error",
-      reject
-    );
-  });
+      request.on(
+        "error",
+        reject
+      );
+    }
+  );
 }
 
-async function fetchText(url, supplierName) {
+async function fetchText(
+  url,
+  supplierName
+) {
   let lastError = null;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
+  for (
+    let attempt = 1;
+    attempt <= 3;
+    attempt++
+  ) {
     try {
       console.log(
         `[${supplierName}_FETCH_ATTEMPT]`,
         JSON.stringify({
           attempt,
-          method: "fetch",
+          method:
+            "fetch",
           url
         })
       );
 
-      return await fetchTextNative(url);
+      return await fetchTextNative(
+        url,
+        supplierName
+      );
     } catch (err) {
       lastError = err;
 
@@ -343,13 +583,17 @@ async function fetchText(url, supplierName) {
         `[${supplierName}_FETCH_ATTEMPT_ERROR]`,
         JSON.stringify({
           attempt,
-          method: "fetch",
+          method:
+            "fetch",
           ...errorDetails(err)
         })
       );
 
       if (attempt < 3) {
-        await sleep(attempt * 1500);
+        await sleep(
+          attempt *
+          1500
+        );
       }
     }
   }
@@ -358,19 +602,24 @@ async function fetchText(url, supplierName) {
     console.log(
       `[${supplierName}_FETCH_FALLBACK]`,
       JSON.stringify({
-        method: "https/http",
+        method:
+          "https/http",
         url
       })
     );
 
-    return await fetchTextHttp(url);
+    return await fetchTextHttp(
+      url,
+      supplierName
+    );
   } catch (err) {
     lastError = err;
 
     console.error(
       `[${supplierName}_FETCH_FALLBACK_ERROR]`,
       JSON.stringify({
-        method: "https/http",
+        method:
+          "https/http",
         ...errorDetails(err)
       })
     );
@@ -379,7 +628,10 @@ async function fetchText(url, supplierName) {
   throw lastError;
 }
 
-async function loadSupplier(name, url) {
+async function loadSupplier(
+  name,
+  url
+) {
   if (!url) {
     return {
       supplier: name,
@@ -418,15 +670,23 @@ async function loadSupplier(name, url) {
     );
 
     return {
-      supplier: name,
-      configured: true,
-      ok: true,
-      error: null,
+      supplier:
+        name,
+
+      configured:
+        true,
+
+      ok:
+        true,
+
+      error:
+        null,
+
       offers:
         rawOffers.map(
-          x =>
+          item =>
             normalizeOffer(
-              x,
+              item,
               name
             )
         )
@@ -444,22 +704,30 @@ async function loadSupplier(name, url) {
     );
 
     return {
-      supplier: name,
-      configured: true,
-      ok: false,
-      error: [
-        details.message,
-        details.causeCode,
-        details.causeMessage
-      ]
-        .filter(Boolean)
-        .join(" | "),
+      supplier:
+        name,
+
+      configured:
+        true,
+
+      ok:
+        false,
+
+      error:
+        [
+          details.message,
+          details.causeCode,
+          details.causeMessage
+        ]
+          .filter(Boolean)
+          .join(" | "),
+
       offers: []
     };
   }
 }
 
-async function loadSuppliers() {
+async function fetchSnapshot() {
   const [bezet, militaris] =
     await Promise.all([
       loadSupplier(
@@ -473,12 +741,94 @@ async function loadSuppliers() {
       )
     ]);
 
-  return {
+  const result = {
     bezet,
     militaris
   };
+
+  // Даже если один поставщик временно ошибся,
+  // короткий кэш лучше, чем долбить 85 МБ XML
+  // четырьмя параллельными аудитами.
+  snapshot =
+    result;
+
+  snapshotAt =
+    Date.now();
+
+  console.log(
+    "[SUPPLIERS_SNAPSHOT_READY]",
+    JSON.stringify({
+      ttlMinutes:
+        SNAPSHOT_TTL_MS /
+        60000,
+      bezetOffers:
+        bezet.offers.length,
+      militarisOffers:
+        militaris.offers.length
+    })
+  );
+
+  return result;
+}
+
+async function loadSuppliers(
+  options = {}
+) {
+  const forceRefresh =
+    Boolean(
+      options.forceRefresh
+    );
+
+  const age =
+    Date.now() -
+    snapshotAt;
+
+  if (
+    !forceRefresh &&
+    snapshot &&
+    age >= 0 &&
+    age < SNAPSHOT_TTL_MS
+  ) {
+    console.log(
+      "[SUPPLIERS_CACHE_HIT]",
+      JSON.stringify({
+        ageSeconds:
+          Math.floor(
+            age / 1000
+          )
+      })
+    );
+
+    return snapshot;
+  }
+
+  if (
+    snapshotPromise
+  ) {
+    console.log(
+      "[SUPPLIERS_CACHE_JOIN]"
+    );
+
+    return snapshotPromise;
+  }
+
+  snapshotPromise =
+    fetchSnapshot();
+
+  try {
+    return await snapshotPromise;
+  } finally {
+    snapshotPromise =
+      null;
+  }
+}
+
+function clearSupplierCache() {
+  snapshot = null;
+  snapshotAt = 0;
 }
 
 module.exports = {
-  loadSuppliers
+  loadSuppliers,
+  clearSupplierCache
 };
