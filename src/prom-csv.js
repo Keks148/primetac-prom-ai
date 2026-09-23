@@ -217,7 +217,7 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
   ];
   const csvRows=[csvRow(headers)], preview=[], familyKeys=[], externalIds=[], productCodes=[];
   const usedExternalIds=new Set(), usedCodes=new Set();
-  let resolvedExternalIdCollisions=0, realVariantFamilies=0, collapsedCodeOnlyFamilies=0, skippedAmbiguousFamilies=0, singleFamilies=0;
+  let resolvedExternalIdCollisions=0, realVariantFamilies=0, collapsedCodeOnlyFamilies=0, skippedAmbiguousFamilies=0, singleFamilies=0, filteredOutOfStockVariants=0;
   for (const row of rows) {
     const mapping=mapSelectedProduct(row), target=String(mapping.groupId||"");
     if(mapping.status!=="MAPPED" || !allowed.has(target)) continue;
@@ -227,10 +227,27 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
     const variant=familyVariantMode(allOffers);
     if(variant.mode==="ambiguous") { skippedAmbiguousFamilies++; continue; }
     const variantNames=variant.variantNames;
-    const offers=variant.mode==="real" ? dedupeVariants(allOffers,variantNames) : [allOffers[0]];
-    if(variant.mode==="real") realVariantFamilies++;
-    else if(variant.mode==="collapsed_code_only") collapsedCodeOnlyFamilies++;
-    else singleFamilies++;
+
+    // Prom can show a grouped child as "В наявності, 0 шт." when an
+    // unavailable source offer is sent together with available variants.
+    // Do not create zero-stock variants at all. Only export offers that the
+    // supplier currently marks as available.
+    const availableOffers=allOffers.filter(isAvailable);
+    if(!availableOffers.length) continue;
+    filteredOutOfStockVariants += allOffers.length - availableOffers.length;
+
+    let offers;
+    if(variant.mode==="real") {
+      offers=dedupeVariants(availableOffers,variantNames);
+      realVariantFamilies++;
+    } else if(variant.mode==="collapsed_code_only") {
+      // Pick an available representative for code-only clones.
+      offers=[availableOffers[0]];
+      collapsedCodeOnlyFamilies++;
+    } else {
+      offers=[availableOffers[0]];
+      singleFamilies++;
+    }
     let emitted=0;
     for (let variantIndex=0; variantIndex<offers.length; variantIndex++) {
       const offer=offers[variantIndex];
@@ -269,7 +286,7 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
   const csv="\ufeff"+csvRows.join("\r\n");
   const externalIdsUnique=new Set(externalIds).size===externalIds.length;
   const productCodesUnique=new Set(productCodes).size===productCodes.length;
-  const summary={mode,requestedFamilies:rows.length,exportedFamilies:familyKeys.length,exportedRows:csvRows.length-1,csvBytes:Buffer.byteLength(csv,"utf8"),targetGroups:[...new Set(preview.map(x=>x.targetGroupId))],allTargetsExist:preview.every(x=>allowed.has(String(x.targetGroupId))),externalIdsUnique,productCodesUnique,resolvedExternalIdCollisions,realVariantFamilies,collapsedCodeOnlyFamilies,skippedAmbiguousFamilies,singleFamilies,familyKeys,externalIds,preview};
+  const summary={mode,requestedFamilies:rows.length,exportedFamilies:familyKeys.length,exportedRows:csvRows.length-1,csvBytes:Buffer.byteLength(csv,"utf8"),targetGroups:[...new Set(preview.map(x=>x.targetGroupId))],allTargetsExist:preview.every(x=>allowed.has(String(x.targetGroupId))),externalIdsUnique,productCodesUnique,resolvedExternalIdCollisions,realVariantFamilies,collapsedCodeOnlyFamilies,skippedAmbiguousFamilies,singleFamilies,filteredOutOfStockVariants,familyKeys,externalIds,preview};
   if(summary.exportedFamilies<=0 || summary.exportedRows<=0 || !summary.allTargetsExist || !summary.externalIdsUnique || !summary.productCodesUnique) throw new Error(`PROM CSV validation failed: ${JSON.stringify(summary)}`);
   return {csv,summary};
 }
