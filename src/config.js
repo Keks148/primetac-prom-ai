@@ -20,7 +20,7 @@ const config = {
   bezetXmlUrl: String(
     process.env.BEZET_XML_URL ||
     process.env.BEZET_FEED_URL ||
-    ""
+    "https://www.bezet.com.ua/sync/prom-second"
   ).trim(),
 
   militarisXmlUrl: String(
@@ -41,7 +41,7 @@ const config = {
 
   httpTimeoutMs: asInt(
     process.env.HTTP_TIMEOUT_MS,
-    60000
+    300000
   )
 };
 
