@@ -42,6 +42,12 @@ function externalProductId(supplier, sourceOfferId) {
   return String(prefix + (h % 899999999));
 }
 
+function additionalExternalProductId(supplier, key) {
+  const h = crypto.createHash("sha256").update(`${supplier}:${key}`).digest().readUInt32BE(0);
+  const prefix = supplier === "BEZET" ? 300000000 : 700000000;
+  return String(prefix + (h % 199999999));
+}
+
 function variantGroupId(supplier, sourceGroupId) {
   const digits = String(sourceGroupId ?? "").replace(/\D+/g, "");
   const prefix = supplier === "BEZET" ? 100000000 : 500000000;
@@ -89,8 +95,7 @@ function variantSignature(offer,names) {
 
 function dedupeVariants(offers,names) {
   if (!names.length) {
-    const available = offers.find(isAvailable);
-    return [available || offers[0]].filter(Boolean);
+    return [...offers].sort((a,b)=>Number(isAvailable(b))-Number(isAvailable(a)));
   }
   const seen=new Set(), out=[];
   for (const offer of [...offers].sort((a,b)=>Number(isAvailable(b))-Number(isAvailable(a)))) {
@@ -142,6 +147,23 @@ function staticParams(offer,variantNames) {
     .filter(p=>p.name && p.value && !set.has(p.name.toLowerCase())).slice(0,5);
 }
 
+function uniqueProductCode(offer, supplier, externalId, usedCodes) {
+  let base = clean(offer?.sku).replace(/[^A-Za-zА-Яа-яІіЇїЄєҐґ0-9._-]+/gu, "-").slice(0,25);
+  if(!base) base = `${supplier === "BEZET" ? "B" : "M"}-${externalId}`.slice(0,25);
+  let code = base;
+  if(usedCodes.has(code)) {
+    const tail = String(externalId).slice(-6);
+    code = `${base.slice(0,Math.max(1,24-tail.length))}-${tail}`;
+  }
+  let i=2;
+  while(usedCodes.has(code)) {
+    const suffix=`-${i++}`;
+    code=`${base.slice(0,25-suffix.length)}${suffix}`;
+  }
+  usedCodes.add(code);
+  return code;
+}
+
 function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,testLimit=20}) {
   const eMap=enrichmentMap(enrichmentItems);
   const allowed=new Set((promGroups||[]).map(g=>String(g?.id)));
@@ -153,23 +175,42 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
     "Наявність","Виробник","Країна_виробник","HTML_заголовок","HTML_заголовок_укр","HTML_опис","HTML_опис_укр",
     "Номер_групи","Код_маркування_(GTIN)","Ідентифікатор_товару","ID_групи_різновидів",...triples
   ];
-  const csvRows=[csvRow(headers)], preview=[], familyKeys=[], externalIds=[];
+  const csvRows=[csvRow(headers)], preview=[], familyKeys=[], externalIds=[], productCodes=[];
+  const usedExternalIds=new Set(), usedCodes=new Set();
+  let resolvedExternalIdCollisions=0, realVariantFamilies=0, fallbackVariantFamilies=0, singleFamilies=0;
   for (const row of rows) {
     const mapping=mapSelectedProduct(row), target=String(mapping.groupId||"");
     if(mapping.status!=="MAPPED" || !allowed.has(target)) continue;
     const enrich=eMap.get(row.familyKey);
     if(!enrich?.content?.descriptionRu || !enrich?.content?.descriptionUa) continue;
     const allOffers=familyOffers(suppliers,row); if(!allOffers.length) continue;
-    const variantNames=chooseVariantParams(allOffers), offers=dedupeVariants(allOffers,variantNames);
+    const realVariantNames=chooseVariantParams(allOffers);
+    const fallbackVariant=allOffers.length>1 && realVariantNames.length===0;
+    const variantNames=fallbackVariant?["Варіант"]:realVariantNames;
+    const offers=dedupeVariants(allOffers,realVariantNames);
+    if(fallbackVariant) fallbackVariantFamilies++; else if(realVariantNames.length) realVariantFamilies++; else singleFamilies++;
     let emitted=0;
-    for (const offer of offers) {
+    for (let variantIndex=0; variantIndex<offers.length; variantIndex++) {
+      const offer=offers[variantIndex];
       const price=num(offer?.price), pics=pictures(offer,enrich.dynamic?.pictures||[]);
       const sourceName=clean(enrich.content.titleRu || row.name || offer.name), uaName=clean(enrich.content.titleUa || sourceName);
       if(!sourceName || price==null || price<=0 || !pics.length) continue;
-      const extId=externalProductId(row.supplier,offer.id || `${row.groupId}-${offer.sku}`);
-      const sku=clean(offer.sku).slice(0,25), available=isAvailable(offer), vm=paramMap(offer);
+      const sourceKey=offer.id || `${row.groupId}-${offer.sku}`;
+      let extId=externalProductId(row.supplier,sourceKey);
+      if(usedExternalIds.has(extId)) {
+        resolvedExternalIdCollisions++;
+        const baseKey=`${row.familyKey}|${sourceKey}|${clean(offer.sku)}|${variantIndex}`;
+        extId=additionalExternalProductId(row.supplier,baseKey);
+        let salt=2;
+        while(usedExternalIds.has(extId)) extId=additionalExternalProductId(row.supplier,`${baseKey}|${salt++}`);
+      }
+      usedExternalIds.add(extId);
+      const sku=uniqueProductCode(offer,row.supplier,extId,usedCodes), available=isAvailable(offer), vm=paramMap(offer);
       const params=[];
-      for(const name of variantNames){const pair=vm.get(name.toLowerCase()); if(pair) params.push(pair);}
+      for(const name of variantNames){
+        if(fallbackVariant && name==="Варіант") params.push({name:"Варіант",value:clean(offer.sku || offer.id || String(variantIndex+1))});
+        else { const pair=vm.get(name.toLowerCase()); if(pair) params.push(pair); }
+      }
       params.push(...staticParams(offer,variantNames)); while(params.length<8) params.push({name:"",value:""});
       const charCells=params.slice(0,8).flatMap(p=>[p.name,"",p.value]);
       const brand=clean(offer.vendor || enrich.content?.source?.brand), country=clean(offer.country || enrich.content?.source?.country), gtin=clean(offer.barcode || enrich.content?.source?.barcode);
@@ -180,13 +221,15 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
         brand,country,enrich.content?.seo?.titleRu||"",enrich.content?.seo?.titleUa||"",enrich.content?.seo?.descriptionRu||"",enrich.content?.seo?.descriptionUa||"",
         target,gtin,extId,variantNames.length?variantGroupId(row.supplier,row.groupId):"",...charCells
       ]));
-      externalIds.push(extId); emitted++;
+      externalIds.push(extId); productCodes.push(sku); emitted++;
     }
-    if(emitted){familyKeys.push(row.familyKey); preview.push({familyKey:row.familyKey,supplier:row.supplier,name:enrich.content.titleRu||row.name,targetGroupId:Number(target),sourceVariants:allOffers.length,exportedRows:emitted,variantParams:variantNames});}
+    if(emitted){familyKeys.push(row.familyKey); preview.push({familyKey:row.familyKey,supplier:row.supplier,name:enrich.content.titleRu||row.name,targetGroupId:Number(target),sourceVariants:allOffers.length,exportedRows:emitted,variantMode:fallbackVariant?"fallback":(realVariantNames.length?"real":"single"),variantParams:variantNames});}
   }
   const csv="\ufeff"+csvRows.join("\r\n");
-  const summary={mode,requestedFamilies:rows.length,exportedFamilies:familyKeys.length,exportedRows:csvRows.length-1,csvBytes:Buffer.byteLength(csv,"utf8"),targetGroups:[...new Set(preview.map(x=>x.targetGroupId))],allTargetsExist:preview.every(x=>allowed.has(String(x.targetGroupId))),familyKeys,externalIds,preview};
-  if(summary.exportedFamilies<=0 || summary.exportedRows<=0 || !summary.allTargetsExist) throw new Error(`PROM CSV validation failed: ${JSON.stringify(summary)}`);
+  const externalIdsUnique=new Set(externalIds).size===externalIds.length;
+  const productCodesUnique=new Set(productCodes).size===productCodes.length;
+  const summary={mode,requestedFamilies:rows.length,exportedFamilies:familyKeys.length,exportedRows:csvRows.length-1,csvBytes:Buffer.byteLength(csv,"utf8"),targetGroups:[...new Set(preview.map(x=>x.targetGroupId))],allTargetsExist:preview.every(x=>allowed.has(String(x.targetGroupId))),externalIdsUnique,productCodesUnique,resolvedExternalIdCollisions,realVariantFamilies,fallbackVariantFamilies,singleFamilies,familyKeys,externalIds,preview};
+  if(summary.exportedFamilies<=0 || summary.exportedRows<=0 || !summary.allTargetsExist || !summary.externalIdsUnique || !summary.productCodesUnique) throw new Error(`PROM CSV validation failed: ${JSON.stringify(summary)}`);
   return {csv,summary};
 }
 

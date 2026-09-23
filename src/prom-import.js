@@ -28,7 +28,7 @@ async function submitCsvControlTest({enabled,feedUrl,summary,groupCountBefore,pr
   const state=readState();
   if(!enabled) return {skipped:true,reason:"PROM_CSV_TEST_IMPORT_ON_START is disabled"};
   if(state.controlCsvV1?.submitted) return {skipped:true,reason:"CSV control test already submitted",state:state.controlCsvV1};
-  if(summary.exportedFamilies!==20 || summary.exportedRows<20 || !summary.allTargetsExist) throw new Error(`Unsafe CSV control feed: ${JSON.stringify(summary)}`);
+  if(summary.exportedFamilies!==20 || summary.exportedRows<20 || !summary.allTargetsExist || !summary.externalIdsUnique || !summary.productCodesUnique) throw new Error(`Unsafe CSV control feed: ${JSON.stringify(summary)}`);
   const response=await startImportUrl(feedUrl); const id=response?.id||response?.import_id||response?.job_id||null;
   if(!id) throw new Error(`Prom import did not return job id: ${JSON.stringify(response)}`);
   state.controlCsvV1={submitted:true,completed:false,submittedAt:new Date().toISOString(),importId:id,feedUrl,groupCountBefore,productCountBefore,expectedFamilies:summary.exportedFamilies,expectedRows:summary.exportedRows,targetGroups:summary.targetGroups,familyKeys:summary.familyKeys,externalIds:summary.externalIds,startResponse:response};
