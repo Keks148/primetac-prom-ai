@@ -700,7 +700,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.8.3",
+        "1.8.4",
       mode:
         "READ_ONLY",
       running:
@@ -718,7 +718,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.8.3",
+        "1.8.4",
       mode:
         "READ_ONLY",
       config:
@@ -1114,7 +1114,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.8.3 VARIANT_DEDUP_FIX listening on :${config.port}`
+      `[PrimeTac Sync] v1.8.4 STOCK_FILTER_FIX listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [

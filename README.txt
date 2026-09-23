@@ -17,3 +17,9 @@ PrimeTac Variant Dedup Fix v1.8.3
 ВАЖНО:
 PROM_CSV_TEST_IMPORT_ON_START оставить false до проверки /feeds/prom-test.csv.
 Уже созданные в Prom лишние разновидности автоматически не удаляются этой версией. Сначала проверяем новый CSV, затем отдельно чистим старые дубли.
+
+
+v1.8.4 STOCK_FILTER_FIX:
+- Unavailable source variants are not exported into Prom CSV.
+- Prevents grouped variants showing "In stock, 0 pcs".
+- Code-only clone collapse remains enabled.
