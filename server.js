@@ -601,7 +601,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.4.3",
+        "1.4.4",
       mode:
         "READ_ONLY",
       running:
@@ -619,7 +619,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.4.3",
+        "1.4.4",
       mode:
         "READ_ONLY",
       config:
@@ -835,42 +835,149 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.4.3 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.4.4 READ_ONLY listening on :${config.port}`
     );
 
+    const KYIV_SLOTS = [
+      4,
+      8,
+      11,
+      14,
+      17,
+      20,
+      23
+    ];
+
     console.log(
-      `[PrimeTac Sync] audit interval: ${config.syncIntervalHours}h`
+      `[PrimeTac Sync] schedule Europe/Kyiv: ${KYIV_SLOTS.map(h => String(h).padStart(2, "0") + ":00").join(", ")}`
     );
+
+    function kyivParts(date = new Date()) {
+      const parts =
+        new Intl.DateTimeFormat(
+          "en-CA",
+          {
+            timeZone:
+              "Europe/Kyiv",
+            year:
+              "numeric",
+            month:
+              "2-digit",
+            day:
+              "2-digit",
+            hour:
+              "2-digit",
+            minute:
+              "2-digit",
+            hourCycle:
+              "h23"
+          }
+        )
+          .formatToParts(date)
+          .reduce(
+            (acc, item) => {
+              if (
+                item.type !==
+                "literal"
+              ) {
+                acc[item.type] =
+                  item.value;
+              }
+
+              return acc;
+            },
+            {}
+          );
+
+      return {
+        year:
+          parts.year,
+        month:
+          parts.month,
+        day:
+          parts.day,
+        hour:
+          Number(parts.hour),
+        minute:
+          Number(parts.minute)
+      };
+    }
+
+    let lastScheduledSlot =
+      null;
+
+    async function runScheduledCycle(
+      reason
+    ) {
+      try {
+        await startAudit(
+          reason
+        );
+
+        const filtered =
+          await getFilteredStats();
+
+        console.log(
+          "[SCHEDULED_FILTERED_CATALOG_STATS]"
+        );
+
+        console.log(
+          JSON.stringify(
+            filtered
+          )
+        );
+      } catch (err) {
+        console.error(
+          "[PrimeTac Sync] scheduled cycle failed:",
+          err?.message ||
+          String(err)
+        );
+      }
+    }
 
     if (
       config.autoAudit
     ) {
       setTimeout(() => {
-        startAudit(
+        runScheduledCycle(
           "startup"
-        ).catch(err => {
-          console.error(
-            "[PrimeTac Sync] startup audit failed:",
-            err.message
-          );
-        });
+        );
       }, 3000);
 
-      setInterval(() => {
-        startAudit(
-          "scheduled"
-        ).catch(err => {
-          console.error(
-            "[PrimeTac Sync] scheduled audit failed:",
-            err.message
+      // Проверяем часы по Киеву раз в минуту.
+      // Окно 10 минут защищает от пропуска слота после холодного старта Render.
+      setInterval(
+        () => {
+          const now =
+            kyivParts();
+
+          if (
+            !KYIV_SLOTS.includes(
+              now.hour
+            ) ||
+            now.minute > 9
+          ) {
+            return;
+          }
+
+          const slotKey =
+            `${now.year}-${now.month}-${now.day}-${String(now.hour).padStart(2, "0")}`;
+
+          if (
+            slotKey ===
+            lastScheduledSlot
+          ) {
+            return;
+          }
+
+          lastScheduledSlot =
+            slotKey;
+
+          runScheduledCycle(
+            `scheduled-${slotKey}`
           );
-        });
-      },
-      config
-        .syncIntervalHours *
-        60 *
-        60 *
-        1000
+        },
+        60 * 1000
       );
     }
 
