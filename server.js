@@ -8,6 +8,7 @@ const { listProducts, listGroups } = require("./src/prom");
 const { buildFilteredCatalogStats } = require("./src/catalog-filter");
 const { buildGroupMappingAudit } = require("./src/group-mapper");
 const { buildCategoryAudit } = require("./src/category-audit");
+const { refreshEnrichment } = require("./src/enrichment");
 
 const app = express();
 app.disable("x-powered-by");
@@ -19,7 +20,8 @@ const state = {
   lastError: null,
   report: null,
   catalogStats: null,
-  filteredStats: null
+  filteredStats: null,
+  enrichmentStats: null
 };
 
 let auditPromise = null;
@@ -504,6 +506,39 @@ async function getGroupMappingAudit() {
   );
 }
 
+async function getEnrichmentCatalog() {
+  const suppliers =
+    await loadSuppliers();
+
+  const filtered =
+    buildFilteredCatalogStats(
+      suppliers,
+      {
+        minPrice: 500,
+        maxMilitarisAccessories: 40,
+        maxCards: 1000,
+        includeRows: true
+      }
+    );
+
+  const promGroups =
+    await listGroups();
+
+  const result =
+    refreshEnrichment({
+      suppliers,
+      selectedRows:
+        filtered.selectedRows ||
+        [],
+      promGroups
+    });
+
+  state.enrichmentStats =
+    result.summary;
+
+  return result;
+}
+
 async function inspectFamily(
   supplierName,
   groupId
@@ -648,7 +683,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.5.5",
+        "1.6.0",
       mode:
         "READ_ONLY",
       running:
@@ -666,13 +701,77 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.5.5",
+        "1.6.0",
       mode:
         "READ_ONLY",
       config:
         publicConfig(),
       state
     });
+  }
+);
+
+app.get(
+  "/api/enrichment-stats",
+  async (_req, res) => {
+    try {
+      const result =
+        await getEnrichmentCatalog();
+
+      res.json({
+        ok: true,
+        result:
+          result.summary
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
+  }
+);
+
+app.get(
+  "/api/enrichment-preview",
+  async (req, res) => {
+    try {
+      const result =
+        await getEnrichmentCatalog();
+
+      const limit =
+        Math.max(
+          1,
+          Math.min(
+            30,
+            Number(
+              req.query.limit
+            ) || 10
+          )
+        );
+
+      res.json({
+        ok: true,
+        summary:
+          result.summary,
+        items:
+          result.items
+            .slice(0, limit)
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
   }
 );
 
@@ -930,7 +1029,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.5.5 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.6.0 READ_ONLY listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
@@ -1019,6 +1118,19 @@ app.listen(
         console.log(
           JSON.stringify(
             filtered
+          )
+        );
+
+        const enrichment =
+          await getEnrichmentCatalog();
+
+        console.log(
+          "[ENRICHMENT_SYNC]"
+        );
+
+        console.log(
+          JSON.stringify(
+            enrichment.summary
           )
         );
       } catch (err) {
@@ -1152,6 +1264,32 @@ app.listen(
         }
       },
       35000
+    );
+
+    setTimeout(
+      async () => {
+        try {
+          const enrichment =
+            await getEnrichmentCatalog();
+
+          console.log(
+            "[ENRICHMENT_STARTUP]"
+          );
+
+          console.log(
+            JSON.stringify(
+              enrichment.summary
+            )
+          );
+        } catch (err) {
+          console.error(
+            "[ENRICHMENT_STARTUP_ERROR]",
+            err?.message ||
+            String(err)
+          );
+        }
+      },
+      45000
     );
 
     setTimeout(
