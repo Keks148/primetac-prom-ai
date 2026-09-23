@@ -11,6 +11,7 @@ const { buildCategoryAudit } = require("./src/category-audit");
 const { refreshEnrichment } = require("./src/enrichment");
 const { buildCsvFeed } = require("./src/prom-csv");
 const { submitCsvControlTest, readState } = require("./src/prom-import");
+const { auditPromPlacement } = require("./src/prom-placement-audit");
 
 const app = express();
 app.disable("x-powered-by");
@@ -699,7 +700,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.8.1",
+        "1.8.3",
       mode:
         "READ_ONLY",
       running:
@@ -717,7 +718,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.8.1",
+        "1.8.3",
       mode:
         "READ_ONLY",
       config:
@@ -762,6 +763,30 @@ app.get(
       res.json({ok:true,format:"CSV",mode,summary:feed.summary});
     } catch (err) {
       res.status(500).json({ok:false,error:err?.message || String(err)});
+    }
+  }
+);
+
+app.get(
+  "/api/prom-placement-audit",
+  async (_req, res) => {
+    try {
+      const result =
+        await auditPromPlacement();
+
+      res.json({
+        ok: true,
+        result
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
     }
   }
 );
@@ -1089,7 +1114,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.8.1 CSV_CONTROL_IMPORT listening on :${config.port}`
+      `[PrimeTac Sync] v1.8.3 VARIANT_DEDUP_FIX listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
@@ -1324,6 +1349,32 @@ app.listen(
         }
       },
       35000
+    );
+
+    setTimeout(
+      async () => {
+        try {
+          const placement =
+            await auditPromPlacement();
+
+          console.log(
+            "[PROM_VARIANT_DEDUP_FIX]"
+          );
+
+          console.log(
+            JSON.stringify(
+              placement
+            )
+          );
+        } catch (err) {
+          console.error(
+            "[PROM_VARIANT_DEDUP_FIX_ERROR]",
+            err?.message ||
+            String(err)
+          );
+        }
+      },
+      25000
     );
 
     setTimeout(
