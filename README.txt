@@ -1,63 +1,21 @@
-PrimeTac Control Import v1.7.0
+PrimeTac CSV Control Import v1.8.0
 
-Что делает
-----------
-1. Формирует тестовый YML из 20 карточек:
-   /feeds/prom-test.yml
+Причина перехода на CSV:
+Первый YML-контроль реально создал тестовые товары, но Prom также создал новые дублирующие группы. В кабинете стало 84 группы вместо исходных 60.
 
-2. Формирует полный YML текущего выбранного каталога:
-   /feeds/prom-full.yml
+CSV использует поле Номер_групи с существующим ID группы Prom и не передает дерево групп, поэтому не должен плодить новые группы.
 
-3. Предпросмотр:
-   /api/prom-feed-preview?mode=test
-   /api/prom-feed-preview?mode=full
+Также исправлено наличие: если поставщик говорит, что товар есть, но точный остаток пустой, передаем Кількість=1 и Наявність=+.
 
-4. Контрольная выгрузка НЕ запускается сама по умолчанию.
-   Для однократного запуска используется Render env:
-   PROM_TEST_IMPORT_ON_START=true
+Endpoints:
+/feeds/prom-test.csv
+/feeds/prom-full.csv
+/api/prom-feed-preview?mode=test
+/api/prom-import-state
 
-5. Защита от повторного тестового импорта:
-   /var/data/primetac-prom-import-state.json
-   После успешного control test v1 повторный restart/deploy не запустит его снова.
+Безопасность:
+PROM_CSV_TEST_IMPORT_ON_START=false по умолчанию.
+Сначала проверить лог [PROM_CSV_TEST_FEED_AUDIT].
+Только после проверки включить PROM_CSV_TEST_IMPORT_ON_START=true один раз.
 
-6. Тестовый импорт использует официальный Prom API endpoint:
-   POST /products/import_url
-   и затем проверяет
-   GET /products/import/status/{id}
-
-7. Для теста:
-   - mark_missing_product_as = none
-   - существующие/отсутствующие товары не трогаются
-   - только 20 выбранных карточек
-   - разновидности имеют одинаковый group_id
-   - используются существующие ID групп Prom
-   - фото, описания UA/RU, keywords, характеристики, цена, наличие и остатки передаются в YML
-
-8. После SUCCESS 20 тестовых карточек помечаются в enrichment-cache как published.
-   Дальнейшие обычные обновления смогут работать в DYNAMIC_ONLY.
-
-ВАЖНО
------
-Сразу после deploy оставляем:
-PROM_TEST_IMPORT_ON_START=false
-
-Сначала проверяем:
-- /api/prom-feed-preview?mode=test
-- /feeds/prom-test.yml
-- что exportedFamilies = 20
-- что группы существуют
-- что XML валиден
-
-Только затем включаем PROM_TEST_IMPORT_ON_START=true.
-После успешного импорта переменную снова выключаем.
-
-Файлы
------
-Залить архив целиком.
-Новые:
-- src/prom-feed.js
-- src/prom-import.js
-
-Изменены:
-- server.js
-- src/ui.js
+Важно: v1.8.0 не удаляет автоматически 24 уже созданные YML-дубли групп. Сначала проверяем CSV на существующих группах. После этого лишние пустые группы можно удалить отдельно.

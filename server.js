@@ -9,8 +9,8 @@ const { buildFilteredCatalogStats } = require("./src/catalog-filter");
 const { buildGroupMappingAudit } = require("./src/group-mapper");
 const { buildCategoryAudit } = require("./src/category-audit");
 const { refreshEnrichment } = require("./src/enrichment");
-const { buildPromFeed } = require("./src/prom-feed");
-const { runControlTestOnce, readState } = require("./src/prom-import");
+const { buildCsvFeed } = require("./src/prom-csv");
+const { submitCsvControlTest, readState } = require("./src/prom-import");
 
 const app = express();
 app.disable("x-powered-by");
@@ -543,53 +543,15 @@ async function getEnrichmentCatalog() {
   return result;
 }
 
-async function getPromFeed(
+async function getPromCsv(
   mode = "test"
 ) {
-  const suppliers =
-    await loadSuppliers();
-
-  const filtered =
-    buildFilteredCatalogStats(
-      suppliers,
-      {
-        minPrice: 500,
-        maxMilitarisAccessories: 40,
-        maxCards: 1000,
-        includeRows: true
-      }
-    );
-
-  const promGroups =
-    await listGroups();
-
-  const enrichment =
-    refreshEnrichment({
-      suppliers,
-      selectedRows:
-        filtered.selectedRows ||
-        [],
-      promGroups
-    });
-
-  const feed =
-    buildPromFeed({
-      mode,
-      suppliers,
-      selectedRows:
-        filtered.selectedRows ||
-        [],
-      enrichmentItems:
-        enrichment.items,
-      promGroups,
-      testLimit: 20
-    });
-
-  state.promFeedStats = {
-    mode,
-    ...feed.summary
-  };
-
+  const suppliers = await loadSuppliers();
+  const filtered = buildFilteredCatalogStats(suppliers, {minPrice:500,maxMilitarisAccessories:40,maxCards:1000,includeRows:true});
+  const promGroups = await listGroups();
+  const enrichment = refreshEnrichment({suppliers,selectedRows:filtered.selectedRows || [],promGroups});
+  const feed = buildCsvFeed({mode,suppliers,selectedRows:filtered.selectedRows || [],enrichmentItems:enrichment.items,promGroups,testLimit:20});
+  state.promFeedStats = {mode,format:"CSV",...feed.summary};
   return feed;
 }
 
@@ -737,7 +699,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.7.0",
+        "1.8.0",
       mode:
         "READ_ONLY",
       running:
@@ -755,7 +717,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.7.0",
+        "1.8.0",
       mode:
         "READ_ONLY",
       config:
@@ -766,65 +728,27 @@ app.get(
 );
 
 app.get(
-  "/feeds/prom-test.yml",
+  "/feeds/prom-test.csv",
   async (_req, res) => {
     try {
-      const feed =
-        await getPromFeed(
-          "test"
-        );
-
-      res
-        .set(
-          "Cache-Control",
-          "no-store"
-        )
-        .type(
-          "application/xml"
-        )
-        .send(
-          feed.xml
-        );
+      const feed = await getPromCsv("test");
+      console.log("[PROM_CSV_TEST_FEED_REQUEST]");
+      console.log(JSON.stringify(feed.summary));
+      res.set("Cache-Control","no-store").set("Content-Type","text/csv; charset=utf-8").send(feed.csv);
     } catch (err) {
-      res
-        .status(500)
-        .type("text/plain")
-        .send(
-          err?.message ||
-          String(err)
-        );
+      res.status(500).type("text/plain").send(err?.message || String(err));
     }
   }
 );
 
 app.get(
-  "/feeds/prom-full.yml",
+  "/feeds/prom-full.csv",
   async (_req, res) => {
     try {
-      const feed =
-        await getPromFeed(
-          "full"
-        );
-
-      res
-        .set(
-          "Cache-Control",
-          "no-store"
-        )
-        .type(
-          "application/xml"
-        )
-        .send(
-          feed.xml
-        );
+      const feed = await getPromCsv("full");
+      res.set("Cache-Control","no-store").set("Content-Type","text/csv; charset=utf-8").send(feed.csv);
     } catch (err) {
-      res
-        .status(500)
-        .type("text/plain")
-        .send(
-          err?.message ||
-          String(err)
-        );
+      res.status(500).type("text/plain").send(err?.message || String(err));
     }
   }
 );
@@ -833,45 +757,18 @@ app.get(
   "/api/prom-feed-preview",
   async (req, res) => {
     try {
-      const mode =
-        req.query.mode ===
-          "full"
-          ? "full"
-          : "test";
-
-      const feed =
-        await getPromFeed(
-          mode
-        );
-
-      res.json({
-        ok: true,
-        mode,
-        summary:
-          feed.summary
-      });
+      const mode=req.query.mode==="full"?"full":"test";
+      const feed=await getPromCsv(mode);
+      res.json({ok:true,format:"CSV",mode,summary:feed.summary});
     } catch (err) {
-      res
-        .status(500)
-        .json({
-          ok: false,
-          error:
-            err?.message ||
-            String(err)
-        });
+      res.status(500).json({ok:false,error:err?.message || String(err)});
     }
   }
 );
 
 app.get(
   "/api/prom-import-state",
-  (_req, res) => {
-    res.json({
-      ok: true,
-      state:
-        readState()
-    });
-  }
+  (_req,res) => res.json({ok:true,state:readState()})
 );
 
 app.get(
@@ -1192,7 +1089,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.7.0 CONTROL_IMPORT listening on :${config.port}`
+      `[PrimeTac Sync] v1.8.0 CSV_CONTROL_IMPORT listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
@@ -1432,60 +1329,19 @@ app.listen(
     setTimeout(
       async () => {
         try {
-          const enabled =
-            String(
-              process.env
-                .PROM_TEST_IMPORT_ON_START ||
-              ""
-            )
-              .trim()
-              .toLowerCase() ===
-            "true";
-
-          const feed =
-            await getPromFeed(
-              "test"
-            );
-
-          const baseUrl =
-            String(
-              process.env
-                .PUBLIC_BASE_URL ||
-              "https://primetac-prom-ai.onrender.com"
-            )
-              .replace(
-                /\/+$/,
-                ""
-              );
-
-          const result =
-            await runControlTestOnce({
-              enabled,
-              feedUrl:
-                `${baseUrl}/feeds/prom-test.yml`,
-              familyKeys:
-                feed.summary
-                  .familyKeys
-            });
-
-          state.controlImport =
-            result;
-
-          console.log(
-            "[PROM_CONTROL_IMPORT]"
-          );
-
-          console.log(
-            JSON.stringify(
-              result
-            )
-          );
+          const enabled = String(process.env.PROM_CSV_TEST_IMPORT_ON_START || "").trim().toLowerCase() === "true";
+          const feed = await getPromCsv("test");
+          const groupsBefore = await listGroups();
+          const productsBefore = await listProducts();
+          console.log("[PROM_CSV_TEST_FEED_AUDIT]");
+          console.log(JSON.stringify({...feed.summary,groupCountBefore:groupsBefore.length,productCountBefore:productsBefore.length}));
+          const baseUrl=String(process.env.PUBLIC_BASE_URL || "https://primetac-prom-ai.onrender.com").replace(/\/+$/,"");
+          const result=await submitCsvControlTest({enabled,feedUrl:`${baseUrl}/feeds/prom-test.csv`,summary:feed.summary,groupCountBefore:groupsBefore.length,productCountBefore:productsBefore.length});
+          state.controlImport=result;
+          console.log("[PROM_CSV_CONTROL_IMPORT]");
+          console.log(JSON.stringify(result));
         } catch (err) {
-          console.error(
-            "[PROM_CONTROL_IMPORT_ERROR]",
-            err?.message ||
-            String(err)
-          );
+          console.error("[PROM_CSV_CONTROL_IMPORT_ERROR]",err?.message || String(err));
         }
       },
       60000
