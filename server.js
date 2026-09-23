@@ -9,6 +9,8 @@ const { buildFilteredCatalogStats } = require("./src/catalog-filter");
 const { buildGroupMappingAudit } = require("./src/group-mapper");
 const { buildCategoryAudit } = require("./src/category-audit");
 const { refreshEnrichment } = require("./src/enrichment");
+const { buildPromFeed } = require("./src/prom-feed");
+const { runControlTestOnce, readState } = require("./src/prom-import");
 
 const app = express();
 app.disable("x-powered-by");
@@ -21,7 +23,9 @@ const state = {
   report: null,
   catalogStats: null,
   filteredStats: null,
-  enrichmentStats: null
+  enrichmentStats: null,
+  promFeedStats: null,
+  controlImport: null
 };
 
 let auditPromise = null;
@@ -539,6 +543,56 @@ async function getEnrichmentCatalog() {
   return result;
 }
 
+async function getPromFeed(
+  mode = "test"
+) {
+  const suppliers =
+    await loadSuppliers();
+
+  const filtered =
+    buildFilteredCatalogStats(
+      suppliers,
+      {
+        minPrice: 500,
+        maxMilitarisAccessories: 40,
+        maxCards: 1000,
+        includeRows: true
+      }
+    );
+
+  const promGroups =
+    await listGroups();
+
+  const enrichment =
+    refreshEnrichment({
+      suppliers,
+      selectedRows:
+        filtered.selectedRows ||
+        [],
+      promGroups
+    });
+
+  const feed =
+    buildPromFeed({
+      mode,
+      suppliers,
+      selectedRows:
+        filtered.selectedRows ||
+        [],
+      enrichmentItems:
+        enrichment.items,
+      promGroups,
+      testLimit: 20
+    });
+
+  state.promFeedStats = {
+    mode,
+    ...feed.summary
+  };
+
+  return feed;
+}
+
 async function inspectFamily(
   supplierName,
   groupId
@@ -683,7 +737,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.6.0",
+        "1.7.0",
       mode:
         "READ_ONLY",
       running:
@@ -701,12 +755,121 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.6.0",
+        "1.7.0",
       mode:
         "READ_ONLY",
       config:
         publicConfig(),
       state
+    });
+  }
+);
+
+app.get(
+  "/feeds/prom-test.yml",
+  async (_req, res) => {
+    try {
+      const feed =
+        await getPromFeed(
+          "test"
+        );
+
+      res
+        .set(
+          "Cache-Control",
+          "no-store"
+        )
+        .type(
+          "application/xml"
+        )
+        .send(
+          feed.xml
+        );
+    } catch (err) {
+      res
+        .status(500)
+        .type("text/plain")
+        .send(
+          err?.message ||
+          String(err)
+        );
+    }
+  }
+);
+
+app.get(
+  "/feeds/prom-full.yml",
+  async (_req, res) => {
+    try {
+      const feed =
+        await getPromFeed(
+          "full"
+        );
+
+      res
+        .set(
+          "Cache-Control",
+          "no-store"
+        )
+        .type(
+          "application/xml"
+        )
+        .send(
+          feed.xml
+        );
+    } catch (err) {
+      res
+        .status(500)
+        .type("text/plain")
+        .send(
+          err?.message ||
+          String(err)
+        );
+    }
+  }
+);
+
+app.get(
+  "/api/prom-feed-preview",
+  async (req, res) => {
+    try {
+      const mode =
+        req.query.mode ===
+          "full"
+          ? "full"
+          : "test";
+
+      const feed =
+        await getPromFeed(
+          mode
+        );
+
+      res.json({
+        ok: true,
+        mode,
+        summary:
+          feed.summary
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
+  }
+);
+
+app.get(
+  "/api/prom-import-state",
+  (_req, res) => {
+    res.json({
+      ok: true,
+      state:
+        readState()
     });
   }
 );
@@ -1029,7 +1192,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.6.0 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.7.0 CONTROL_IMPORT listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
@@ -1264,6 +1427,68 @@ app.listen(
         }
       },
       35000
+    );
+
+    setTimeout(
+      async () => {
+        try {
+          const enabled =
+            String(
+              process.env
+                .PROM_TEST_IMPORT_ON_START ||
+              ""
+            )
+              .trim()
+              .toLowerCase() ===
+            "true";
+
+          const feed =
+            await getPromFeed(
+              "test"
+            );
+
+          const baseUrl =
+            String(
+              process.env
+                .PUBLIC_BASE_URL ||
+              "https://primetac-prom-ai.onrender.com"
+            )
+              .replace(
+                /\/+$/,
+                ""
+              );
+
+          const result =
+            await runControlTestOnce({
+              enabled,
+              feedUrl:
+                `${baseUrl}/feeds/prom-test.yml`,
+              familyKeys:
+                feed.summary
+                  .familyKeys
+            });
+
+          state.controlImport =
+            result;
+
+          console.log(
+            "[PROM_CONTROL_IMPORT]"
+          );
+
+          console.log(
+            JSON.stringify(
+              result
+            )
+          );
+        } catch (err) {
+          console.error(
+            "[PROM_CONTROL_IMPORT_ERROR]",
+            err?.message ||
+            String(err)
+          );
+        }
+      },
+      60000
     );
 
     setTimeout(
