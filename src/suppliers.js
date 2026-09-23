@@ -110,6 +110,303 @@ function chooseOffers(parsed) {
   return candidates[0] || [];
 }
 
+
+function findCategoryArrays(
+  node,
+  depth = 0
+) {
+  if (
+    !node ||
+    typeof node !== "object" ||
+    depth > 12
+  ) {
+    return [];
+  }
+
+  const found = [];
+
+  for (
+    const [key, value]
+    of Object.entries(node)
+  ) {
+    const lower =
+      key.toLowerCase();
+
+    if (
+      lower === "category"
+    ) {
+      if (
+        Array.isArray(value)
+      ) {
+        found.push(value);
+      } else if (
+        value &&
+        typeof value === "object"
+      ) {
+        found.push([value]);
+      }
+    }
+
+    if (
+      value &&
+      typeof value === "object"
+    ) {
+      found.push(
+        ...findCategoryArrays(
+          value,
+          depth + 1
+        )
+      );
+    }
+  }
+
+  return found;
+}
+
+function normalizeCategory(
+  raw
+) {
+  if (
+    !raw ||
+    typeof raw !== "object"
+  ) {
+    return null;
+  }
+
+  const id =
+    valueOf(
+      raw,
+      [
+        "@id",
+        "id",
+        "category_id",
+        "@category_id"
+      ]
+    );
+
+  const parentId =
+    valueOf(
+      raw,
+      [
+        "@parentId",
+        "@parent_id",
+        "parentId",
+        "parent_id"
+      ]
+    );
+
+  const name =
+    valueOf(
+      raw,
+      [
+        "#text",
+        "name",
+        "title"
+      ]
+    );
+
+  if (!id) {
+    return null;
+  }
+
+  return {
+    id,
+    parentId:
+      parentId || null,
+    name:
+      name || ""
+  };
+}
+
+function chooseCategories(
+  parsed
+) {
+  const candidates =
+    findCategoryArrays(parsed)
+      .filter(
+        list =>
+          list.length > 0
+      )
+      .sort(
+        (a, b) =>
+          b.length -
+          a.length
+      );
+
+  const raw =
+    candidates[0] || [];
+
+  const categories =
+    raw
+      .map(
+        normalizeCategory
+      )
+      .filter(Boolean);
+
+  const seen =
+    new Set();
+
+  return categories.filter(
+    category => {
+      const key =
+        String(
+          category.id
+        );
+
+      if (
+        seen.has(key)
+      ) {
+        return false;
+      }
+
+      seen.add(key);
+      return true;
+    }
+  );
+}
+
+function withCategoryPaths(
+  categories
+) {
+  const byId =
+    new Map(
+      (categories || [])
+        .map(
+          category => [
+            String(
+              category.id
+            ),
+            category
+          ]
+        )
+    );
+
+  function pathOf(
+    category
+  ) {
+    const names = [];
+    const seen =
+      new Set();
+
+    let current =
+      category;
+
+    while (
+      current &&
+      current.id &&
+      !seen.has(
+        String(
+          current.id
+        )
+      )
+    ) {
+      seen.add(
+        String(
+          current.id
+        )
+      );
+
+      if (
+        current.name
+      ) {
+        names.unshift(
+          current.name
+        );
+      }
+
+      if (
+        !current.parentId
+      ) {
+        break;
+      }
+
+      current =
+        byId.get(
+          String(
+            current.parentId
+          )
+        ) ||
+        null;
+    }
+
+    return names.join(
+      " > "
+    );
+  }
+
+  return (categories || [])
+    .map(
+      category => ({
+        ...category,
+        path:
+          pathOf(category)
+      })
+    );
+}
+
+function textValue(value) {
+  if (value == null) {
+    return "";
+  }
+
+  if (
+    typeof value === "string" ||
+    typeof value === "number"
+  ) {
+    return String(value).trim();
+  }
+
+  if (
+    typeof value === "object"
+  ) {
+    return valueOf(
+      value,
+      [
+        "#text",
+        "@url",
+        "url",
+        "@src",
+        "src",
+        "value"
+      ]
+    );
+  }
+
+  return "";
+}
+
+function extractPictures(raw) {
+  const values = [
+    ...arr(raw?.picture),
+    ...arr(raw?.pictures?.picture),
+    ...arr(raw?.image),
+    ...arr(raw?.images?.image),
+    ...arr(raw?.photo),
+    ...arr(raw?.photos?.photo)
+  ];
+
+  const out = [];
+  const seen = new Set();
+
+  for (const item of values) {
+    const value =
+      textValue(item);
+
+    if (!value) {
+      continue;
+    }
+
+    if (seen.has(value)) {
+      continue;
+    }
+
+    seen.add(value);
+    out.push(value);
+  }
+
+  return out;
+}
+
 function extractParams(raw) {
   const params = [];
 
@@ -268,6 +565,9 @@ function normalizeOffer(
           "presence"
         ]
       ),
+
+    pictures:
+      extractPictures(raw),
 
     params:
       extractParams(raw)
@@ -639,6 +939,7 @@ async function loadSupplier(
       ok: false,
       error:
         `${name} XML URL is not configured`,
+      categories: [],
       offers: []
     };
   }
@@ -656,6 +957,13 @@ async function loadSupplier(
     const rawOffers =
       chooseOffers(parsed);
 
+    const categories =
+      withCategoryPaths(
+        chooseCategories(
+          parsed
+        )
+      );
+
     console.log(
       `[${name}_XML_OK]`,
       JSON.stringify({
@@ -665,7 +973,9 @@ async function loadSupplier(
             "utf8"
           ),
         offers:
-          rawOffers.length
+          rawOffers.length,
+        categories:
+          categories.length
       })
     );
 
@@ -681,6 +991,8 @@ async function loadSupplier(
 
       error:
         null,
+
+      categories,
 
       offers:
         rawOffers.map(
@@ -722,6 +1034,7 @@ async function loadSupplier(
           .filter(Boolean)
           .join(" | "),
 
+      categories: [],
       offers: []
     };
   }

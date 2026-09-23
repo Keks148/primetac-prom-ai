@@ -295,6 +295,55 @@ function groupSupplierOffers(offers) {
   return map;
 }
 
+function hasPhoto(items) {
+  return (items || []).some(
+    item =>
+      Array.isArray(
+        item?.pictures
+      ) &&
+      item.pictures.some(
+        picture =>
+          String(
+            picture || ""
+          ).trim()
+      )
+  );
+}
+
+function isBezetCertificate(items) {
+  const categoryIds =
+    new Set(
+      (items || []).map(
+        item =>
+          String(
+            item?.categoryId ||
+            ""
+          ).trim()
+      )
+    );
+
+  const text =
+    norm(
+      (items || [])
+        .map(
+          item =>
+            item?.name ||
+            ""
+        )
+        .join(" ")
+    );
+
+  return (
+    categoryIds.has("3") ||
+    text.includes(
+      "сертификат"
+    ) ||
+    text.includes(
+      "сертифікат"
+    )
+  );
+}
+
 function analyzeSupplier(
   supplierName,
   offers,
@@ -312,6 +361,9 @@ function analyzeSupplier(
     if (!availableItems.length) {
       continue;
     }
+
+    const familyHasPhoto =
+      hasPhoto(items);
 
     const eligibleItems =
       availableItems.filter(
@@ -365,7 +417,12 @@ function analyzeSupplier(
         familyClass.type,
 
       reason:
-        familyClass.reason,
+        !familyHasPhoto
+          ? "excluded_no_photo"
+          : familyClass.reason,
+
+      hasPhoto:
+        familyHasPhoto,
 
       totalVariants:
         items.length,
@@ -386,6 +443,7 @@ function analyzeSupplier(
       excluded:
         familyClass.type ===
           "forbidden" ||
+        !familyHasPhoto ||
         eligibleItems.length === 0
     };
 
@@ -429,6 +487,12 @@ function analyzeSupplier(
         !row.passesPrice
     );
 
+  const excludedNoPhoto =
+    rows.filter(
+      row =>
+        row.hasPhoto === false
+    );
+
   return {
     supplier:
       supplierName,
@@ -466,6 +530,9 @@ function analyzeSupplier(
 
     excludedByPrice:
       excludedByPrice.length,
+
+    excludedNoPhoto:
+      excludedNoPhoto.length,
 
     samples: {
       clothing:
@@ -522,6 +589,9 @@ function buildFilteredCatalogStats(
     );
 
   const bezetSelected = [];
+  let bezetAvailableFamilies = 0;
+  let bezetExcludedCertificates = 0;
+  let bezetExcludedNoPhoto = 0;
 
   for (
     const [groupId, items]
@@ -531,6 +601,24 @@ function buildFilteredCatalogStats(
       items.filter(isAvailable);
 
     if (!availableItems.length) {
+      continue;
+    }
+
+    bezetAvailableFamilies++;
+
+    if (
+      isBezetCertificate(
+        items
+      )
+    ) {
+      bezetExcludedCertificates++;
+      continue;
+    }
+
+    if (
+      !hasPhoto(items)
+    ) {
+      bezetExcludedNoPhoto++;
       continue;
     }
 
@@ -550,7 +638,9 @@ function buildFilteredCatalogStats(
       type:
         "bezet_keep_all",
       reason:
-        "bezet_not_filtered",
+        "bezet_keep_available_with_photo_non_certificate",
+      hasPhoto:
+        true,
       totalVariants:
         items.length,
       availableVariants:
@@ -696,13 +786,13 @@ function buildFilteredCatalogStats(
   return {
     rules: {
       BEZET:
-        "keep all available models; no price/category/brand filtering",
+        "keep all available models except certificates and products without photos",
 
       MILITARIS: {
         minPrice,
 
         exclude:
-          "helmets, ballistic plates, weapon magazines/ammunition, Helikon-Tex, LOWA footwear",
+          "helmets, ballistic plates, weapon magazines/ammunition, Helikon-Tex, LOWA footwear, products without photos",
 
         priority:
           "clothing and footwear",
@@ -720,13 +810,20 @@ function buildFilteredCatalogStats(
     suppliers: {
       BEZET: {
         availableFamilies:
-          bezetSelected.length,
+          bezetAvailableFamilies,
 
         selected:
           selectedBySupplier.BEZET,
 
+        excludedCertificates:
+          bezetExcludedCertificates,
+
+        excludedNoPhoto:
+          bezetExcludedNoPhoto,
+
         filteredOut:
-          0
+          bezetAvailableFamilies -
+          selectedBySupplier.BEZET
       },
 
       MILITARIS: {
@@ -753,6 +850,9 @@ function buildFilteredCatalogStats(
 
         excludedByPrice:
           militaris.excludedByPrice,
+
+        excludedNoPhoto:
+          militaris.excludedNoPhoto,
 
         selected:
           selectedBySupplier.MILITARIS
