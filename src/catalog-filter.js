@@ -510,7 +510,8 @@ function buildFilteredCatalogStats(
   {
     minPrice = 500,
     maxMilitarisAccessories = 40,
-    maxCards = 1000
+    maxCards = 1000,
+    includeRows = false
   } = {}
 ) {
   // BEZET НЕ РЕЖЕМ ВООБЩЕ:
@@ -780,7 +781,11 @@ function buildFilteredCatalogStats(
 
       militaris:
         militaris.samples
-    }
+    },
+
+    ...(includeRows
+      ? { selectedRows: selected }
+      : {})
   };
 }
 
