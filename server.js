@@ -4,8 +4,9 @@ const { config, publicConfig } = require("./src/config");
 const { runAudit } = require("./src/audit");
 const { renderDashboard } = require("./src/ui");
 const { loadSuppliers } = require("./src/suppliers");
-const { listProducts } = require("./src/prom");
+const { listProducts, listGroups } = require("./src/prom");
 const { buildFilteredCatalogStats } = require("./src/catalog-filter");
+const { buildGroupMappingAudit } = require("./src/group-mapper");
 
 const app = express();
 app.disable("x-powered-by");
@@ -457,6 +458,30 @@ async function getFilteredStats() {
   }
 }
 
+async function getGroupMappingAudit() {
+  const suppliers =
+    await loadSuppliers();
+
+  const filtered =
+    buildFilteredCatalogStats(
+      suppliers,
+      {
+        minPrice: 500,
+        maxMilitarisAccessories: 40,
+        maxCards: 1000,
+        includeRows: true
+      }
+    );
+
+  const promGroups =
+    await listGroups();
+
+  return buildGroupMappingAudit(
+    filtered.selectedRows || [],
+    promGroups
+  );
+}
+
 async function inspectFamily(
   supplierName,
   groupId
@@ -601,7 +626,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.4.4",
+        "1.5.0",
       mode:
         "READ_ONLY",
       running:
@@ -619,13 +644,37 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.4.4",
+        "1.5.0",
       mode:
         "READ_ONLY",
       config:
         publicConfig(),
       state
     });
+  }
+);
+
+app.get(
+  "/api/group-mapping-audit",
+  async (_req, res) => {
+    try {
+      const result =
+        await getGroupMappingAudit();
+
+      res.json({
+        ok: true,
+        result
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
   }
 );
 
@@ -835,7 +884,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.4.4 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.5.0 READ_ONLY listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
@@ -1005,6 +1054,32 @@ app.listen(
         }
       },
       12000
+    );
+
+    setTimeout(
+      async () => {
+        try {
+          const mapping =
+            await getGroupMappingAudit();
+
+          console.log(
+            "[GROUP_MAPPING_AUDIT]"
+          );
+
+          console.log(
+            JSON.stringify(
+              mapping
+            )
+          );
+        } catch (err) {
+          console.error(
+            "[GROUP_MAPPING_AUDIT_ERROR]",
+            err?.message ||
+            String(err)
+          );
+        }
+      },
+      35000
     );
 
     setTimeout(
