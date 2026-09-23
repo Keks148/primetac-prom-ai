@@ -5,6 +5,7 @@ const { runAudit } = require("./src/audit");
 const { renderDashboard } = require("./src/ui");
 const { loadSuppliers } = require("./src/suppliers");
 const { listProducts } = require("./src/prom");
+const { buildFilteredCatalogStats } = require("./src/catalog-filter");
 
 const app = express();
 app.disable("x-powered-by");
@@ -15,11 +16,13 @@ const state = {
   lastFinishedAt: null,
   lastError: null,
   report: null,
-  catalogStats: null
+  catalogStats: null,
+  filteredStats: null
 };
 
 let auditPromise = null;
 let statsPromise = null;
+let filteredStatsPromise = null;
 
 async function startAudit(reason = "manual") {
   if (auditPromise) return auditPromise;
@@ -422,6 +425,38 @@ async function getCatalogStats() {
   }
 }
 
+async function getFilteredStats() {
+  if (filteredStatsPromise) {
+    return filteredStatsPromise;
+  }
+
+  filteredStatsPromise = (async () => {
+    const suppliers =
+      await loadSuppliers();
+
+    const result =
+      buildFilteredCatalogStats(
+        suppliers,
+        {
+          minPrice: 500,
+          targetCards: 950,
+          maxCards: 1000
+        }
+      );
+
+    state.filteredStats =
+      result;
+
+    return result;
+  })();
+
+  try {
+    return await filteredStatsPromise;
+  } finally {
+    filteredStatsPromise = null;
+  }
+}
+
 async function inspectFamily(
   supplierName,
   groupId
@@ -566,7 +601,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.3.0",
+        "1.4.1",
       mode:
         "READ_ONLY",
       running:
@@ -584,7 +619,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.3.0",
+        "1.4.1",
       mode:
         "READ_ONLY",
       config:
@@ -600,6 +635,40 @@ app.get(
     try {
       const result =
         await getCatalogStats();
+
+      res.json({
+        ok: true,
+        result
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
+  }
+);
+
+app.get(
+  "/api/filtered-stats",
+  async (_req, res) => {
+    try {
+      const result =
+        await getFilteredStats();
+
+      console.log(
+        "[FILTERED_CATALOG_STATS]"
+      );
+
+      console.log(
+        JSON.stringify(
+          result
+        )
+      );
 
       res.json({
         ok: true,
@@ -766,7 +835,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.3.0 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.4.1 READ_ONLY listening on :${config.port}`
     );
 
     console.log(
@@ -829,6 +898,32 @@ app.listen(
         }
       },
       12000
+    );
+
+    setTimeout(
+      async () => {
+        try {
+          const filtered =
+            await getFilteredStats();
+
+          console.log(
+            "[FILTERED_CATALOG_STATS]"
+          );
+
+          console.log(
+            JSON.stringify(
+              filtered
+            )
+          );
+        } catch (err) {
+          console.error(
+            "[FILTERED_CATALOG_STATS_ERROR]",
+            err?.message ||
+            String(err)
+          );
+        }
+      },
+      25000
     );
   }
 );
