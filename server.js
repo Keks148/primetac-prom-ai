@@ -439,7 +439,7 @@ async function getFilteredStats() {
         suppliers,
         {
           minPrice: 500,
-          targetCards: 950,
+          maxMilitarisAccessories: 40,
           maxCards: 1000
         }
       );
@@ -601,7 +601,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.4.1",
+        "1.4.3",
       mode:
         "READ_ONLY",
       running:
@@ -619,7 +619,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.4.1",
+        "1.4.3",
       mode:
         "READ_ONLY",
       config:
@@ -835,7 +835,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.4.1 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.4.3 READ_ONLY listening on :${config.port}`
     );
 
     console.log(
