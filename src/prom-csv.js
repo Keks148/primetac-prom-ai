@@ -80,10 +80,18 @@ function chooseVariantParams(offers) {
       const e = data.get(lower); e.values.add(pair.value); e.present++;
     }
   }
-  const hints = ["розмір","размер","size","колір","цвет","color","colour","зріст","рост"];
+  const hints = ["розмір","размер","size","колір","цвет","color","colour","зріст","рост","об'єм","объем","volume","довжина","длина","length","ширина","width"];
+  const identityHints = ["артикул","код товар","код товара","sku","product id","offer id","ідентифікатор","идентификатор"];
   return [...data.entries()]
-    .map(([lower,e]) => ({lower,...e,complete:e.present===offers.length,varies:e.values.size>1,rank:hints.findIndex(h=>lower.includes(h))}))
-    .filter(e=>e.complete && e.varies)
+    .map(([lower,e]) => ({
+      lower,
+      ...e,
+      complete:e.present===offers.length,
+      varies:e.values.size>1,
+      identity:identityHints.some(h=>lower.includes(h)),
+      rank:hints.findIndex(h=>lower.includes(h))
+    }))
+    .filter(e=>e.complete && e.varies && !e.identity)
     .sort((a,b)=>(a.rank<0?99:a.rank)-(b.rank<0?99:b.rank) || b.values.size-a.values.size)
     .slice(0,3).map(e=>e.name);
 }
@@ -94,9 +102,7 @@ function variantSignature(offer,names) {
 }
 
 function dedupeVariants(offers,names) {
-  if (!names.length) {
-    return [...offers].sort((a,b)=>Number(isAvailable(b))-Number(isAvailable(a)));
-  }
+  if (!names.length) return offers.length ? [offers[0]] : [];
   const seen=new Set(), out=[];
   for (const offer of [...offers].sort((a,b)=>Number(isAvailable(b))-Number(isAvailable(a)))) {
     const sig=variantSignature(offer,names);
@@ -104,6 +110,40 @@ function dedupeVariants(offers,names) {
     seen.add(sig); out.push(offer);
   }
   return out;
+}
+
+function cloneComparable(offer) {
+  const params=(offer?.params||[])
+    .map(p=>[clean(p?.name).toLowerCase(),clean(p?.value).toLowerCase()])
+    .filter(([name,value])=>name && value)
+    .filter(([name])=>!["артикул","код товар","код товара","sku","product id","offer id","ідентифікатор","идентификатор"].some(h=>name.includes(h)))
+    .sort((a,b)=>a[0].localeCompare(b[0],"uk") || a[1].localeCompare(b[1],"uk"));
+  return JSON.stringify({
+    name:clean(offer?.name).toLowerCase(),
+    vendor:clean(offer?.vendor).toLowerCase(),
+    categoryId:clean(offer?.categoryId),
+    price:num(offer?.price),
+    currency:clean(offer?.currency || offer?.currencyId).toUpperCase(),
+    available:isAvailable(offer),
+    quantity:num(offer?.quantity),
+    country:clean(offer?.country).toLowerCase(),
+    pictures:(offer?.pictures||[]).map(clean).filter(Boolean).slice(0,10),
+    params
+  });
+}
+
+function areCodeOnlyClones(offers) {
+  if (!offers || offers.length <= 1) return false;
+  const first=cloneComparable(offers[0]);
+  return offers.every(offer=>cloneComparable(offer)===first);
+}
+
+function familyVariantMode(offers) {
+  if (!offers || offers.length <= 1) return {mode:"single",variantNames:[]};
+  const variantNames=chooseVariantParams(offers);
+  if (variantNames.length) return {mode:"real",variantNames};
+  if (areCodeOnlyClones(offers)) return {mode:"collapsed_code_only",variantNames:[]};
+  return {mode:"ambiguous",variantNames:[]};
 }
 
 function pictures(offer,fallback) {
@@ -119,9 +159,9 @@ function enrichmentMap(items) { return new Map((items||[]).map(i=>[i.familyKey,i
 
 function chooseTestRows(rows,suppliers,limit=20) {
   const candidates=(rows||[]).map(row=>{
-    const mapping=mapSelectedProduct(row), offers=familyOffers(suppliers,row);
-    return {row,mapping,offers,score:(offers.length>1?100:0)+offers.filter(isAvailable).length};
-  }).filter(x=>x.mapping.status==="MAPPED" && x.mapping.groupId && x.offers.length)
+    const mapping=mapSelectedProduct(row), offers=familyOffers(suppliers,row), variant=familyVariantMode(offers);
+    return {row,mapping,offers,variant,score:(variant.mode==="real"?200:(variant.mode==="collapsed_code_only"?100:0))+offers.filter(isAvailable).length};
+  }).filter(x=>x.mapping.status==="MAPPED" && x.mapping.groupId && x.offers.length && x.variant.mode!=="ambiguous")
     .sort((a,b)=>b.score-a.score || a.row.familyKey.localeCompare(b.row.familyKey,"en",{numeric:true}));
   const chosen=[], usedGroups=new Set();
   for (const item of candidates) {
@@ -177,18 +217,20 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
   ];
   const csvRows=[csvRow(headers)], preview=[], familyKeys=[], externalIds=[], productCodes=[];
   const usedExternalIds=new Set(), usedCodes=new Set();
-  let resolvedExternalIdCollisions=0, realVariantFamilies=0, fallbackVariantFamilies=0, singleFamilies=0;
+  let resolvedExternalIdCollisions=0, realVariantFamilies=0, collapsedCodeOnlyFamilies=0, skippedAmbiguousFamilies=0, singleFamilies=0;
   for (const row of rows) {
     const mapping=mapSelectedProduct(row), target=String(mapping.groupId||"");
     if(mapping.status!=="MAPPED" || !allowed.has(target)) continue;
     const enrich=eMap.get(row.familyKey);
     if(!enrich?.content?.descriptionRu || !enrich?.content?.descriptionUa) continue;
     const allOffers=familyOffers(suppliers,row); if(!allOffers.length) continue;
-    const realVariantNames=chooseVariantParams(allOffers);
-    const fallbackVariant=allOffers.length>1 && realVariantNames.length===0;
-    const variantNames=fallbackVariant?["Варіант"]:realVariantNames;
-    const offers=dedupeVariants(allOffers,realVariantNames);
-    if(fallbackVariant) fallbackVariantFamilies++; else if(realVariantNames.length) realVariantFamilies++; else singleFamilies++;
+    const variant=familyVariantMode(allOffers);
+    if(variant.mode==="ambiguous") { skippedAmbiguousFamilies++; continue; }
+    const variantNames=variant.variantNames;
+    const offers=variant.mode==="real" ? dedupeVariants(allOffers,variantNames) : [allOffers[0]];
+    if(variant.mode==="real") realVariantFamilies++;
+    else if(variant.mode==="collapsed_code_only") collapsedCodeOnlyFamilies++;
+    else singleFamilies++;
     let emitted=0;
     for (let variantIndex=0; variantIndex<offers.length; variantIndex++) {
       const offer=offers[variantIndex];
@@ -208,8 +250,7 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
       const sku=uniqueProductCode(offer,row.supplier,extId,usedCodes), available=isAvailable(offer), vm=paramMap(offer);
       const params=[];
       for(const name of variantNames){
-        if(fallbackVariant && name==="Варіант") params.push({name:"Варіант",value:clean(offer.sku || offer.id || String(variantIndex+1))});
-        else { const pair=vm.get(name.toLowerCase()); if(pair) params.push(pair); }
+        const pair=vm.get(name.toLowerCase()); if(pair) params.push(pair);
       }
       params.push(...staticParams(offer,variantNames)); while(params.length<8) params.push({name:"",value:""});
       const charCells=params.slice(0,8).flatMap(p=>[p.name,"",p.value]);
@@ -223,12 +264,12 @@ function buildCsvFeed({mode,suppliers,selectedRows,enrichmentItems,promGroups,te
       ]));
       externalIds.push(extId); productCodes.push(sku); emitted++;
     }
-    if(emitted){familyKeys.push(row.familyKey); preview.push({familyKey:row.familyKey,supplier:row.supplier,name:enrich.content.titleRu||row.name,targetGroupId:Number(target),sourceVariants:allOffers.length,exportedRows:emitted,variantMode:fallbackVariant?"fallback":(realVariantNames.length?"real":"single"),variantParams:variantNames});}
+    if(emitted){familyKeys.push(row.familyKey); preview.push({familyKey:row.familyKey,supplier:row.supplier,name:enrich.content.titleRu||row.name,targetGroupId:Number(target),sourceVariants:allOffers.length,exportedRows:emitted,variantMode:variant.mode,variantParams:variantNames});}
   }
   const csv="\ufeff"+csvRows.join("\r\n");
   const externalIdsUnique=new Set(externalIds).size===externalIds.length;
   const productCodesUnique=new Set(productCodes).size===productCodes.length;
-  const summary={mode,requestedFamilies:rows.length,exportedFamilies:familyKeys.length,exportedRows:csvRows.length-1,csvBytes:Buffer.byteLength(csv,"utf8"),targetGroups:[...new Set(preview.map(x=>x.targetGroupId))],allTargetsExist:preview.every(x=>allowed.has(String(x.targetGroupId))),externalIdsUnique,productCodesUnique,resolvedExternalIdCollisions,realVariantFamilies,fallbackVariantFamilies,singleFamilies,familyKeys,externalIds,preview};
+  const summary={mode,requestedFamilies:rows.length,exportedFamilies:familyKeys.length,exportedRows:csvRows.length-1,csvBytes:Buffer.byteLength(csv,"utf8"),targetGroups:[...new Set(preview.map(x=>x.targetGroupId))],allTargetsExist:preview.every(x=>allowed.has(String(x.targetGroupId))),externalIdsUnique,productCodesUnique,resolvedExternalIdCollisions,realVariantFamilies,collapsedCodeOnlyFamilies,skippedAmbiguousFamilies,singleFamilies,familyKeys,externalIds,preview};
   if(summary.exportedFamilies<=0 || summary.exportedRows<=0 || !summary.allTargetsExist || !summary.externalIdsUnique || !summary.productCodesUnique) throw new Error(`PROM CSV validation failed: ${JSON.stringify(summary)}`);
   return {csv,summary};
 }
