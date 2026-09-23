@@ -61,8 +61,165 @@ const GROUPS = Object.freeze({
 
   tourism: {
     sleepingBags: 157085454
+  },
+
+  parents: {
+    clothing: 157085421,
+    footwear: 157085422,
+    headwear: 157085423,
+    bags: 157085424,
+    equipment: 157085425,
+    protective: 157085426,
+    tourism: 157085427,
+    accessories: 157085428
+  },
+
+  existingSpecific: {
+    gogglesMasks: 156580908,
+    camouflageSuits: 156580910
   }
 });
+
+
+const SOURCE_CATEGORY_GROUPS = Object.freeze({
+  BEZET: Object.freeze({
+    "188": GROUPS.clothing.pants,
+    "203": GROUPS.clothing.tshirts,
+    "187": GROUPS.clothing.jackets,
+    "205": GROUPS.clothing.tshirts,
+    "189": GROUPS.clothing.pants,
+    "195": GROUPS.clothing.pants,
+    "220": GROUPS.clothing.shirts,
+    "15": GROUPS.clothing.pants,
+    "7": GROUPS.clothing.jackets,
+    "9": GROUPS.clothing.pants,
+    "25": GROUPS.clothing.fleece,
+    "206": GROUPS.parents.clothing,
+    "226": GROUPS.existingSpecific.gogglesMasks,
+    "228": GROUPS.clothing.fleece,
+    "227": GROUPS.clothing.pants,
+    "204": GROUPS.clothing.fleece,
+    "190": GROUPS.bags.tacticalBags,
+    "191": GROUPS.parents.headwear,
+    "196": GROUPS.clothing.jackets,
+    "19": GROUPS.headwear.caps,
+    "24": GROUPS.footwear.socks,
+    "141": GROUPS.clothing.pants,
+    "11": GROUPS.clothing.pants,
+    "154": GROUPS.parents.headwear,
+    "207": GROUPS.equipment.belts,
+    "182": GROUPS.parents.clothing,
+    "16": GROUPS.clothing.tshirts,
+    "162": GROUPS.clothing.pants,
+    "26": GROUPS.clothing.pants,
+    "135": GROUPS.clothing.shirts,
+    "180": GROUPS.parents.clothing,
+    "224": GROUPS.bags.backpacks,
+    "138": GROUPS.clothing.thermal,
+    "55": GROUPS.clothing.pants,
+    "139": GROUPS.clothing.thermal,
+    "229": GROUPS.clothing.fleece,
+    "159": GROUPS.parents.headwear,
+    "27": GROUPS.clothing.fleece,
+    "18": GROUPS.clothing.shirts,
+    "20": GROUPS.headwear.hatsBuffs,
+    "110": GROUPS.clothing.pants,
+    "211": GROUPS.equipment.gloves,
+    "111": GROUPS.clothing.pants,
+    "10": GROUPS.clothing.pants,
+    "193": GROUPS.parents.footwear,
+    "47": GROUPS.parents.clothing,
+    "194": GROUPS.accessories.patches,
+    "12": GROUPS.clothing.pants,
+    "117": GROUPS.headwear.balaclava,
+    "161": GROUPS.headwear.caps,
+    "219": GROUPS.clothing.jackets,
+    "198": GROUPS.parents.headwear,
+    "112": GROUPS.clothing.jackets,
+    "113": GROUPS.clothing.jackets,
+    "192": GROUPS.accessories.other,
+    "122": GROUPS.equipment.belts,
+    "128": GROUPS.parents.clothing,
+    "116": GROUPS.clothing.fleece,
+    "4": GROUPS.clothing.jackets,
+    "5": GROUPS.clothing.jackets,
+    "42": GROUPS.parents.headwear,
+    "99": GROUPS.parents.clothing,
+    "43": GROUPS.bags.tacticalBags
+  }),
+
+  MILITARIS: Object.freeze({
+    "1175": GROUPS.clothing.tshirts,
+    "1254": GROUPS.clothing.jackets,
+    "1258": GROUPS.footwear.boots,
+    "1253": GROUPS.clothing.jackets,
+    "1173": GROUPS.clothing.fleece,
+    "1180": GROUPS.parents.clothing,
+    "1172": GROUPS.clothing.shirts,
+    "1282": GROUPS.clothing.pants,
+    "1255": GROUPS.clothing.jackets,
+    "1256": GROUPS.footwear.sneakers,
+    "1257": GROUPS.footwear.sneakers,
+    "1199": GROUPS.equipment.gloves,
+    "1284": GROUPS.clothing.pants,
+    "1259": GROUPS.footwear.boots,
+    "1285": GROUPS.clothing.pants,
+    "1281": GROUPS.clothing.pants,
+    "1181": GROUPS.clothing.thermal,
+    "1179": GROUPS.clothing.pants,
+    "1222": GROUPS.existingSpecific.gogglesMasks,
+    "1193": GROUPS.parents.headwear,
+    "1270": GROUPS.clothing.rain,
+    "1176": GROUPS.clothing.shirts,
+    "1286": GROUPS.footwear.sneakers,
+    "1283": GROUPS.clothing.pants,
+    "1218": GROUPS.existingSpecific.camouflageSuits,
+    "1280": GROUPS.footwear.boots,
+    "1187": GROUPS.bags.backpacks,
+    "1194": GROUPS.headwear.caps,
+    "1178": GROUPS.clothing.pants
+  })
+});
+
+function sourceCategoryMapping(row) {
+  const supplier =
+    String(
+      row?.supplier ||
+      ""
+    ).toUpperCase();
+
+  const categoryId =
+    String(
+      row?.categoryId ||
+      ""
+    ).trim();
+
+  const supplierMap =
+    SOURCE_CATEGORY_GROUPS[
+      supplier
+    ];
+
+  if (
+    !supplierMap ||
+    !categoryId
+  ) {
+    return null;
+  }
+
+  const groupId =
+    supplierMap[
+      categoryId
+    ];
+
+  if (!groupId) {
+    return null;
+  }
+
+  return mapped(
+    groupId,
+    `source_category:${supplier}:${categoryId}`
+  );
+}
 
 function hit(text, words) {
   return words.some(word =>
@@ -90,7 +247,16 @@ function mapSelectedProduct(row) {
     };
   }
 
-  // Обувь
+  const bySourceCategory =
+    sourceCategoryMapping(
+      row
+    );
+
+  if (bySourceCategory) {
+    return bySourceCategory;
+  }
+
+  // Обувь / name-based fallback
   if (
     hit(text, [
       "шкарпет",
@@ -571,6 +737,7 @@ function buildGroupMappingAudit(
 
 module.exports = {
   GROUPS,
+  SOURCE_CATEGORY_GROUPS,
   mapSelectedProduct,
   buildGroupMappingAudit
 };
