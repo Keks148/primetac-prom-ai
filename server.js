@@ -699,7 +699,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.8.0",
+        "1.8.1",
       mode:
         "READ_ONLY",
       running:
@@ -717,7 +717,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.8.0",
+        "1.8.1",
       mode:
         "READ_ONLY",
       config:
@@ -1089,7 +1089,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.8.0 CSV_CONTROL_IMPORT listening on :${config.port}`
+      `[PrimeTac Sync] v1.8.1 CSV_CONTROL_IMPORT listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
