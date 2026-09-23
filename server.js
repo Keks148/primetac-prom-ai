@@ -7,6 +7,7 @@ const { loadSuppliers } = require("./src/suppliers");
 const { listProducts, listGroups } = require("./src/prom");
 const { buildFilteredCatalogStats } = require("./src/catalog-filter");
 const { buildGroupMappingAudit } = require("./src/group-mapper");
+const { buildCategoryAudit } = require("./src/category-audit");
 
 const app = express();
 app.disable("x-powered-by");
@@ -458,6 +459,27 @@ async function getFilteredStats() {
   }
 }
 
+async function getCategoryAudit() {
+  const suppliers =
+    await loadSuppliers();
+
+  const filtered =
+    buildFilteredCatalogStats(
+      suppliers,
+      {
+        minPrice: 500,
+        maxMilitarisAccessories: 40,
+        maxCards: 1000,
+        includeRows: true
+      }
+    );
+
+  return buildCategoryAudit(
+    suppliers,
+    filtered.selectedRows || []
+  );
+}
+
 async function getGroupMappingAudit() {
   const suppliers =
     await loadSuppliers();
@@ -626,7 +648,7 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.5.1",
+        "1.5.3",
       mode:
         "READ_ONLY",
       running:
@@ -644,13 +666,37 @@ app.get(
       service:
         "PrimeTac Sync",
       version:
-        "1.5.1",
+        "1.5.3",
       mode:
         "READ_ONLY",
       config:
         publicConfig(),
       state
     });
+  }
+);
+
+app.get(
+  "/api/category-audit",
+  async (_req, res) => {
+    try {
+      const result =
+        await getCategoryAudit();
+
+      res.json({
+        ok: true,
+        result
+      });
+    } catch (err) {
+      res
+        .status(500)
+        .json({
+          ok: false,
+          error:
+            err?.message ||
+            String(err)
+        });
+    }
   }
 );
 
@@ -884,7 +930,7 @@ app.listen(
   config.port,
   () => {
     console.log(
-      `[PrimeTac Sync] v1.5.1 READ_ONLY listening on :${config.port}`
+      `[PrimeTac Sync] v1.5.3 READ_ONLY listening on :${config.port}`
     );
 
     const KYIV_SLOTS = [
@@ -1054,6 +1100,32 @@ app.listen(
         }
       },
       12000
+    );
+
+    setTimeout(
+      async () => {
+        try {
+          const categories =
+            await getCategoryAudit();
+
+          console.log(
+            "[SUPPLIER_CATEGORY_AUDIT]"
+          );
+
+          console.log(
+            JSON.stringify(
+              categories
+            )
+          );
+        } catch (err) {
+          console.error(
+            "[SUPPLIER_CATEGORY_AUDIT_ERROR]",
+            err?.message ||
+            String(err)
+          );
+        }
+      },
+      30000
     );
 
     setTimeout(

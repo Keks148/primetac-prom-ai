@@ -1,28 +1,27 @@
-PrimeTac Hotfix v1.5.1
+PrimeTac Filter v1.5.3
 
-Причина:
-v1.5.0 успешно стартовал, но несколько startup-аудитов подряд повторно скачивали и парсили два больших XML.
-Render начал перезапускать instance до завершения GROUP_MAPPING_AUDIT.
-Также старая главная страница ожидала поле samples.families и могла отдавать 500.
+Новые правила:
+- Сертификаты BEZET не добавляются вообще.
+  Проверка: categoryId=3 или название содержит сертификат/сертифікат.
+- Любые товары без фото не добавляются вообще.
+  Правило действует для BEZET и MILITARIS.
+- BEZET по-прежнему не фильтруется по цене, бренду и обычным категориям.
+- MILITARIS сохраняет прежние фильтры:
+  от 500 грн, без шлемов, плит, магазинов/боеприпасов,
+  без Helikon-Tex, без обуви LOWA,
+  одежда/обувь в приоритете, аксессуары сокращаются первыми.
+- READ_ONLY сохраняется.
+- Category audit и group mapping сохраняются.
 
-Исправлено:
-- общий 15-минутный supplier snapshot/cache;
-- одновременные запросы присоединяются к одному fetch вместо повторной загрузки;
-- BEZET и MILITARIS получают корректный Referer;
-- dashboard больше не падает на отсутствии samples.families;
-- Group Mapping v1.5.0 сохранен;
-- READ_ONLY сохранен;
-- расписание 04/08/11/14/17/20/23 Kyiv сохранено.
-
-Заменить в GitHub:
+Заменить/добавить:
 - server.js
+- src/suppliers.js
 - src/catalog-filter.js
 - src/group-mapper.js
-- src/suppliers.js
+- src/category-audit.js
 - src/ui.js
 
 После deploy проверяем:
-- [SUPPLIERS_SNAPSHOT_READY]
-- [SUPPLIERS_CACHE_HIT] / [SUPPLIERS_CACHE_JOIN]
-- [GROUP_MAPPING_AUDIT]
-- отсутствие повторных restart
+[FILTERED_CATALOG_STATS]
+[SUPPLIER_CATEGORY_AUDIT]
+[GROUP_MAPPING_AUDIT]
