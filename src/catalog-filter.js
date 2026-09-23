@@ -509,17 +509,67 @@ function buildFilteredCatalogStats(
   suppliers,
   {
     minPrice = 500,
-    targetCards = 950,
+    maxMilitarisAccessories = 40,
     maxCards = 1000
   } = {}
 ) {
-  const bezet =
-    analyzeSupplier(
-      "BEZET",
-      suppliers.bezet.offers,
-      minPrice
+  // BEZET НЕ РЕЖЕМ ВООБЩЕ:
+  // берем все реальные модели, у которых есть хотя бы один вариант в наличии.
+  const bezetGroups =
+    groupSupplierOffers(
+      suppliers.bezet.offers
     );
 
+  const bezetSelected = [];
+
+  for (
+    const [groupId, items]
+    of bezetGroups.entries()
+  ) {
+    const availableItems =
+      items.filter(isAvailable);
+
+    if (!availableItems.length) {
+      continue;
+    }
+
+    bezetSelected.push({
+      supplier: "BEZET",
+      familyKey:
+        `BEZET:${groupId}`,
+      groupId,
+      categoryId:
+        String(
+          items[0]?.categoryId ||
+          ""
+        ),
+      name:
+        items[0]?.name ||
+        "",
+      type:
+        "bezet_keep_all",
+      reason:
+        "bezet_not_filtered",
+      totalVariants:
+        items.length,
+      availableVariants:
+        availableItems.length,
+      eligibleVariants:
+        availableItems.length,
+      minAvailablePrice:
+        Math.min(
+          ...availableItems.map(priceOf)
+        ),
+      maxAvailablePrice:
+        Math.max(
+          ...availableItems.map(priceOf)
+        ),
+      excluded:
+        false
+    });
+  }
+
+  // MILITARIS режем по правилам.
   const militaris =
     analyzeSupplier(
       "MILITARIS",
@@ -527,77 +577,58 @@ function buildFilteredCatalogStats(
       minPrice
     );
 
-  const priorityRows = [
-    ...bezet.rows,
-    ...militaris.rows
-  ]
-    .filter(
-      row =>
-        !row.excluded &&
-        (
-          row.type === "clothing" ||
-          row.type === "footwear"
-        )
-    )
-    .sort(
-      (a, b) => {
-        const aScore =
-          a.type === "footwear"
-            ? 2
-            : 1;
+  const militarisPriority =
+    militaris.rows
+      .filter(
+        row =>
+          !row.excluded &&
+          (
+            row.type === "clothing" ||
+            row.type === "footwear"
+          )
+      )
+      .sort(
+        (a, b) => {
+          const aScore =
+            a.type === "footwear"
+              ? 2
+              : 1;
 
-        const bScore =
-          b.type === "footwear"
-            ? 2
-            : 1;
+          const bScore =
+            b.type === "footwear"
+              ? 2
+              : 1;
 
-        return (
-          bScore - aScore ||
+          return (
+            bScore - aScore ||
+            b.availableVariants -
+              a.availableVariants ||
+            (b.minEligiblePrice || 0) -
+              (a.minEligiblePrice || 0)
+          );
+        }
+      );
+
+  const militarisAccessories =
+    militaris.rows
+      .filter(
+        row =>
+          !row.excluded &&
+          row.type === "accessory"
+      )
+      .sort(
+        (a, b) =>
           b.availableVariants -
             a.availableVariants ||
           (b.minEligiblePrice || 0) -
             (a.minEligiblePrice || 0)
-        );
-      }
-    );
+      );
 
-  const accessoryRows = [
-    ...bezet.rows,
-    ...militaris.rows
-  ]
-    .filter(
-      row =>
-        !row.excluded &&
-        row.type === "accessory"
-    )
-    .sort(
-      (a, b) =>
-        b.availableVariants -
-          a.availableVariants ||
-        (b.minEligiblePrice || 0) -
-          (a.minEligiblePrice || 0)
-    );
+  const selected = [
+    ...bezetSelected
+  ];
 
-  const otherRows = [
-    ...bezet.rows,
-    ...militaris.rows
-  ]
-    .filter(
-      row =>
-        !row.excluded &&
-        row.type === "other"
-    )
-    .sort(
-      (a, b) =>
-        b.availableVariants -
-          a.availableVariants ||
-        (b.minEligiblePrice || 0) -
-          (a.minEligiblePrice || 0)
-    );
-
-  const selected = [];
-
-  for (const row of priorityRows) {
+  for (const row of militarisPriority) {
     if (selected.length >= maxCards) {
       break;
     }
@@ -605,24 +636,19 @@ function buildFilteredCatalogStats(
     selected.push(row);
   }
 
-  // Аксессуары добавляем только если есть запас
-  // и только до целевого размера каталога.
-  for (const row of accessoryRows) {
-    if (selected.length >= targetCards) {
+  let addedMilitarisAccessories = 0;
+
+  for (const row of militarisAccessories) {
+    if (
+      selected.length >= maxCards ||
+      addedMilitarisAccessories >=
+        maxMilitarisAccessories
+    ) {
       break;
     }
 
     selected.push(row);
-  }
-
-  // Прочие товары добавляем последними,
-  // тоже только если не достигнут целевой размер.
-  for (const row of otherRows) {
-    if (selected.length >= targetCards) {
-      break;
-    }
-
-    selected.push(row);
+    addedMilitarisAccessories++;
   }
 
   const selectedBySupplier = {
@@ -635,74 +661,71 @@ function buildFilteredCatalogStats(
     MILITARIS:
       selected.filter(
         row =>
-          row.supplier === "MILITARIS"
+          row.supplier ===
+          "MILITARIS"
       ).length
   };
 
-  const selectedByType = {
+  const selectedMilitarisByType = {
     clothing:
       selected.filter(
         row =>
+          row.supplier ===
+            "MILITARIS" &&
           row.type === "clothing"
       ).length,
 
     footwear:
       selected.filter(
         row =>
+          row.supplier ===
+            "MILITARIS" &&
           row.type === "footwear"
       ).length,
 
     accessory:
       selected.filter(
         row =>
+          row.supplier ===
+            "MILITARIS" &&
           row.type === "accessory"
-      ).length,
-
-    other:
-      selected.filter(
-        row =>
-          row.type === "other"
       ).length
   };
 
   return {
     rules: {
-      minPrice,
-      exclude:
-        "helmets, ballistic plates, weapon magazines/ammunition, Militaris Helikon-Tex, Militaris LOWA footwear",
-      priority:
-        "clothing and footwear",
-      accessories:
-        "only if free slots remain",
-      targetCards,
+      BEZET:
+        "keep all available models; no price/category/brand filtering",
+
+      MILITARIS: {
+        minPrice,
+
+        exclude:
+          "helmets, ballistic plates, weapon magazines/ammunition, Helikon-Tex, LOWA footwear",
+
+        priority:
+          "clothing and footwear",
+
+        accessories:
+          `max ${maxMilitarisAccessories}`,
+
+        other:
+          "not auto-selected"
+      },
+
       maxCards
     },
 
     suppliers: {
       BEZET: {
         availableFamilies:
-          bezet.availableFamilies,
+          bezetSelected.length,
 
-        priorityClothing:
-          bezet.priorityClothing,
+        selected:
+          selectedBySupplier.BEZET,
 
-        priorityFootwear:
-          bezet.priorityFootwear,
-
-        priorityTotal:
-          bezet.priorityTotal,
-
-        optionalAccessories:
-          bezet.optionalAccessories,
-
-        optionalOther:
-          bezet.optionalOther,
-
-        excludedForbidden:
-          bezet.excludedForbidden,
-
-        excludedByPrice:
-          bezet.excludedByPrice
+        filteredOut:
+          0
       },
 
       MILITARIS: {
@@ -728,20 +751,14 @@ function buildFilteredCatalogStats(
           militaris.excludedForbidden,
 
         excludedByPrice:
-          militaris.excludedByPrice
+          militaris.excludedByPrice,
+
+        selected:
+          selectedBySupplier.MILITARIS
       }
     },
 
     combined: {
-      priorityClothingAndFootwear:
-        priorityRows.length,
-
-      optionalAccessories:
-        accessoryRows.length,
-
-      optionalOther:
-        otherRows.length,
-
       selectedCards:
         selected.length,
 
@@ -753,15 +770,13 @@ function buildFilteredCatalogStats(
         ),
 
       selectedBySupplier,
-      selectedByType
+
+      selectedMilitarisByType
     },
 
     samples: {
       selected:
         selected.slice(0, 40),
-
-      bezet:
-        bezet.samples,
 
       militaris:
         militaris.samples
