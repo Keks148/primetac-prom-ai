@@ -1,10 +1,13 @@
 const fs = require("fs");
 const path = require("path");
+
 const { config } = require("./config");
 const { listProducts, listGroups } = require("./prom");
 
-const EDITOR_VERSION = "2.0.0";
-const STATE_PATH = process.env.PROM_EDITOR_STATE_PATH || "/var/data/primetac-prom-editor-state.json";
+const EDITOR_VERSION = "2.0.1";
+const STATE_PATH =
+  process.env.PROM_EDITOR_STATE_PATH ||
+  "/var/data/primetac-prom-editor-state.json";
 
 const BLOCKED_BRANDS = [
   /\blowa\b/iu,
@@ -14,44 +17,125 @@ const BLOCKED_BRANDS = [
 ];
 
 const HARD_BLOCK = [
-  /бронеплит/iu, /бронепак/iu, /plate\s*carrier/iu, /плитоноск/iu,
-  /\bрпс\b/iu, /разгруз/iu, /розвантаж/iu,
-  /\bшлем/iu, /\bhelmet/iu, /\bкаск/iu,
-  /кавер.*(?:шлем|шолом|каск)/iu, /чехол.*(?:шлем|каск)/iu, /чохол.*шолом/iu,
-  /накладк.*(?:шлем|каск)/iu, /накладк.*шолом/iu,
-  /окуляр/iu, /\bочки\b/iu, /goggle/iu,
+  /бронеплит/iu,
+  /бронепак/iu,
+  /plate\s*carrier/iu,
+  /плитоноск/iu,
+  /\bрпс\b/iu,
+  /разгруз/iu,
+  /розвантаж/iu,
+  /\bшлем/iu,
+  /\bhelmet/iu,
+  /\bкаск/iu,
+  /кавер.*(?:шлем|шолом|каск)/iu,
+  /чехол.*(?:шлем|каск)/iu,
+  /чохол.*шолом/iu,
+  /накладк.*(?:шлем|каск)/iu,
+  /накладк.*шолом/iu,
+  /окуляр/iu,
+  /\bочки\b/iu,
+  /goggle/iu,
   /магазин.*(?:оруж|збро|автомат|винтов|пістолет|пистолет)/iu,
   /(?:оруж|збро).*магазин/iu,
-  /підсум/iu, /подсум/iu, /кобур/iu, /holster/iu,
-  /рем(?:ень|інь).*оруж/iu, /оруж.*рем(?:ень|інь)/iu,
-  /рем(?:ень|інь).*збро/iu, /збро.*рем(?:ень|інь)/iu,
-  /\bрюкзак/iu, /\bсумк/iu, /\bбаул/iu, /органайзер/iu,
-  /\bкарабин/iu, /\bкарабін/iu, /\bфонар/iu, /\bліхтар/iu,
-  /\bнож\b/iu, /\bніж\b/iu, /шеврон/iu, /\bпатч/iu,
-  /спальн.*(?:меш|міш)/iu, /наколен/iu, /налокот/iu,
-  /маскувальн.*сіт/iu, /маскировочн.*сет/iu
+  /підсум/iu,
+  /подсум/iu,
+  /кобур/iu,
+  /holster/iu,
+  /рем(?:ень|інь).*оруж/iu,
+  /оруж.*рем(?:ень|інь)/iu,
+  /рем(?:ень|інь).*збро/iu,
+  /збро.*рем(?:ень|інь)/iu,
+  /\bрюкзак/iu,
+  /\bсумк/iu,
+  /\bбаул/iu,
+  /органайзер/iu,
+  /\bкарабин/iu,
+  /\bкарабін/iu,
+  /\bфонар/iu,
+  /\bліхтар/iu,
+  /\bнож\b/iu,
+  /\bніж\b/iu,
+  /шеврон/iu,
+  /\bпатч/iu,
+  /спальн.*(?:меш|міш)/iu,
+  /наколен/iu,
+  /налокот/iu,
+  /маскувальн.*сіт/iu,
+  /маскировочн.*сет/iu
 ];
 
 const APPAREL_OR_SHOES = [
-  /тактичн.*одяг/iu, /тактическ.*одежд/iu, /\bодяг\b/iu, /\bодежд/iu,
-  /\bфутболк/iu, /\bполо\b/iu, /\bштани\b/iu, /\bбрюк/iu, /\bшорт/iu,
-  /\bкуртк/iu, /вітров/iu, /ветров/iu, /\bкофт/iu, /\bхуді/iu, /\bхуди/iu,
-  /\bфліс/iu, /\bфлис/iu, /\bсороч/iu, /\bрубаш/iu, /\bubacs\b/iu,
-  /термобілиз/iu, /термобель/iu, /дощов/iu, /дождев/iu, /\bпончо\b/iu,
-  /\bкостюм/iu, /\bботин/iu, /\bчеревик/iu, /\bберц/iu, /\bкрос/iu,
-  /\bвзут/iu, /\bобув/iu, /\bшкарпет/iu, /\bноск/iu, /\bстельк/iu,
-  /\bрукавич/iu, /\bперчат/iu, /головн.*убор/iu, /\bкепк/iu,
-  /\bпанам/iu, /\bшапк/iu, /\bбаф\b/iu, /\bбалаклав/iu
+  /тактичн.*одяг/iu,
+  /тактическ.*одежд/iu,
+  /\bодяг\b/iu,
+  /\bодежд/iu,
+  /\bфутболк/iu,
+  /\bполо\b/iu,
+  /\bштани\b/iu,
+  /\bштаны\b/iu,
+  /\bбрюк/iu,
+  /\bшорт/iu,
+  /\bджинс/iu,
+  /\bтрус/iu,
+  /\bкуртк/iu,
+  /вітров/iu,
+  /ветров/iu,
+  /\bкофт/iu,
+  /\bхуді/iu,
+  /\bхуди/iu,
+  /\bфліс/iu,
+  /\bфлис/iu,
+  /\bсороч/iu,
+  /\bрубаш/iu,
+  /\bubacs\b/iu,
+  /термобілиз/iu,
+  /термобель/iu,
+  /дощов/iu,
+  /дождев/iu,
+  /\bпончо\b/iu,
+  /\bкостюм/iu,
+  /\bжилет/iu,
+  /безрукав/iu,
+  /\bбомбер/iu,
+  /\bанорак/iu,
+  /св[іи]тшот/iu,
+  /толстовк/iu,
+  /\bманти/iu,
+  /\bботин/iu,
+  /\bчеревик/iu,
+  /\bберц/iu,
+  /\bкрос/iu,
+  /\bвзут/iu,
+  /\bобув/iu,
+  /\bсандал/iu,
+  /\bтапк/iu,
+  /\bшкарпет/iu,
+  /\bноск/iu,
+  /\bстельк/iu,
+  /\bрукавич/iu,
+  /\bперчат/iu,
+  /головн.*убор/iu,
+  /\bкепк/iu,
+  /\bпанам/iu,
+  /\bшапк/iu,
+  /\bбаф\b/iu,
+  /\bбалаклав/iu,
+  /\bберет/iu
 ];
 
 const BLOCK_GROUP = [
-  /тактичн.*споряджен/iu, /тактическ.*снаряжен/iu,
-  /захисн.*споряджен/iu, /защитн.*снаряжен/iu,
-  /аксесуар/iu, /рюкзак/iu, /сумк/iu, /туризм.*споряджен/iu
+  /тактичн.*споряджен/iu,
+  /тактическ.*снаряжен/iu,
+  /захисн.*споряджен/iu,
+  /защитн.*снаряжен/iu,
+  /аксесуар/iu,
+  /рюкзак/iu,
+  /сумк/iu,
+  /туризм.*споряджен/iu
 ];
 
 function clean(value) {
-  return String(value == null ? "" : value).replace(/\s+/g, " ").trim();
+  return String(value ?? "").replace(/\s+/g, " ").trim();
 }
 
 function norm(value) {
@@ -59,11 +143,11 @@ function norm(value) {
 }
 
 function stripHtml(value) {
-  return clean(String(value == null ? "" : value).replace(/<[^>]*>/g, " "));
+  return clean(String(value ?? "").replace(/<[^>]*>/g, " "));
 }
 
 function escapeHtml(value) {
-  return String(value == null ? "" : value)
+  return String(value ?? "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
@@ -71,142 +155,326 @@ function escapeHtml(value) {
 }
 
 function groupIdOf(product) {
-  return product && (
-    (product.group && product.group.id) ??
-    product.group_id ??
-    product.category_id ??
+  return (
+    product?.group?.id ??
+    product?.group_id ??
+    product?.category_id ??
     null
   );
 }
 
 function brandOf(product) {
-  return clean(product && (
-    product.vendor ??
-    product.brand ??
-    product.manufacturer ??
-    product.producer ??
+  return clean(
+    product?.vendor ??
+    product?.brand ??
+    product?.manufacturer ??
+    product?.producer ??
     ""
-  ));
+  );
 }
 
 function categoryNameOf(product) {
-  return clean(product && product.category && (
-    product.category.name ??
-    product.category.caption ??
+  return clean(
+    product?.category?.name ??
+    product?.category?.caption ??
     ""
-  ));
+  );
 }
 
 function quantityOf(product) {
-  const value = product && (
-    product.quantity_in_stock ??
-    product.quantity ??
-    product.stock_quantity ??
-    product.stock ??
-    null
-  );
+  const value =
+    product?.quantity_in_stock ??
+    product?.quantity ??
+    product?.stock_quantity ??
+    product?.stock ??
+    null;
+
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
 
 function presenceOf(product) {
-  return norm(product && (
-    product.presence ??
-    product.availability ??
-    product.available ??
+  return norm(
+    product?.presence ??
+    product?.availability ??
+    product?.available ??
     ""
-  ));
+  );
 }
 
 function isAvailable(product) {
   const presence = presenceOf(product);
-  if (["available", "in_stock", "true", "1", "в наявності", "в наличии"].includes(presence)) return true;
-  if (["not_available", "unavailable", "out_of_stock", "false", "0", "немає", "нет"].includes(presence)) return false;
+
+  if (
+    [
+      "available",
+      "in_stock",
+      "true",
+      "1",
+      "в наявності",
+      "в наличии"
+    ].includes(presence)
+  ) {
+    return true;
+  }
+
+  if (
+    [
+      "not_available",
+      "unavailable",
+      "out_of_stock",
+      "false",
+      "0",
+      "немає",
+      "нет"
+    ].includes(presence)
+  ) {
+    return false;
+  }
+
   const q = quantityOf(product);
   return q == null ? true : q > 0;
 }
 
 function buildGroupInfo(groups) {
   const byId = new Map();
+
   for (const group of groups || []) {
-    if (group && group.id != null) byId.set(String(group.id), group);
+    if (group?.id != null) {
+      byId.set(String(group.id), group);
+    }
   }
 
   function pathOf(group) {
     const names = [];
     const seen = new Set();
     let current = group;
-    while (current && current.id != null && !seen.has(String(current.id))) {
+
+    while (
+      current?.id != null &&
+      !seen.has(String(current.id))
+    ) {
       seen.add(String(current.id));
-      const name = clean(current.name ?? current.title);
-      if (name) names.unshift(name);
+
+      const name = clean(
+        current?.name ??
+        current?.title
+      );
+
+      if (name) {
+        names.unshift(name);
+      }
+
       const parentId =
-        current.parent_group_id ??
-        current.parent_id ??
-        (current.parent && current.parent.id) ??
+        current?.parent_group_id ??
+        current?.parent_id ??
+        current?.parent?.id ??
         null;
-      if (parentId == null) break;
-      current = byId.get(String(parentId)) || null;
+
+      if (parentId == null) {
+        break;
+      }
+
+      current =
+        byId.get(String(parentId)) ||
+        null;
     }
+
     return names.join(" > ");
   }
 
   const paths = new Map();
-  for (const entry of byId.entries()) paths.set(entry[0], pathOf(entry[1]));
-  return { byId, paths };
+
+  for (const [id, group] of byId.entries()) {
+    paths.set(id, pathOf(group));
+  }
+
+  return {
+    byId,
+    paths
+  };
 }
 
 function classifyProduct(product, groupsInfo) {
-  const name = clean(product && product.name);
+  const name = clean(product?.name);
   const brand = brandOf(product);
   const groupId = groupIdOf(product);
-  const groupPath = groupId == null ? "" : clean(groupsInfo.paths.get(String(groupId)) || "");
-  const category = categoryNameOf(product);
-  const haystack = [name, brand, groupPath, category].filter(Boolean).join(" | ");
 
-  if (BLOCKED_BRANDS.some((rx) => rx.test(haystack))) {
-    return { action: "REMOVE", reason: "blocked_brand", groupPath, brand };
+  const groupPath =
+    groupId == null
+      ? ""
+      : clean(
+          groupsInfo.paths.get(
+            String(groupId)
+          ) || ""
+        );
+
+  const category =
+    categoryNameOf(product);
+
+  const identityText =
+    [name, brand, category]
+      .filter(Boolean)
+      .join(" | ");
+
+  const productText =
+    [name, category]
+      .filter(Boolean)
+      .join(" | ");
+
+  // Brand exclusions are absolute.
+  if (
+    BLOCKED_BRANDS.some(
+      rx => rx.test(identityText)
+    )
+  ) {
+    return {
+      action: "REMOVE",
+      reason: "blocked_brand",
+      groupPath,
+      brand
+    };
   }
-  if (HARD_BLOCK.some((rx) => rx.test(haystack))) {
-    return { action: "REMOVE", reason: "non_apparel_hard_block", groupPath, brand };
+
+  // Product name/category always win over a bad supplier-created Prom group.
+  // This prevents valid pants/jackets from being removed merely because the
+  // supplier import accidentally placed them into "Кобури та кріплення".
+  if (
+    HARD_BLOCK.some(
+      rx => rx.test(productText)
+    )
+  ) {
+    return {
+      action: "REMOVE",
+      reason:
+        "non_apparel_hard_block",
+      groupPath,
+      brand
+    };
   }
-  if (APPAREL_OR_SHOES.some((rx) => rx.test(haystack))) {
-    return { action: "KEEP", reason: "apparel_or_footwear", groupPath, brand };
+
+  if (
+    APPAREL_OR_SHOES.some(
+      rx => rx.test(productText)
+    )
+  ) {
+    return {
+      action: "KEEP",
+      reason:
+        "apparel_or_footwear",
+      groupPath,
+      brand
+    };
   }
-  if (BLOCK_GROUP.some((rx) => rx.test(groupPath))) {
-    return { action: "REMOVE", reason: "non_apparel_group", groupPath, brand };
+
+  // Group classification is only a fallback.
+  if (
+    APPAREL_OR_SHOES.some(
+      rx => rx.test(groupPath)
+    )
+  ) {
+    return {
+      action: "KEEP",
+      reason:
+        "apparel_or_footwear_group",
+      groupPath,
+      brand
+    };
   }
-  return { action: "REVIEW", reason: "uncertain", groupPath, brand };
+
+  if (
+    BLOCK_GROUP.some(
+      rx => rx.test(groupPath)
+    )
+  ) {
+    return {
+      action: "REMOVE",
+      reason:
+        "non_apparel_group",
+      groupPath,
+      brand
+    };
+  }
+
+  return {
+    action: "REVIEW",
+    reason: "uncertain",
+    groupPath,
+    brand
+  };
 }
 
 function keywordTokens(value) {
   return clean(value)
-    .split(/[\s,.;:()\[\]{}\/\\|+_-]+/u)
-    .map((v) => v.trim())
-    .filter((v) => v.length >= 3 && v.length <= 32 && !/^\d+$/u.test(v));
+    .split(
+      /[\s,.;:()\[\]{}\/\\|+_-]+/u
+    )
+    .map(value => value.trim())
+    .filter(
+      value =>
+        value.length >= 3 &&
+        value.length <= 32 &&
+        !/^\d+$/u.test(value)
+    );
 }
 
 function unique(values, limit = 15) {
   const out = [];
   const seen = new Set();
+
   for (const raw of values) {
     const value = clean(raw);
-    const key = value.toLowerCase();
-    if (!value || seen.has(key)) continue;
+    const key =
+      value.toLowerCase();
+
+    if (
+      !value ||
+      seen.has(key)
+    ) {
+      continue;
+    }
+
     seen.add(key);
     out.push(value);
-    if (out.length >= limit) break;
+
+    if (out.length >= limit) {
+      break;
+    }
   }
+
   return out;
 }
 
-function buildKeywords(product, classification) {
-  const name = clean(product && product.name);
-  const brand = classification.brand;
-  const groupPath = classification.groupPath;
-  const isShoes = /взут|обув|ботин|черевик|берц|крос|шкарпет|носк|стельк/iu.test([name, groupPath].join(" "));
-  const baseUa = isShoes ? "тактичне взуття" : "тактичний одяг";
-  const baseRu = isShoes ? "тактическая обувь" : "тактическая одежда";
+function buildKeywords(
+  product,
+  classification
+) {
+  const name =
+    clean(product?.name);
+
+  const brand =
+    classification.brand;
+
+  const groupPath =
+    classification.groupPath;
+
+  const isShoes =
+    /взут|обув|ботин|черевик|берц|крос|сандал|тапк|шкарпет|носк|стельк/iu
+      .test(
+        [name, groupPath]
+          .join(" ")
+      );
+
+  const baseUa =
+    isShoes
+      ? "тактичне взуття"
+      : "тактичний одяг";
+
+  const baseRu =
+    isShoes
+      ? "тактическая обувь"
+      : "тактическая одежда";
+
   const values = [
     name,
     brand,
@@ -214,72 +482,191 @@ function buildKeywords(product, classification) {
     baseRu,
     "купити " + name,
     "купить " + name,
-    brand ? baseUa + " " + brand : "",
-    brand ? baseRu + " " + brand : ""
+    brand
+      ? baseUa + " " + brand
+      : "",
+    brand
+      ? baseRu + " " + brand
+      : ""
   ];
-  keywordTokens(name).forEach((token) => values.push(baseUa + " " + token));
-  keywordTokens(name).forEach((token) => values.push(baseRu + " " + token));
-  return unique(values, 15).join(", ").slice(0, 1024);
+
+  for (
+    const token
+    of keywordTokens(name)
+  ) {
+    values.push(
+      baseUa + " " + token
+    );
+  }
+
+  for (
+    const token
+    of keywordTokens(name)
+  ) {
+    values.push(
+      baseRu + " " + token
+    );
+  }
+
+  return unique(
+    values,
+    15
+  )
+    .join(", ")
+    .slice(0, 1024);
 }
 
-function buildDescriptions(product, classification) {
-  const name = clean(product && product.name) || "Товар";
-  const brand = classification.brand;
-  const group = classification.groupPath.split(" > ").filter(Boolean).pop() || "";
-  const sku = clean(product && (product.sku ?? product.sku_code ?? product.article ?? ""));
+function buildDescriptions(
+  product,
+  classification
+) {
+  const name =
+    clean(product?.name) ||
+    "Товар";
+
+  const brand =
+    classification.brand;
+
+  const group =
+    classification.groupPath
+      .split(" > ")
+      .filter(Boolean)
+      .pop() || "";
+
+  const sku =
+    clean(
+      product?.sku ??
+      product?.sku_code ??
+      product?.article ??
+      ""
+    );
 
   const uaItems = [
-    brand ? "<li><strong>Бренд:</strong> " + escapeHtml(brand) + "</li>" : "",
-    sku ? "<li><strong>Артикул:</strong> " + escapeHtml(sku) + "</li>" : "",
-    group ? "<li><strong>Категорія:</strong> " + escapeHtml(group) + "</li>" : ""
-  ].filter(Boolean).join("");
+    brand
+      ? "<li><strong>Бренд:</strong> " +
+        escapeHtml(brand) +
+        "</li>"
+      : "",
+    sku
+      ? "<li><strong>Артикул:</strong> " +
+        escapeHtml(sku) +
+        "</li>"
+      : "",
+    group
+      ? "<li><strong>Категорія:</strong> " +
+        escapeHtml(group) +
+        "</li>"
+      : ""
+  ]
+    .filter(Boolean)
+    .join("");
 
   const ruItems = [
-    brand ? "<li><strong>Бренд:</strong> " + escapeHtml(brand) + "</li>" : "",
-    sku ? "<li><strong>Артикул:</strong> " + escapeHtml(sku) + "</li>" : "",
-    group ? "<li><strong>Категория:</strong> " + escapeHtml(group) + "</li>" : ""
-  ].filter(Boolean).join("");
+    brand
+      ? "<li><strong>Бренд:</strong> " +
+        escapeHtml(brand) +
+        "</li>"
+      : "",
+    sku
+      ? "<li><strong>Артикул:</strong> " +
+        escapeHtml(sku) +
+        "</li>"
+      : "",
+    group
+      ? "<li><strong>Категория:</strong> " +
+        escapeHtml(group) +
+        "</li>"
+      : ""
+  ]
+    .filter(Boolean)
+    .join("");
 
   const ua = [
-    "<p><strong>" + escapeHtml(name) + "</strong></p>",
+    "<p><strong>" +
+      escapeHtml(name) +
+      "</strong></p>",
     "<p>Практична модель з актуального каталогу PrimeTac Group. Ціна та наявність синхронізуються з даними постачальника.</p>",
-    uaItems ? "<p><strong>Основна інформація:</strong></p><ul>" + uaItems + "</ul>" : "",
+    uaItems
+      ? "<p><strong>Основна інформація:</strong></p><ul>" +
+        uaItems +
+        "</ul>"
+      : "",
     "<p>Перед замовленням перевірте доступний розмір або варіант товару в картці.</p>"
-  ].filter(Boolean).join("");
+  ]
+    .filter(Boolean)
+    .join("");
 
   const ru = [
-    "<p><strong>" + escapeHtml(name) + "</strong></p>",
+    "<p><strong>" +
+      escapeHtml(name) +
+      "</strong></p>",
     "<p>Практичная модель из актуального каталога PrimeTac Group. Цена и наличие синхронизируются с данными поставщика.</p>",
-    ruItems ? "<p><strong>Основная информация:</strong></p><ul>" + ruItems + "</ul>" : "",
+    ruItems
+      ? "<p><strong>Основная информация:</strong></p><ul>" +
+        ruItems +
+        "</ul>"
+      : "",
     "<p>Перед заказом проверьте доступный размер или вариант товара в карточке.</p>"
-  ].filter(Boolean).join("");
+  ]
+    .filter(Boolean)
+    .join("");
 
-  return { ua, ru };
+  return {
+    ua,
+    ru
+  };
 }
 
 function keywordCount(product) {
-  const raw = product && (
-    product.keywords ??
-    product.search_keywords ??
-    product.searchKeywords ??
-    ""
-  );
-  if (Array.isArray(raw)) return raw.filter(Boolean).length;
-  return clean(raw).split(",").map((v) => v.trim()).filter(Boolean).length;
+  const raw =
+    product?.keywords ??
+    product?.search_keywords ??
+    product?.searchKeywords ??
+    "";
+
+  if (Array.isArray(raw)) {
+    return raw
+      .filter(Boolean)
+      .length;
+  }
+
+  return clean(raw)
+    .split(",")
+    .map(value => value.trim())
+    .filter(Boolean)
+    .length;
 }
 
 function shouldFillDescription(product) {
-  return stripHtml(product && product.description).length < 180;
+  return (
+    stripHtml(
+      product?.description
+    ).length < 180
+  );
 }
 
 function shouldFillKeywords(product) {
-  return keywordCount(product) < 6;
+  return (
+    keywordCount(product) < 6
+  );
 }
 
 function readState() {
   try {
-    if (!fs.existsSync(STATE_PATH)) return {};
-    return JSON.parse(fs.readFileSync(STATE_PATH, "utf8"));
+    if (
+      !fs.existsSync(
+        STATE_PATH
+      )
+    ) {
+      return {};
+    }
+
+    return JSON.parse(
+      fs.readFileSync(
+        STATE_PATH,
+        "utf8"
+      )
+    );
   } catch {
     return {};
   }
@@ -287,44 +674,176 @@ function readState() {
 
 function writeState(state) {
   try {
-    fs.mkdirSync(path.dirname(STATE_PATH), { recursive: true });
-    const tmp = STATE_PATH + ".tmp";
-    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
-    fs.renameSync(tmp, STATE_PATH);
+    fs.mkdirSync(
+      path.dirname(
+        STATE_PATH
+      ),
+      {
+        recursive: true
+      }
+    );
+
+    const tmp =
+      STATE_PATH + ".tmp";
+
+    fs.writeFileSync(
+      tmp,
+      JSON.stringify(
+        state,
+        null,
+        2
+      ),
+      "utf8"
+    );
+
+    fs.renameSync(
+      tmp,
+      STATE_PATH
+    );
   } catch (err) {
-    console.error("[PROM_EDITOR_STATE_ERROR]", err?.message || String(err));
+    console.error(
+      "[PROM_EDITOR_STATE_ERROR]",
+      err?.message ||
+      String(err)
+    );
   }
 }
 
-async function promRequest(endpoint, { method = "GET", body = null, language = null } = {}) {
-  if (!config.promToken) throw new Error("PROM_TOKEN is not configured");
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), config.httpTimeoutMs);
+async function wait(ms) {
+  return new Promise(
+    resolve =>
+      setTimeout(
+        resolve,
+        ms
+      )
+  );
+}
+
+async function promRequest(
+  endpoint,
+  {
+    method = "GET",
+    body = null,
+    language = null
+  } = {},
+  attempt = 0
+) {
+  if (!config.promToken) {
+    throw new Error(
+      "PROM_TOKEN is not configured"
+    );
+  }
+
+  const controller =
+    new AbortController();
+
+  const timer =
+    setTimeout(
+      () =>
+        controller.abort(),
+      config.httpTimeoutMs
+    );
+
   try {
-    const response = await fetch(config.promApiBase + "/" + String(endpoint).replace(/^\/+/, ""), {
-      method,
-      signal: controller.signal,
-      headers: {
-        Accept: "application/json",
-        Authorization: "Bearer " + config.promToken,
-        ...(language ? { "X-LANGUAGE": language } : {}),
-        ...(body != null ? { "Content-Type": "application/json" } : {})
-      },
-      body: body != null ? JSON.stringify(body) : undefined
-    });
-    const text = await response.text();
+    const response =
+      await fetch(
+        config.promApiBase +
+          "/" +
+          String(endpoint)
+            .replace(/^\/+/, ""),
+        {
+          method,
+          signal:
+            controller.signal,
+          headers: {
+            Accept:
+              "application/json",
+            Authorization:
+              "Bearer " +
+              config.promToken,
+            ...(language
+              ? {
+                  "X-LANGUAGE":
+                    language
+                }
+              : {}),
+            ...(body != null
+              ? {
+                  "Content-Type":
+                    "application/json"
+                }
+              : {})
+          },
+          body:
+            body != null
+              ? JSON.stringify(
+                  body
+                )
+              : undefined
+        }
+      );
+
+    const text =
+      await response.text();
+
     let payload = null;
+
     try {
-      payload = text ? JSON.parse(text) : null;
+      payload =
+        text
+          ? JSON.parse(text)
+          : null;
     } catch {
-      payload = { raw: text.slice(0, 500) };
+      payload = {
+        raw:
+          text.slice(
+            0,
+            500
+          )
+      };
     }
-    if (!response.ok) {
-      throw new Error(
-        "Prom API " + response.status + " " + response.statusText + ": " +
-        JSON.stringify(payload).slice(0, 800)
+
+    if (
+      (
+        response.status ===
+          429 ||
+        response.status >=
+          500
+      ) &&
+      attempt < 3
+    ) {
+      await wait(
+        700 *
+          2 ** attempt
+      );
+
+      return promRequest(
+        endpoint,
+        {
+          method,
+          body,
+          language
+        },
+        attempt + 1
       );
     }
+
+    if (!response.ok) {
+      throw new Error(
+        "Prom API " +
+          response.status +
+          " " +
+          response.statusText +
+          ": " +
+          JSON.stringify(
+            payload
+          ).slice(
+            0,
+            800
+          )
+      );
+    }
+
     return payload;
   } finally {
     clearTimeout(timer);
@@ -332,111 +851,315 @@ async function promRequest(endpoint, { method = "GET", body = null, language = n
 }
 
 function hasErrors(payload) {
-  const errors = payload?.errors;
-  if (!errors) return false;
-  if (typeof errors === "string") return errors.trim().length > 0;
-  if (Array.isArray(errors)) return errors.length > 0;
-  if (typeof errors === "object") return Object.keys(errors).length > 0;
+  const errors =
+    payload?.errors;
+
+  if (!errors) {
+    return false;
+  }
+
+  if (
+    typeof errors ===
+    "string"
+  ) {
+    return (
+      errors.trim().length >
+      0
+    );
+  }
+
+  if (
+    Array.isArray(errors)
+  ) {
+    return (
+      errors.length > 0
+    );
+  }
+
+  if (
+    typeof errors ===
+    "object"
+  ) {
+    return (
+      Object.keys(errors)
+        .length > 0
+    );
+  }
+
   return false;
 }
 
-async function editProducts(items, language = "uk") {
-  if (!items.length) return { processed: 0, responses: [] };
-  const responses = [];
-  for (let i = 0; i < items.length; i += 50) {
-    const batch = items.slice(i, i + 50);
-    const response = await promRequest("products/edit", {
-      method: "POST",
-      language,
-      body: batch
-    });
-    if (hasErrors(response)) {
-      throw new Error("Prom products/edit returned errors: " + JSON.stringify(response.errors).slice(0, 1000));
-    }
-    responses.push(response);
+async function editProducts(
+  items,
+  language = "uk"
+) {
+  if (!items.length) {
+    return {
+      processed: 0,
+      responses: []
+    };
   }
-  return { processed: items.length, responses };
+
+  const responses = [];
+
+  for (
+    let i = 0;
+    i < items.length;
+    i += 50
+  ) {
+    const batch =
+      items.slice(
+        i,
+        i + 50
+      );
+
+    const response =
+      await promRequest(
+        "products/edit",
+        {
+          method: "POST",
+          language,
+          body: batch
+        }
+      );
+
+    if (
+      hasErrors(response)
+    ) {
+      throw new Error(
+        "Prom products/edit returned errors: " +
+          JSON.stringify(
+            response.errors
+          ).slice(
+            0,
+            1000
+          )
+      );
+    }
+
+    responses.push(
+      response
+    );
+  }
+
+  return {
+    processed:
+      items.length,
+    responses
+  };
 }
 
-async function putTranslation(productId, lang, data) {
-  return promRequest("products/translation", {
-    method: "PUT",
-    body: {
-      product_id: String(productId),
-      lang,
-      ...data
+async function putTranslation(
+  productId,
+  lang,
+  data
+) {
+  return promRequest(
+    "products/translation",
+    {
+      method: "PUT",
+      body: {
+        product_id:
+          String(
+            productId
+          ),
+        lang,
+        ...data
+      }
     }
-  });
+  );
 }
 
 async function buildPromEditorPlan() {
-  const [products, groups] = await Promise.all([listProducts(), listGroups()]);
-  const groupsInfo = buildGroupInfo(groups);
+  const [
+    products,
+    groups
+  ] =
+    await Promise.all([
+      listProducts(),
+      listGroups()
+    ]);
+
+  const groupsInfo =
+    buildGroupInfo(
+      groups
+    );
+
   const keep = [];
   const remove = [];
   const review = [];
   const editPayload = [];
   const translations = [];
 
-  for (const product of products) {
-    const classification = classifyProduct(product, groupsInfo);
+  for (
+    const product
+    of products
+  ) {
+    const classification =
+      classifyProduct(
+        product,
+        groupsInfo
+      );
+
     const item = {
-      id: product?.id ?? null,
-      name: clean(product?.name),
-      externalId: clean(product?.external_id),
-      sku: clean(product?.sku ?? product?.sku_code ?? product?.article),
-      groupId: groupIdOf(product),
-      groupPath: classification.groupPath,
-      brand: classification.brand,
-      presence: presenceOf(product),
-      quantity: quantityOf(product),
-      reason: classification.reason
+      id:
+        product?.id ??
+        null,
+
+      name:
+        clean(
+          product?.name
+        ),
+
+      externalId:
+        clean(
+          product?.external_id
+        ),
+
+      sku:
+        clean(
+          product?.sku ??
+          product?.sku_code ??
+          product?.article
+        ),
+
+      groupId:
+        groupIdOf(product),
+
+      groupPath:
+        classification.groupPath,
+
+      brand:
+        classification.brand,
+
+      presence:
+        presenceOf(product),
+
+      quantity:
+        quantityOf(product),
+
+      reason:
+        classification.reason
     };
 
-    if (classification.action === "REMOVE") {
+    if (
+      classification.action ===
+      "REMOVE"
+    ) {
       remove.push(item);
-      if (isAvailable(product) || quantityOf(product) !== 0) {
+
+      if (
+        isAvailable(product) ||
+        quantityOf(product) !==
+          0
+      ) {
         editPayload.push({
-          id: Number(product.id),
-          presence: "not_available",
-          quantity_in_stock: 0
+          id:
+            Number(
+              product.id
+            ),
+
+          presence:
+            "not_available",
+
+          quantity_in_stock:
+            0
         });
       }
+
       continue;
     }
 
-    if (classification.action === "REVIEW") {
+    if (
+      classification.action ===
+      "REVIEW"
+    ) {
       review.push(item);
       continue;
     }
 
-    const fillKeywords = shouldFillKeywords(product);
-    const fillDescription = shouldFillDescription(product);
-    const payload = { id: Number(product.id) };
-    const keywords = buildKeywords(product, classification);
+    const fillKeywords =
+      shouldFillKeywords(
+        product
+      );
 
-    if (fillKeywords) payload.keywords = keywords;
+    const fillDescription =
+      shouldFillDescription(
+        product
+      );
+
+    const payload = {
+      id:
+        Number(
+          product.id
+        )
+    };
+
+    const keywords =
+      buildKeywords(
+        product,
+        classification
+      );
+
+    if (fillKeywords) {
+      payload.keywords =
+        keywords;
+    }
 
     if (fillDescription) {
-      const descriptions = buildDescriptions(product, classification);
-      payload.description = descriptions.ua;
+      const descriptions =
+        buildDescriptions(
+          product,
+          classification
+        );
+
+      payload.description =
+        descriptions.ua;
+
       translations.push({
-        productId: String(product.id),
+        productId:
+          String(
+            product.id
+          ),
+
         lang: "ru",
+
         data: {
-          description: descriptions.ru,
-          ...(fillKeywords ? { keywords } : {})
+          description:
+            descriptions.ru,
+
+          ...(fillKeywords
+            ? {
+                keywords
+              }
+            : {})
         }
       });
-    } else if (fillKeywords) {
+    } else if (
+      fillKeywords
+    ) {
       translations.push({
-        productId: String(product.id),
+        productId:
+          String(
+            product.id
+          ),
+
         lang: "ru",
-        data: { keywords }
+
+        data: {
+          keywords
+        }
       });
     }
 
-    if (Object.keys(payload).length > 1) editPayload.push(payload);
+    if (
+      Object.keys(payload)
+        .length > 1
+    ) {
+      editPayload.push(
+        payload
+      );
+    }
 
     keep.push({
       ...item,
@@ -445,42 +1168,125 @@ async function buildPromEditorPlan() {
     });
   }
 
-  const countsByGroup = new Map();
-  for (const product of products) {
-    const gid = groupIdOf(product);
-    if (gid == null) continue;
-    countsByGroup.set(String(gid), (countsByGroup.get(String(gid)) || 0) + 1);
+  const countsByGroup =
+    new Map();
+
+  for (
+    const product
+    of products
+  ) {
+    const groupId =
+      groupIdOf(product);
+
+    if (groupId == null) {
+      continue;
+    }
+
+    const key =
+      String(groupId);
+
+    countsByGroup.set(
+      key,
+      (
+        countsByGroup.get(
+          key
+        ) || 0
+      ) + 1
+    );
   }
 
-  const emptyGroups = (groups || [])
-    .filter((group) => group?.id != null && !countsByGroup.has(String(group.id)))
-    .map((group) => ({
-      id: group.id,
-      name: clean(group?.name ?? group?.title),
-      parentId: group?.parent_group_id ?? group?.parent_id ?? group?.parent?.id ?? null,
-      path: clean(groupsInfo.paths.get(String(group.id)) || "")
-    }));
+  const emptyGroups =
+    (groups || [])
+      .filter(
+        group =>
+          group?.id != null &&
+          !countsByGroup.has(
+            String(
+              group.id
+            )
+          )
+      )
+      .map(
+        group => ({
+          id:
+            group.id,
+
+          name:
+            clean(
+              group?.name ??
+              group?.title
+            ),
+
+          parentId:
+            group?.parent_group_id ??
+            group?.parent_id ??
+            group?.parent?.id ??
+            null,
+
+          path:
+            clean(
+              groupsInfo.paths.get(
+                String(
+                  group.id
+                )
+              ) || ""
+            )
+        })
+      );
 
   return {
-    version: EDITOR_VERSION,
-    generatedAt: new Date().toISOString(),
-    mode: "POST_IMPORT_EDITOR",
+    version:
+      EDITOR_VERSION,
+
+    generatedAt:
+      new Date()
+        .toISOString(),
+
+    mode:
+      "POST_IMPORT_EDITOR",
+
     policy: {
-      keep: "clothing and footwear only",
-      blockedBrands: ["LOWA", "Helikon-Tex"],
-      removeImplementation: "mark_not_available_via_public_api",
-      unknownProducts: "review_only",
-      groupDeletion: "report_only_public_api_has_no_group_delete"
+      keep:
+        "clothing and footwear only",
+
+      blockedBrands: [
+        "LOWA",
+        "Helikon-Tex"
+      ],
+
+      removeImplementation:
+        "mark_not_available_via_public_api",
+
+      unknownProducts:
+        "review_only",
+
+      groupDeletion:
+        "report_only_public_api_has_no_group_delete"
     },
+
     counts: {
-      products: products.length,
-      keep: keep.length,
-      remove: remove.length,
-      review: review.length,
-      edits: editPayload.length,
-      translations: translations.length,
-      emptyGroups: emptyGroups.length
+      products:
+        products.length,
+
+      keep:
+        keep.length,
+
+      remove:
+        remove.length,
+
+      review:
+        review.length,
+
+      edits:
+        editPayload.length,
+
+      translations:
+        translations.length,
+
+      emptyGroups:
+        emptyGroups.length
     },
+
     keep,
     remove,
     review,
@@ -490,21 +1296,55 @@ async function buildPromEditorPlan() {
   };
 }
 
-async function runPromEditor({ apply = false, reason = "manual" } = {}) {
-  const plan = await buildPromEditorPlan();
+async function runPromEditor(
+  {
+    apply = false,
+    reason = "manual"
+  } = {}
+) {
+  const plan =
+    await buildPromEditorPlan();
+
   const result = {
-    version: EDITOR_VERSION,
+    version:
+      EDITOR_VERSION,
+
     reason,
     apply,
-    startedAt: new Date().toISOString(),
+
+    startedAt:
+      new Date()
+        .toISOString(),
+
     plan: {
-      generatedAt: plan.generatedAt,
-      policy: plan.policy,
-      counts: plan.counts,
-      removeExamples: plan.remove.slice(0, 40),
-      reviewExamples: plan.review.slice(0, 40),
-      emptyGroupExamples: plan.emptyGroups.slice(0, 40)
+      generatedAt:
+        plan.generatedAt,
+
+      policy:
+        plan.policy,
+
+      counts:
+        plan.counts,
+
+      removeExamples:
+        plan.remove.slice(
+          0,
+          40
+        ),
+
+      reviewExamples:
+        plan.review.slice(
+          0,
+          40
+        ),
+
+      emptyGroupExamples:
+        plan.emptyGroups.slice(
+          0,
+          40
+        )
     },
+
     applied: {
       productEdits: 0,
       translations: 0
@@ -512,30 +1352,70 @@ async function runPromEditor({ apply = false, reason = "manual" } = {}) {
   };
 
   if (apply) {
-    const edits = await editProducts(plan.editPayload, "uk");
-    result.applied.productEdits = edits.processed;
+    const edits =
+      await editProducts(
+        plan.editPayload,
+        "uk"
+      );
 
-    for (const item of plan.translations) {
+    result.applied
+      .productEdits =
+        edits.processed;
+
+    for (
+      const item
+      of plan.translations
+    ) {
       try {
-        await putTranslation(item.productId, item.lang, item.data);
-        result.applied.translations++;
+        await putTranslation(
+          item.productId,
+          item.lang,
+          item.data
+        );
+
+        result.applied
+          .translations++;
       } catch (err) {
-        console.error("[PROM_EDITOR_TRANSLATION_ERROR]", JSON.stringify({
-          productId: item.productId,
-          error: err?.message || String(err)
-        }));
+        console.error(
+          "[PROM_EDITOR_TRANSLATION_ERROR]",
+          JSON.stringify({
+            productId:
+              item.productId,
+
+            error:
+              err?.message ||
+              String(err)
+          })
+        );
       }
     }
   }
 
-  result.finishedAt = new Date().toISOString();
-  const state = readState();
-  state.lastRun = result;
-  state.version = EDITOR_VERSION;
+  result.finishedAt =
+    new Date()
+      .toISOString();
+
+  const state =
+    readState();
+
+  state.lastRun =
+    result;
+
+  state.version =
+    EDITOR_VERSION;
+
   writeState(state);
 
-  console.log("[PROM_EDITOR_RUN]");
-  console.log(JSON.stringify(result));
+  console.log(
+    "[PROM_EDITOR_RUN]"
+  );
+
+  console.log(
+    JSON.stringify(
+      result
+    )
+  );
+
   return result;
 }
 
