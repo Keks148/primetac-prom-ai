@@ -3,7 +3,7 @@ const path = require("path");
 const { config } = require("./config");
 const { listProducts, listGroups } = require("./prom");
 
-const EDITOR_VERSION = "2.1.0";
+const EDITOR_VERSION = "2.1.1";
 const STATE_PATH =
   process.env.PROM_EDITOR_STATE_PATH ||
   "/var/data/primetac-prom-editor-state.json";
@@ -348,36 +348,35 @@ function classifyProduct(product, groupsInfo) {
 }
 
 function targetGroupForProduct(product) {
-  const text = norm([
-    product?.name,
-    categoryNameOf(product)
-  ].filter(Boolean).join(" | "));
+  // Group by the product name only. Prom marketplace/category data can be wrong
+  // after supplier imports and must not move a fleece jacket into thermal underwear.
+  const text = norm(product?.name);
 
-  if (/термобілиз|термобель/iu.test(text)) {
+  if (/термобілиз|термобель|thermal underwear|base layer/iu.test(text)) {
     return { id: TARGET_GROUPS.THERMAL, labelUa: "Термобілизна", labelRu: "Термобелье" };
   }
   if (/дощов|дождев|пончо/iu.test(text)) {
     return { id: TARGET_GROUPS.RAIN, labelUa: "Дощовики та пончо", labelRu: "Дождевики и пончо" };
   }
-  if (/куртк|вітров|ветров|бомбер|анорак/iu.test(text)) {
+  if (/куртк|вітров|ветров|бомбер|анорак|jacket|smock|parka/iu.test(text)) {
     return { id: TARGET_GROUPS.JACKETS, labelUa: "Куртки та вітровки", labelRu: "Куртки и ветровки" };
   }
-  if (/фліс|флис|худі|худи|кофт|толстовк|св[іи]тшот/iu.test(text)) {
+  if (/фліс|флис|fleece|худі|худи|hoodie|кофт|толстовк|св[іи]тшот|sweatshirt/iu.test(text)) {
     return { id: TARGET_GROUPS.FLEECE, labelUa: "Фліс, кофти та худі", labelRu: "Флис, кофты и худи" };
   }
   if (/футболк|поло/iu.test(text)) {
     return { id: TARGET_GROUPS.TSHIRTS, labelUa: "Футболки та поло", labelRu: "Футболки и поло" };
   }
-  if (/сороч|рубаш|\bubacs\b/iu.test(text)) {
+  if (/сороч|рубаш|shirt|\bubacs\b/iu.test(text)) {
     return { id: TARGET_GROUPS.SHIRTS, labelUa: "Сорочки та UBACS", labelRu: "Рубашки и UBACS" };
   }
-  if (/штани|штаны|брюк|шорт|джинс|карго|трус/iu.test(text)) {
+  if (/штани|штаны|брюк|pants|trousers|шорт|shorts|джинс|jeans|карго|cargo|трус/iu.test(text)) {
     return { id: TARGET_GROUPS.PANTS, labelUa: "Штани та шорти", labelRu: "Брюки и шорты" };
   }
-  if (/ботин|черевик|берц/iu.test(text)) {
+  if (/ботин|черевик|берц|boots?/iu.test(text)) {
     return { id: TARGET_GROUPS.BOOTS, labelUa: "Черевики та берці", labelRu: "Ботинки и берцы" };
   }
-  if (/крос/iu.test(text)) {
+  if (/крос|sneakers?|trainers?/iu.test(text)) {
     return { id: TARGET_GROUPS.SNEAKERS, labelUa: "Кросівки", labelRu: "Кроссовки" };
   }
   if (/шкарпет|носк|стельк/iu.test(text)) {
