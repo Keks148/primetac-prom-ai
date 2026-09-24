@@ -1,12 +1,12 @@
 {
-  "name": "primetac-sync",
-  "version": "1.0.0",
+  "name": "primetac-editor",
+  "version": "2.0.0",
   "private": true,
-  "description": "PrimeTac Sync v1.0 - read-only audit for Prom.ua, BEZET and Militaris",
-  "main": "server.js",
+  "description": "PrimeTac post-import editor for Prom.ua",
+  "main": "editor-server.js",
   "scripts": {
-    "start": "node server.js",
-    "check": "node --check server.js && node --check src/config.js && node --check src/prom.js && node --check src/suppliers.js && node --check src/audit.js && node --check src/ui.js"
+    "start": "node editor-server.js",
+    "check": "node --check editor-server.js && node --check src/prom-editor.js && node --check src/config.js && node --check src/prom.js"
   },
   "engines": {
     "node": ">=20"
