@@ -135,7 +135,7 @@ function extractGender(name) {
   const text = norm(name);
   if (/женск|жіноч/iu.test(text)) return "Жіночий";
   if (/мужск|чоловіч/iu.test(text)) return "Чоловічий";
-  return "Унісекс";
+  return "";
 }
 
 function extractSeason(name) {
@@ -146,31 +146,237 @@ function extractSeason(name) {
   return "";
 }
 
+function sourceParamValue(offer, aliases) {
+  const wanted = aliases.map(value => norm(value));
+
+  for (const param of offer?.params || []) {
+    const name = norm(param?.name);
+
+    if (
+      wanted.some(
+        alias =>
+          name === alias ||
+          name.includes(alias)
+      )
+    ) {
+      const value =
+        clean(param?.value);
+
+      if (value) {
+        return value;
+      }
+    }
+  }
+
+  return "";
+}
+
+function canonicalParamName(name) {
+  const value = norm(name);
+
+  if (["цвет", "колір", "color", "colour"].includes(value)) {
+    return "Колір";
+  }
+
+  if (["размер", "розмір", "size"].includes(value)) {
+    return "Розмір";
+  }
+
+  if (["пол", "стать", "gender"].includes(value)) {
+    return "Стать";
+  }
+
+  if (["сезон", "season"].includes(value)) {
+    return "Сезон";
+  }
+
+  if (
+    [
+      "бренд",
+      "brand",
+      "vendor",
+      "виробник",
+      "производитель"
+    ].includes(value)
+  ) {
+    return "Бренд";
+  }
+
+  if (
+    [
+      "країна",
+      "страна",
+      "country",
+      "країна виробник",
+      "страна производитель"
+    ].includes(value)
+  ) {
+    return "Країна виробник";
+  }
+
+  return clean(name);
+}
+
 function buildCharacteristics(product, offer, target) {
   const pairs = [];
 
+  const reserved =
+    new Set([
+      "Колір",
+      "Стать",
+      "Сезон",
+      "Бренд",
+      "Країна виробник",
+      "Тип товару"
+    ]);
+
   for (const param of offer?.params || []) {
+    const canonicalName =
+      canonicalParamName(
+        param?.name
+      );
+
+    if (
+      !canonicalName ||
+      reserved.has(
+        canonicalName
+      )
+    ) {
+      continue;
+    }
+
     pairs.push({
-      name: param?.name,
-      value: param?.value,
+      name:
+        canonicalName,
+
+      value:
+        param?.value,
+
       unit: ""
     });
   }
 
-  const vendor = clean(offer?.vendor);
-  const country = clean(offer?.country);
-  const color = extractColor(product?.name);
-  const gender = extractGender(product?.name);
-  const season = extractSeason(product?.name);
+  const vendor =
+    clean(offer?.vendor) ||
+    sourceParamValue(
+      offer,
+      [
+        "бренд",
+        "brand",
+        "виробник",
+        "производитель"
+      ]
+    );
 
-  if (vendor) pairs.unshift({ name: "Бренд", value: vendor, unit: "" });
-  if (country) pairs.push({ name: "Країна виробник", value: country, unit: "" });
-  if (target?.labelUa) pairs.push({ name: "Тип товару", value: target.labelUa, unit: "" });
-  if (color) pairs.push({ name: "Колір", value: color, unit: "" });
-  if (gender) pairs.push({ name: "Стать", value: gender, unit: "" });
-  if (season) pairs.push({ name: "Сезон", value: season, unit: "" });
+  const country =
+    clean(offer?.country) ||
+    sourceParamValue(
+      offer,
+      [
+        "країна виробник",
+        "страна производитель",
+        "country"
+      ]
+    );
 
-  return uniquePairs(pairs, 10);
+  // If the name explicitly contains a color, it wins over a stale supplier
+  // parameter. This prevents cards such as "... белый" + "Цвет: Черный".
+  const color =
+    extractColor(
+      product?.name
+    ) ||
+    sourceParamValue(
+      offer,
+      [
+        "колір",
+        "цвет",
+        "color",
+        "colour"
+      ]
+    );
+
+  // Do not invent "Unisex". Only write gender when the name/feed actually says it.
+  const gender =
+    extractGender(
+      product?.name
+    ) ||
+    sourceParamValue(
+      offer,
+      [
+        "стать",
+        "пол",
+        "gender"
+      ]
+    );
+
+  const season =
+    extractSeason(
+      product?.name
+    ) ||
+    sourceParamValue(
+      offer,
+      [
+        "сезон",
+        "season"
+      ]
+    );
+
+  if (vendor) {
+    pairs.unshift({
+      name: "Бренд",
+      value: vendor,
+      unit: ""
+    });
+  }
+
+  if (country) {
+    pairs.push({
+      name:
+        "Країна виробник",
+      value:
+        country,
+      unit: ""
+    });
+  }
+
+  if (target?.labelUa) {
+    pairs.push({
+      name:
+        "Тип товару",
+      value:
+        target.labelUa,
+      unit: ""
+    });
+  }
+
+  if (color) {
+    pairs.push({
+      name: "Колір",
+      value: color,
+      unit: ""
+    });
+  }
+
+  if (gender) {
+    pairs.push({
+      name: "Стать",
+      value: gender,
+      unit: ""
+    });
+  }
+
+  if (season) {
+    pairs.push({
+      name: "Сезон",
+      value: season,
+      unit: ""
+    });
+  }
+
+  return uniquePairs(
+    pairs,
+    10
+  );
 }
 
 function safeDescription(product, classification, lang) {
