@@ -703,6 +703,37 @@ async function submitEnrichmentImport() {
   }
 
   if (!response.ok) {
+    const apiMessage =
+      clean(
+        payload?.error?.message ??
+        payload?.message ??
+        ""
+      );
+
+    if (
+      response.status === 400 &&
+      /одновременн.*импорт/iu.test(
+        apiMessage
+      )
+    ) {
+      const result = {
+        submitted: false,
+        busy: true,
+        reason: "prom_import_busy",
+        message: apiMessage,
+        summary: feed.summary
+      };
+
+      console.log(
+        "[PROM_ENRICH_IMPORT_BUSY]"
+      );
+      console.log(
+        JSON.stringify(result)
+      );
+
+      return result;
+    }
+
     throw new Error(
       "Prom enrichment import " +
       response.status +

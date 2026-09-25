@@ -3,10 +3,19 @@ const path = require("path");
 const { config } = require("./config");
 const { listProducts, listGroups } = require("./prom");
 
-const EDITOR_VERSION = "2.1.1";
+const EDITOR_VERSION = "2.2.0";
 const STATE_PATH =
   process.env.PROM_EDITOR_STATE_PATH ||
   "/var/data/primetac-prom-editor-state.json";
+
+const CONTENT_INTERVAL_MINUTES =
+  Math.max(
+    60,
+    Number(
+      process.env.PROM_EDITOR_CONTENT_INTERVAL_MINUTES ||
+      240
+    )
+  );
 
 const BLOCKED_BRANDS = [
   /\blowa\b/iu,
@@ -627,7 +636,8 @@ async function buildPromEditorPlan() {
   const remove = [];
   const review = [];
   const groupFixes = [];
-  const editPayload = [];
+  const removePayload = [];
+  const contentPayload = [];
   const translations = [];
 
   for (const product of products) {
@@ -652,7 +662,7 @@ async function buildPromEditorPlan() {
     if (classification.action === "REMOVE") {
       remove.push(item);
       if (isAvailable(product) || quantityOf(product) !== 0) {
-        editPayload.push({
+        removePayload.push({
           id: Number(product.id),
           presence: "not_available",
           quantity_in_stock: 0
@@ -705,7 +715,7 @@ async function buildPromEditorPlan() {
       });
     }
 
-    if (Object.keys(payload).length > 1) editPayload.push(payload);
+    if (Object.keys(payload).length > 1) contentPayload.push(payload);
 
     keep.push({
       ...item,
@@ -753,7 +763,9 @@ async function buildPromEditorPlan() {
       remove: remove.length,
       review: review.length,
       groupFixes: groupFixes.length,
-      edits: editPayload.length,
+      removeEdits: removePayload.length,
+      contentEdits: contentPayload.length,
+      edits: removePayload.length + contentPayload.length,
       translations: translations.length,
       emptyGroups: emptyGroups.length
     },
@@ -762,13 +774,31 @@ async function buildPromEditorPlan() {
     review,
     groupFixes,
     emptyGroups,
-    editPayload,
+    removePayload,
+    contentPayload,
     translations
   };
 }
 
 async function runPromEditor({ apply = false, reason = "manual" } = {}) {
   const plan = await buildPromEditorPlan();
+  const editorState = readState();
+
+  const lastContentApplyMs =
+    Date.parse(
+      editorState.lastContentApplyAt ||
+      ""
+    );
+
+  const contentDue =
+    !Number.isFinite(lastContentApplyMs) ||
+    (
+      Date.now() -
+      lastContentApplyMs
+    ) >=
+    CONTENT_INTERVAL_MINUTES *
+    60 *
+    1000;
 
   const result = {
     version: EDITOR_VERSION,
@@ -779,39 +809,83 @@ async function runPromEditor({ apply = false, reason = "manual" } = {}) {
       generatedAt: plan.generatedAt,
       policy: plan.policy,
       counts: plan.counts,
+      contentDue,
+      contentIntervalMinutes: CONTENT_INTERVAL_MINUTES,
+      lastContentApplyAt:
+        editorState.lastContentApplyAt ||
+        null,
       removeExamples: plan.remove.slice(0, 40),
       reviewExamples: plan.review.slice(0, 40),
       groupFixExamples: plan.groupFixes.slice(0, 40),
       emptyGroupExamples: plan.emptyGroups.slice(0, 40)
     },
     applied: {
+      removalEdits: 0,
+      contentEdits: 0,
       productEdits: 0,
       translations: 0
     }
   };
 
   if (apply) {
-    const edits = await editProducts(plan.editPayload, "uk");
-    result.applied.productEdits = edits.processed;
+    const removals =
+      await editProducts(
+        plan.removePayload,
+        "uk"
+      );
 
-    for (const item of plan.translations) {
-      try {
-        await putTranslation(item.productId, item.lang, item.data);
-        result.applied.translations++;
-      } catch (err) {
-        console.error("[PROM_EDITOR_TRANSLATION_ERROR]", JSON.stringify({
-          productId: item.productId,
-          error: err?.message || String(err)
-        }));
+    result.applied.removalEdits =
+      removals.processed;
+
+    if (contentDue) {
+      const contentEdits =
+        await editProducts(
+          plan.contentPayload,
+          "uk"
+        );
+
+      result.applied.contentEdits =
+        contentEdits.processed;
+
+      for (const item of plan.translations) {
+        try {
+          await putTranslation(
+            item.productId,
+            item.lang,
+            item.data
+          );
+
+          result.applied.translations++;
+        } catch (err) {
+          console.error(
+            "[PROM_EDITOR_TRANSLATION_ERROR]",
+            JSON.stringify({
+              productId:
+                item.productId,
+
+              error:
+                err?.message ||
+                String(err)
+            })
+          );
+        }
       }
+
+      editorState.lastContentApplyAt =
+        new Date().toISOString();
     }
   }
 
-  result.finishedAt = new Date().toISOString();
-  const state = readState();
-  state.lastRun = result;
-  state.version = EDITOR_VERSION;
-  writeState(state);
+  result.applied.productEdits =
+    result.applied.removalEdits +
+    result.applied.contentEdits;
+
+  result.finishedAt =
+    new Date().toISOString();
+
+  editorState.lastRun = result;
+  editorState.version = EDITOR_VERSION;
+  writeState(editorState);
 
   console.log("[PROM_EDITOR_RUN]");
   console.log(JSON.stringify(result));
