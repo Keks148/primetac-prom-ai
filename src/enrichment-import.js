@@ -38,14 +38,25 @@ function sourceIndex(suppliers) {
   const byId = new Map();
   const bySku = new Map();
 
-  for (const supplier of [suppliers?.bezet, suppliers?.militaris]) {
+  const sources = [
+    ["bezet", suppliers?.bezet],
+    ["militaris", suppliers?.militaris]
+  ];
+
+  for (const [supplierKey, supplier] of sources) {
     for (const offer of supplier?.offers || []) {
-      const id = clean(offer?.id);
+      const wrapped = { offer, supplierKey };
+      const id = clean(offer?.id).toLowerCase();
       const sku = clean(offer?.sku).toLowerCase();
-      if (id) byId.set(id.toLowerCase(), offer);
+
+      if (id) {
+        if (!byId.has(id)) byId.set(id, []);
+        byId.get(id).push(wrapped);
+      }
+
       if (sku) {
         if (!bySku.has(sku)) bySku.set(sku, []);
-        bySku.get(sku).push(offer);
+        bySku.get(sku).push(wrapped);
       }
     }
   }
@@ -53,9 +64,86 @@ function sourceIndex(suppliers) {
   return { byId, bySku };
 }
 
+function sourcePreference(product) {
+  const text = norm([
+    product?.name,
+    product?.vendor,
+    product?.brand,
+    product?.manufacturer
+  ].filter(Boolean).join(" "));
+
+  if (text.includes("bezet")) return "bezet";
+  return null;
+}
+
+function meaningfulNameTokens(value) {
+  const stop = new Set([
+    "тактический", "тактическая", "тактические",
+    "тактичний", "тактична", "тактичні",
+    "женский", "женская", "женские",
+    "жіночий", "жіноча", "жіночі",
+    "мужской", "мужская", "мужские",
+    "чоловічий", "чоловіча", "чоловічі"
+  ]);
+
+  return norm(value)
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .split(/\s+/u)
+    .filter(token => token.length >= 4 && !stop.has(token));
+}
+
+function candidateScore(product, wrapped) {
+  const productTokens = meaningfulNameTokens(product?.name);
+  const offerName = norm(wrapped?.offer?.name);
+  const vendor = norm(wrapped?.offer?.vendor);
+
+  let score = productTokens.filter(token => offerName.includes(token)).length;
+
+  if (norm(product?.name).includes("bezet")) {
+    if (wrapped?.supplierKey === "bezet") score += 10;
+    if (vendor.includes("bezet")) score += 5;
+  }
+
+  return score;
+}
+
+function chooseCandidate(product, candidates) {
+  if (!candidates?.length) return null;
+
+  const preferred = sourcePreference(product);
+  let pool = candidates;
+
+  if (preferred) {
+    pool = candidates.filter(item => item?.supplierKey === preferred);
+    if (!pool.length) return null;
+  }
+
+  const scored = pool
+    .map(item => ({ item, score: candidateScore(product, item) }))
+    .sort((a, b) => b.score - a.score);
+
+  if (!scored.length || scored[0].score <= 0) return null;
+
+  // Do not accept an ambiguous tie between suppliers. Missing characteristics
+  // are safer than attaching an M-Tac brand to a BEZET product.
+  if (
+    scored.length > 1 &&
+    scored[0].score === scored[1].score &&
+    scored[0].item?.supplierKey !== scored[1].item?.supplierKey
+  ) {
+    return null;
+  }
+
+  return scored[0].item?.offer || null;
+}
+
 function findSourceOffer(product, index) {
   const ext = clean(product?.external_id).toLowerCase();
-  if (ext && index.byId.has(ext)) return index.byId.get(ext);
+
+  if (ext) {
+    const exact = chooseCandidate(product, index.byId.get(ext) || []);
+    if (exact) return exact;
+  }
 
   const sku = clean(
     product?.sku ??
@@ -63,20 +151,9 @@ function findSourceOffer(product, index) {
     product?.article
   ).toLowerCase();
 
-  const candidates = sku ? (index.bySku.get(sku) || []) : [];
-  if (candidates.length === 1) return candidates[0];
-
-  if (candidates.length > 1) {
-    const name = norm(product?.name);
-    const scored = candidates
-      .map(offer => {
-        const offerName = norm(offer?.name);
-        const tokens = name.split(/\s+/u).filter(x => x.length >= 4);
-        const score = tokens.filter(t => offerName.includes(t)).length;
-        return { offer, score };
-      })
-      .sort((a, b) => b.score - a.score);
-    if (scored[0]?.score > 0) return scored[0].offer;
+  if (sku) {
+    const bySku = chooseCandidate(product, index.bySku.get(sku) || []);
+    if (bySku) return bySku;
   }
 
   return null;
@@ -433,6 +510,11 @@ async function buildEnrichmentFeed() {
   const groupsInfo = buildGroupInfo(groups);
   const source = sourceIndex(suppliers);
 
+  const supplierHealth = {
+    bezetOffers: suppliers?.bezet?.offers?.length || 0,
+    militarisOffers: suppliers?.militaris?.offers?.length || 0
+  };
+
   const triples = Array
     .from({ length: 10 }, () => [
       "Назва_Характеристики",
@@ -561,14 +643,26 @@ async function buildEnrichmentFeed() {
     sourceMatched,
     groupFixes,
     threePlusCharacteristics,
+    supplierHealth,
     bytes: Buffer.byteLength(csv, "utf8")
   };
 
-  return { csv, summary, preview };
+  return { csv, summary, preview, supplierHealth };
 }
 
 async function submitEnrichmentImport() {
   const feed = await buildEnrichmentFeed();
+
+  if (
+    feed?.supplierHealth?.bezetOffers <= 0 ||
+    feed?.supplierHealth?.militarisOffers <= 0
+  ) {
+    throw new Error(
+      "Enrichment import aborted: supplier feed unavailable " +
+      JSON.stringify(feed?.supplierHealth || {})
+    );
+  }
+
   const url =
     PUBLIC_BASE_URL +
     "/feeds/editor-enrichment.csv?v=" +
