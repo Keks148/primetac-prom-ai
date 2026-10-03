@@ -3,7 +3,7 @@ const path = require("path");
 const { config } = require("./config");
 const { listProducts, listGroups } = require("./prom");
 
-const EDITOR_VERSION = "2.2.0";
+const EDITOR_VERSION = "2.3.0";
 const STATE_PATH =
   process.env.PROM_EDITOR_STATE_PATH ||
   "/var/data/primetac-prom-editor-state.json";
@@ -37,60 +37,29 @@ const SAFE_HEADWEAR = [
 
 const HARD_BLOCK = [
   /бронеплит/iu,
-  /бронепак/iu,
-  /plate\s*carrier/iu,
-  /плитоноск/iu,
-  /рпс/iu,
-  /разгруз/iu,
-  /розвантаж/iu,
+  /бронепласт/iu,
+  /бронепанел/iu,
+  /балістичн.*плит/iu,
+  /баллистическ.*плит/iu,
+  /armor\s*plate/iu,
+  /armour\s*plate/iu,
+  /\bhelmet\b/iu,
+  /шолом/iu,
   /шлем/iu,
-  /\bhelmet/iu,
-  /каск/iu,
-  /кавер.*(?:шлем|шолом|каск)/iu,
-  /чехол.*(?:шлем|каск)/iu,
-  /чохол.*шолом/iu,
-  /накладк.*(?:шлем|каск)/iu,
-  /накладк.*шолом/iu,
-  /окуляр/iu,
-  /очки/iu,
-  /goggle/iu,
-  /магазин.*(?:оруж|збро|автомат|винтов|пістолет|пистолет)/iu,
-  /(?:оруж|збро).*магазин/iu,
-  /підсум/iu,
-  /подсум/iu,
-  /кобур/iu,
-  /holster/iu,
-  /рем(?:ень|інь).*оруж/iu,
-  /оруж.*рем(?:ень|інь)/iu,
-  /рем(?:ень|інь).*збро/iu,
-  /збро.*рем(?:ень|інь)/iu,
-  /рюкзак/iu,
-  /сумк/iu,
-  /мессендж/iu,
-  /баул/iu,
-  /органайзер/iu,
-  /карабин/iu,
-  /карабін/iu,
-  /фонар/iu,
-  /ліхтар/iu,
-  /наушник/iu,
-  /навушник/iu,
-  /нож/iu,
-  /ніж/iu,
-  /мультитул/iu,
-  /шеврон/iu,
-  /патч/iu,
-  /спальн.*(?:меш|міш)/iu,
-  /каремат/iu,
-  /наколен/iu,
-  /налокот/iu,
-  /маскувальн.*сіт/iu,
-  /маскировочн.*сет/iu,
-  /сетк.*маскир/iu,
-  /cетк.*маскир/iu,
-  /термоодеял/iu,
-  /сертификат/iu,
-  /сертифікат/iu
+  /каск/iu
+];
+
+const HELMET_ACCESSORY = [
+  /подшлем/iu,
+  /кавер/iu,
+  /чехол/iu,
+  /чохол/iu,
+  /накладк/iu,
+  /подушк/iu,
+  /підвісн.*систем/iu,
+  /креплен/iu,
+  /кріплен/iu,
+  /аксесуар/iu
 ];
 
 const APPAREL_OR_SHOES = [
@@ -309,51 +278,41 @@ function classifyProduct(product, groupsInfo) {
   const productText = [name, category].filter(Boolean).join(" | ");
 
   if (BLOCKED_BRANDS.some(rx => rx.test(identityText))) {
-    return { action: "REMOVE", reason: "blocked_brand", groupPath, brand };
+    return {
+      action: "REMOVE",
+      reason: "blocked_brand",
+      groupPath,
+      brand
+    };
   }
 
-  // "Шапка-подшлемник" is headwear, not a helmet.
-  if (SAFE_HEADWEAR.some(rx => rx.test(productText))) {
-    return { action: "KEEP", reason: "headwear_exception", groupPath, brand };
+  if (
+    HELMET_ACCESSORY.some(rx => rx.test(productText)) &&
+    !/^(?:\s*)(?:helmet|шлем|шолом|каска)/iu.test(productText)
+  ) {
+    return {
+      action: "KEEP",
+      reason: "keep_helmet_accessory",
+      groupPath,
+      brand
+    };
   }
 
   if (HARD_BLOCK.some(rx => rx.test(productText))) {
     return {
       action: "REMOVE",
-      reason: "non_apparel_hard_block",
+      reason: "helmet_or_armor_plate",
       groupPath,
       brand
     };
   }
 
-  if (APPAREL_OR_SHOES.some(rx => rx.test(productText))) {
-    return {
-      action: "KEEP",
-      reason: "apparel_or_footwear",
-      groupPath,
-      brand
-    };
-  }
-
-  if (APPAREL_OR_SHOES.some(rx => rx.test(groupPath))) {
-    return {
-      action: "KEEP",
-      reason: "apparel_or_footwear_group",
-      groupPath,
-      brand
-    };
-  }
-
-  if (BLOCK_GROUP.some(rx => rx.test(groupPath))) {
-    return {
-      action: "REMOVE",
-      reason: "non_apparel_group",
-      groupPath,
-      brand
-    };
-  }
-
-  return { action: "REVIEW", reason: "uncertain", groupPath, brand };
+  return {
+    action: "KEEP",
+    reason: "allowed_by_narrow_policy",
+    groupPath,
+    brand
+  };
 }
 
 function targetGroupForProduct(product) {
@@ -676,6 +635,15 @@ async function buildPromEditorPlan() {
       continue;
     }
 
+    if (!targetGroup?.id) {
+      keep.push({
+        ...item,
+        fillKeywords: false,
+        fillDescription: false
+      });
+      continue;
+    }
+
     if (
       targetGroup?.id &&
       String(currentGroupId || "") !== String(targetGroup.id)
@@ -750,10 +718,10 @@ async function buildPromEditorPlan() {
     generatedAt: new Date().toISOString(),
     mode: "POST_IMPORT_EDITOR",
     policy: {
-      keep: "clothing, footwear, headwear and gloves only",
+      keep: "everything except LOWA, Helikon-Tex, helmets and armor plates",
       blockedBrands: ["LOWA", "Helikon-Tex"],
       removeImplementation: "mark_not_available_via_public_api",
-      unknownProducts: "review_only",
+      unknownProducts: "keep",
       groupFixes: "via enrichment import only",
       groupDeletion: "report_only"
     },
